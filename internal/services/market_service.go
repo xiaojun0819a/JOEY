@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/run-bigpig/jcp/internal/embed"
 	"github.com/run-bigpig/jcp/internal/logger"
 	"github.com/run-bigpig/jcp/internal/models"
 	"github.com/run-bigpig/jcp/internal/pkg/paths"
@@ -38,6 +39,7 @@ const (
 	emBoardFundFlowURL = "https://push2.eastmoney.com/api/qt/clist/get"
 	emFundFlowKLineURL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
 	emAnnouncementURL  = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+	qqFundFlowURL      = "https://proxy.finance.qq.com/cgi/cgi-bin/fundflow/hsfundtab"
 )
 
 const (
@@ -958,6 +960,755 @@ func (ms *MarketService) SearchStocks(keyword string, limit int) []StockSearchRe
 	return ms.searchStocksWithFallback(keyword, limit)
 }
 
+// ScanSnapshotRow 全A扫描的单只股票快照
+type ScanSnapshotRow struct {
+	Symbol             string
+	Name               string
+	Price              float64
+	ChangePercent      float64
+	Amount             float64
+	TurnoverRate       float64
+	TotalMarketCap     float64
+	FloatMarketCap     float64
+	Industry           string
+	IsST               bool
+	MainNetInflow      float64
+	MainNetInflowRatio float64
+	MainFlowSource     string
+	UpdateTime         string
+}
+
+// ScanMarketSnapshot 全A扫描的大盘快照
+type ScanMarketSnapshot struct {
+	ShPrice        float64
+	ShMA20         float64
+	LimitUpCount   int
+	LimitDownCount int
+	TotalAmount    float64
+}
+
+// GetAllAStockSnapshot 拉取全A（沪深，按需含北交所）扫描快照
+func (ms *MarketService) GetAllAStockSnapshot(includeBeijing bool) ([]ScanSnapshotRow, error) {
+	items, err := ms.getAllAStockSnapshotFromEastmoney(includeBeijing)
+	if err == nil && len(items) > 0 {
+		return items, nil
+	}
+	if err != nil {
+		log.Warn("东财全A快照失败，切换腾讯源: %v", err)
+	}
+	fallbackItems, fallbackErr := ms.getAllAStockSnapshotFromTencent(includeBeijing)
+	if fallbackErr == nil && len(fallbackItems) > 0 {
+		ms.enrichSnapshotMainFlowWithQQFund(fallbackItems)
+		return fallbackItems, nil
+	}
+	if err != nil && fallbackErr != nil {
+		return nil, fmt.Errorf("东财源失败: %v；腾讯源失败: %v", err, fallbackErr)
+	}
+	if fallbackErr != nil {
+		return nil, fallbackErr
+	}
+	return nil, err
+}
+
+func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) ([]ScanSnapshotRow, error) {
+	fs := "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23"
+	if includeBeijing {
+		fs += ",m:0 t:81 s:2048"
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 30
+	total := int64(0)
+	items := make([]ScanSnapshotRow, 0, 4000)
+
+	for page <= maxPages {
+		params := url.Values{}
+		params.Set("np", "1")
+		params.Set("fltt", "2")
+		params.Set("invt", "2")
+		params.Set("fid", "f3")
+		params.Set("po", "1")
+		params.Set("pn", strconv.Itoa(page))
+		params.Set("pz", strconv.Itoa(pageSize))
+		params.Set("fs", fs)
+		params.Set("fields", "f12,f14,f2,f3,f6,f8,f20,f21,f62,f184,f124,f13")
+		params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
+
+		raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
+			"Referer":    "https://quote.eastmoney.com/",
+			"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		data, ok := raw["data"].(map[string]any)
+		if !ok || data == nil {
+			return nil, fmt.Errorf("全A扫描响应缺少data")
+		}
+		if page == 1 {
+			total = int64(toInt64Any(data["total"]))
+		}
+
+		rows := toMapSliceLocal(toSliceAnyLocal(data["diff"]))
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, row := range rows {
+			code := strings.TrimSpace(toStringLocal(row["f12"]))
+			if code == "" {
+				continue
+			}
+			marketID := toInt64Any(row["f13"])
+			symbol := formatSymbolByMarket(code, marketID)
+			if symbol == "" {
+				continue
+			}
+
+			name := strings.TrimSpace(toStringLocal(row["f14"]))
+			items = append(items, ScanSnapshotRow{
+				Symbol:             symbol,
+				Name:               name,
+				Price:              toFloat64Any(row["f2"]),
+				ChangePercent:      toFloat64Any(row["f3"]),
+				Amount:             toFloat64Any(row["f6"]),
+				TurnoverRate:       toFloat64Any(row["f8"]),
+				TotalMarketCap:     toFloat64Any(row["f20"]),
+				FloatMarketCap:     toFloat64Any(row["f21"]),
+				Industry:           "",
+				IsST:               isSTName(name),
+				MainNetInflow:      toFloat64Any(row["f62"]),
+				MainNetInflowRatio: toFloat64Any(row["f184"]),
+				MainFlowSource:     "eastmoney",
+				UpdateTime:         formatEastmoneyTimestamp(toInt64Any(row["f124"])),
+			})
+		}
+
+		if int64(len(items)) >= total || len(rows) < pageSize {
+			break
+		}
+		page++
+	}
+
+	return items, nil
+}
+
+func (ms *MarketService) getAllAStockSnapshotFromTencent(includeBeijing bool) ([]ScanSnapshotRow, error) {
+	catalog := loadEmbeddedStockCatalog(includeBeijing)
+	if len(catalog) == 0 {
+		return nil, fmt.Errorf("腾讯快照回退失败：本地股票目录为空")
+	}
+
+	// 腾讯接口单次 URL 过长会失败，这里做小批量。
+	const batchSize = 60
+	items := make([]ScanSnapshotRow, 0, len(catalog))
+	nowText := time.Now().Format("2006-01-02 15:04:05")
+
+	for i := 0; i < len(catalog); i += batchSize {
+		end := i + batchSize
+		if end > len(catalog) {
+			end = len(catalog)
+		}
+		chunk := catalog[i:end]
+		symbols := make([]string, 0, len(chunk))
+		meta := make(map[string]embeddedStockMeta, len(chunk))
+		for _, item := range chunk {
+			symbols = append(symbols, item.Symbol)
+			meta[item.Symbol] = item
+		}
+
+		qURL := "https://qt.gtimg.cn/q=" + strings.Join(symbols, ",")
+		req, reqErr := http.NewRequest("GET", qURL, nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Referer", "https://gu.qq.com/")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+		resp, doErr := ms.client.Do(req)
+		if doErr != nil {
+			return nil, doErr
+		}
+		reader := transform.NewReader(resp.Body, simplifiedchinese.GBK.NewDecoder())
+		body, readErr := io.ReadAll(reader)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		// 同批次追加腾讯盘口买卖比数据（作为主力代理分数）
+		pkURL := "https://qt.gtimg.cn/q=" + buildTencentPKSymbols(symbols)
+		pkReq, pkReqErr := http.NewRequest("GET", pkURL, nil)
+		if pkReqErr != nil {
+			return nil, pkReqErr
+		}
+		pkReq.Header.Set("Referer", "https://gu.qq.com/")
+		pkReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		pkResp, pkDoErr := ms.client.Do(pkReq)
+		if pkDoErr != nil {
+			return nil, pkDoErr
+		}
+		pkReader := transform.NewReader(pkResp.Body, simplifiedchinese.GBK.NewDecoder())
+		pkBody, pkReadErr := io.ReadAll(pkReader)
+		pkResp.Body.Close()
+		if pkReadErr != nil {
+			return nil, pkReadErr
+		}
+		pkScore := parseTencentPKScoreMap(string(pkBody))
+
+		lines := strings.Split(string(body), ";")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "v_") || !strings.Contains(line, "=\"") {
+				continue
+			}
+			lhsRhs := strings.SplitN(line, "=\"", 2)
+			if len(lhsRhs) != 2 {
+				continue
+			}
+			symbol := strings.TrimPrefix(lhsRhs[0], "v_")
+			payload := strings.TrimSuffix(lhsRhs[1], "\"")
+			if payload == "" {
+				continue
+			}
+			fields := strings.Split(payload, "~")
+			// 关键字段按公开索引：3现价, 32涨跌幅, 37成交额(万), 38换手率, 44/45市值
+			if len(fields) < 46 {
+				continue
+			}
+
+			price := parseFloat64Safe(fields[3])
+			changePct := parseFloat64Safe(fields[32])
+			amountWan := parseFloat64Safe(fields[37])
+			turnover := parseFloat64Safe(fields[38])
+			mcap44 := parseFloat64Safe(fields[44])
+			mcap45 := parseFloat64Safe(fields[45])
+
+			// 兼容索引口径差异：总市值一般 >= 流通市值
+			totalCapYi := math.Max(mcap44, mcap45)
+			floatCapYi := math.Min(mcap44, mcap45)
+			if totalCapYi <= 0 {
+				continue
+			}
+			if floatCapYi <= 0 {
+				floatCapYi = totalCapYi
+			}
+
+			m := meta[symbol]
+			name := fields[1]
+			if strings.TrimSpace(name) == "" {
+				name = m.Name
+			}
+			mainNetProxy := math.NaN()
+			mainRatioProxy := math.NaN()
+			mainFlowSource := ""
+			if score, ok := pkScore[symbol]; ok {
+				mainRatioProxy = score
+				// 映射到近似“主力净流入额”代理量，便于前端展示非空
+				mainNetProxy = (score / 100.0) * amountWan * 10000
+				mainFlowSource = "tencent-pk-proxy"
+			}
+
+			items = append(items, ScanSnapshotRow{
+				Symbol:             symbol,
+				Name:               name,
+				Price:              price,
+				ChangePercent:      changePct,
+				Amount:             amountWan * 10000, // 万元 -> 元
+				TurnoverRate:       turnover,
+				TotalMarketCap:     totalCapYi * 1e8, // 亿 -> 元
+				FloatMarketCap:     floatCapYi * 1e8, // 亿 -> 元
+				Industry:           m.Industry,
+				IsST:               isSTName(name),
+				MainNetInflow:      mainNetProxy,
+				MainNetInflowRatio: mainRatioProxy,
+				MainFlowSource:     mainFlowSource,
+				UpdateTime:         nowText,
+			})
+		}
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("腾讯快照回退失败：返回为空")
+	}
+	return items, nil
+}
+
+func buildTencentPKSymbols(symbols []string) string {
+	out := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		if len(sym) < 3 {
+			continue
+		}
+		out = append(out, "s_pk"+sym)
+	}
+	return strings.Join(out, ",")
+}
+
+func parseTencentPKScoreMap(text string) map[string]float64 {
+	result := make(map[string]float64)
+	lines := strings.Split(text, ";")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "v_s_pk") || !strings.Contains(line, "=\"") {
+			continue
+		}
+		lhsRhs := strings.SplitN(line, "=\"", 2)
+		if len(lhsRhs) != 2 {
+			continue
+		}
+		key := strings.TrimPrefix(lhsRhs[0], "v_s_pk")
+		payload := strings.TrimSuffix(lhsRhs[1], "\"")
+		if payload == "" {
+			continue
+		}
+		parts := strings.Split(payload, "~")
+		if len(parts) < 4 {
+			continue
+		}
+		// s_pk 返回四项，分别对应不同周期买卖盘强弱，这里取短中期均值作为主力代理
+		v1 := parseFloat64Safe(parts[0])
+		v2 := parseFloat64Safe(parts[1])
+		v3 := parseFloat64Safe(parts[2])
+		v4 := parseFloat64Safe(parts[3])
+		score := ((v1+v2+v3+v4)/4.0 - 0.25) * 100.0
+		result[key] = score
+	}
+	return result
+}
+
+type qqTodayFundFlow struct {
+	MainNetIn   float64
+	MainInRate  float64
+	MainOutRate float64
+	MainInflow  float64
+	MainOutflow float64
+	HasValue    bool
+}
+
+// MainFlowHistoryPoint 主力历史净流入点（按交易日）
+type MainFlowHistoryPoint struct {
+	Date          string
+	MainNetInflow float64
+	Price         float64
+}
+
+func (ms *MarketService) enrichSnapshotMainFlowWithQQFund(items []ScanSnapshotRow) {
+	if len(items) == 0 {
+		return
+	}
+	workerCount := 6
+	if workerCount > len(items) {
+		workerCount = len(items)
+	}
+	indices := make(chan int, len(items))
+	for i := range items {
+		indices <- i
+	}
+	close(indices)
+
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for w := 0; w < workerCount; w++ {
+		go func() {
+			defer wg.Done()
+			for idx := range indices {
+				row := &items[idx]
+				// 已有东财主力数据时不覆盖
+				if row.MainFlowSource == "eastmoney" && !math.IsNaN(row.MainNetInflow) && !math.IsNaN(row.MainNetInflowRatio) {
+					continue
+				}
+				ff, err := ms.fetchQQTodayFundFlow(row.Symbol)
+				if err != nil || !ff.HasValue {
+					continue
+				}
+				row.MainNetInflow = ff.MainNetIn
+				ratio := ff.MainInRate - ff.MainOutRate
+				if math.Abs(ratio) < 0.0001 && row.FloatMarketCap > 0 {
+					// 腾讯 summary 里的 mcRatio 对应主力净流入占流通市值比，转成百分比
+					ratio = (ff.MainNetIn / row.FloatMarketCap) * 100
+				}
+				row.MainNetInflowRatio = ratio
+				row.MainFlowSource = "tencent-fundflow"
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func (ms *MarketService) fetchQQTodayFundFlow(symbol string) (qqTodayFundFlow, error) {
+	code := strings.ToLower(strings.TrimSpace(symbol))
+	if len(code) < 8 {
+		return qqTodayFundFlow{}, fmt.Errorf("symbol invalid: %s", symbol)
+	}
+	if !strings.HasPrefix(code, "sh") && !strings.HasPrefix(code, "sz") {
+		return qqTodayFundFlow{}, fmt.Errorf("qq fundflow unsupported market: %s", symbol)
+	}
+	params := url.Values{}
+	params.Set("code", code)
+	params.Set("type", "todayFundFlow")
+	params.Set("klineNeedDay", "5")
+
+	req, err := http.NewRequest("GET", qqFundFlowURL+"?"+params.Encode(), nil)
+	if err != nil {
+		return qqTodayFundFlow{}, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://gu.qq.com/")
+
+	resp, err := ms.client.Do(req)
+	if err != nil {
+		return qqTodayFundFlow{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return qqTodayFundFlow{}, err
+	}
+	if isHTMLBody(body) {
+		return qqTodayFundFlow{}, fmt.Errorf("qq fundflow returns html")
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return qqTodayFundFlow{}, err
+	}
+	if toInt64Any(raw["code"]) != 0 {
+		return qqTodayFundFlow{}, fmt.Errorf("qq fundflow api code=%v msg=%v", raw["code"], raw["msg"])
+	}
+	data, _ := raw["data"].(map[string]any)
+	if data == nil {
+		return qqTodayFundFlow{}, fmt.Errorf("qq fundflow empty data")
+	}
+	today, _ := data["todayFundFlow"].(map[string]any)
+	if today == nil {
+		return qqTodayFundFlow{}, nil
+	}
+	mainNet := parseFloat64Safe(toStringLocal(today["mainNetIn"]))
+	mainInRate := parseFloat64Safe(toStringLocal(today["mainInRate"]))
+	mainOutRate := parseFloat64Safe(toStringLocal(today["mainOutRate"]))
+	mainInflow := parseFloat64Safe(toStringLocal(today["mainIn"]))
+	mainOutflow := parseFloat64Safe(toStringLocal(today["mainOut"]))
+
+	return qqTodayFundFlow{
+		MainNetIn:   mainNet,
+		MainInRate:  mainInRate,
+		MainOutRate: mainOutRate,
+		MainInflow:  mainInflow,
+		MainOutflow: mainOutflow,
+		HasValue:    !(mainNet == 0 && mainInflow == 0 && mainOutflow == 0 && mainInRate == 0 && mainOutRate == 0),
+	}, nil
+}
+
+// GetQQMainFlowHistory 获取腾讯主力历史净流入（默认按日期升序）
+func (ms *MarketService) GetQQMainFlowHistory(symbol string, days int) ([]MainFlowHistoryPoint, error) {
+	return ms.fetchQQHistoryFundFlow(symbol, days)
+}
+
+func (ms *MarketService) fetchQQHistoryFundFlow(symbol string, days int) ([]MainFlowHistoryPoint, error) {
+	code := strings.ToLower(strings.TrimSpace(symbol))
+	if len(code) < 8 {
+		return nil, fmt.Errorf("symbol invalid: %s", symbol)
+	}
+	if !strings.HasPrefix(code, "sh") && !strings.HasPrefix(code, "sz") {
+		return nil, fmt.Errorf("qq fundflow unsupported market: %s", symbol)
+	}
+	if days <= 0 {
+		days = 5
+	}
+	if days > 120 {
+		days = 120
+	}
+
+	params := url.Values{}
+	params.Set("code", code)
+	params.Set("type", "historyFundFlow")
+	params.Set("klineNeedDay", strconv.Itoa(days))
+
+	req, err := http.NewRequest("GET", qqFundFlowURL+"?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://gu.qq.com/")
+
+	resp, err := ms.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if isHTMLBody(body) {
+		return nil, fmt.Errorf("qq history fundflow returns html")
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	if toInt64Any(raw["code"]) != 0 {
+		return nil, fmt.Errorf("qq history fundflow api code=%v msg=%v", raw["code"], raw["msg"])
+	}
+	data, _ := raw["data"].(map[string]any)
+	if data == nil {
+		return nil, fmt.Errorf("qq history fundflow empty data")
+	}
+	history, _ := data["historyFundFlow"].(map[string]any)
+	if history == nil {
+		return nil, fmt.Errorf("qq history fundflow empty history")
+	}
+
+	rows := toMapSliceLocal(toSliceAnyLocal(history["oneDayKlineList"]))
+	points := make([]MainFlowHistoryPoint, 0, len(rows))
+	for _, row := range rows {
+		date := strings.TrimSpace(toStringLocal(row["date"]))
+		if date == "" {
+			continue
+		}
+		points = append(points, MainFlowHistoryPoint{
+			Date:          date,
+			MainNetInflow: parseFloat64Safe(toStringLocal(row["mainNetIn"])),
+			Price:         parseFloat64Safe(toStringLocal(row["price"])),
+		})
+	}
+	if len(points) == 0 {
+		return nil, fmt.Errorf("qq history fundflow list empty")
+	}
+
+	sort.SliceStable(points, func(i, j int) bool {
+		return points[i].Date < points[j].Date
+	})
+	if len(points) > days {
+		points = points[len(points)-days:]
+	}
+	return points, nil
+}
+
+type embeddedStockMeta struct {
+	Symbol   string
+	Name     string
+	Industry string
+}
+
+func loadEmbeddedStockCatalog(includeBeijing bool) []embeddedStockMeta {
+	type stockBasicData struct {
+		Data struct {
+			Fields []string        `json:"fields"`
+			Items  [][]interface{} `json:"items"`
+		} `json:"data"`
+	}
+	var basic stockBasicData
+	if err := json.Unmarshal(embed.StockBasicJSON, &basic); err != nil {
+		return nil
+	}
+
+	symbolIdx, nameIdx, tsCodeIdx, industryIdx := -1, -1, -1, -1
+	for i, field := range basic.Data.Fields {
+		switch field {
+		case "symbol":
+			symbolIdx = i
+		case "name":
+			nameIdx = i
+		case "ts_code":
+			tsCodeIdx = i
+		case "industry":
+			industryIdx = i
+		}
+	}
+	if symbolIdx < 0 || nameIdx < 0 {
+		return nil
+	}
+
+	out := make([]embeddedStockMeta, 0, len(basic.Data.Items))
+	for _, row := range basic.Data.Items {
+		if symbolIdx >= len(row) || nameIdx >= len(row) {
+			continue
+		}
+		code, _ := row[symbolIdx].(string)
+		name, _ := row[nameIdx].(string)
+		if code == "" {
+			continue
+		}
+
+		prefix := "sz"
+		if tsCodeIdx >= 0 && tsCodeIdx < len(row) {
+			tsCode, _ := row[tsCodeIdx].(string)
+			switch {
+			case strings.HasSuffix(strings.ToUpper(tsCode), ".SH"):
+				prefix = "sh"
+			case strings.HasSuffix(strings.ToUpper(tsCode), ".BJ"):
+				if !includeBeijing {
+					continue
+				}
+				prefix = "bj"
+			case strings.HasSuffix(strings.ToUpper(tsCode), ".SZ"):
+				prefix = "sz"
+			}
+		} else {
+			switch code[0] {
+			case '6', '9', '5':
+				prefix = "sh"
+			case '8', '4':
+				if !includeBeijing {
+					continue
+				}
+				prefix = "bj"
+			default:
+				prefix = "sz"
+			}
+		}
+
+		industry := ""
+		if industryIdx >= 0 && industryIdx < len(row) {
+			industry, _ = row[industryIdx].(string)
+		}
+		out = append(out, embeddedStockMeta{
+			Symbol:   prefix + code,
+			Name:     name,
+			Industry: industry,
+		})
+	}
+	return out
+}
+
+// BuildScanMarketSnapshot 构建扫描时的大盘快照
+func (ms *MarketService) BuildScanMarketSnapshot() (ScanMarketSnapshot, error) {
+	result := ScanMarketSnapshot{}
+
+	// 上证当前点位优先走指数接口（更稳）
+	if indices, idxErr := ms.GetMarketIndices(); idxErr == nil {
+		for _, idx := range indices {
+			if strings.EqualFold(idx.Code, "sh000001") {
+				result.ShPrice = idx.Price
+				break
+			}
+		}
+	}
+
+	// 上证 MA20：优先使用新浪日K（避免主源偶发异常值）
+	if shDaily, err := ms.fetchKLineDataFromSina("sh000001", "1d", 40); err == nil {
+		if ma20, closePrice, ok := extractIndexSnapshot(shDaily); ok {
+			result.ShMA20 = ma20
+			if !isValidIndexPoint(result.ShPrice) {
+				result.ShPrice = closePrice
+			}
+		}
+	}
+	// 兜底：若仍不可用，再尝试统一 K 线接口
+	if !isValidIndexPoint(result.ShPrice) || !isValidIndexPoint(result.ShMA20) {
+		if shDaily, err := ms.GetKLineData("sh000001", "1d", 40); err == nil {
+			if ma20, closePrice, ok := extractIndexSnapshot(shDaily); ok {
+				result.ShMA20 = ma20
+				if !isValidIndexPoint(result.ShPrice) {
+					result.ShPrice = closePrice
+				}
+			}
+		}
+	}
+
+	// 涨停/跌停计数 + 两市成交额（分页聚合，避免单次大包返回空）
+	page := 1
+	pageSize := 200
+	maxPages := 30
+	total := int64(0)
+	processed := 0
+
+	for page <= maxPages {
+		params := url.Values{}
+		params.Set("np", "1")
+		params.Set("fltt", "2")
+		params.Set("invt", "2")
+		params.Set("fid", "f3")
+		params.Set("po", "1")
+		params.Set("pn", strconv.Itoa(page))
+		params.Set("pz", strconv.Itoa(pageSize))
+		params.Set("fs", "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23")
+		params.Set("fields", "f3,f6")
+		params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
+
+		raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
+			"Referer":    "https://quote.eastmoney.com/",
+			"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		})
+		if err != nil {
+			return result, err
+		}
+		data, ok := raw["data"].(map[string]any)
+		if !ok || data == nil {
+			return result, fmt.Errorf("大盘快照响应缺少data")
+		}
+		if page == 1 {
+			total = int64(toInt64Any(data["total"]))
+		}
+
+		rows := toMapSliceLocal(toSliceAnyLocal(data["diff"]))
+		if len(rows) == 0 {
+			break
+		}
+		for _, row := range rows {
+			pct := toFloat64Any(row["f3"])
+			if pct >= 9.8 {
+				result.LimitUpCount++
+			}
+			if pct <= -9.8 {
+				result.LimitDownCount++
+			}
+			result.TotalAmount += toFloat64Any(row["f6"])
+			processed++
+		}
+
+		if int64(processed) >= total || len(rows) < pageSize {
+			break
+		}
+		page++
+	}
+	if processed == 0 {
+		return result, fmt.Errorf("大盘快照返回空列表")
+	}
+
+	return result, nil
+}
+
+func isValidIndexPoint(v float64) bool {
+	return v > 10 && v < 30000
+}
+
+func extractIndexSnapshot(klines []models.KLineData) (ma20 float64, closePrice float64, ok bool) {
+	if len(klines) < 20 {
+		return 0, 0, false
+	}
+	last := klines[len(klines)-1]
+	closePrice = last.Close
+	if !isValidIndexPoint(closePrice) {
+		return 0, 0, false
+	}
+	sum := 0.0
+	count := 0
+	for i := len(klines) - 20; i < len(klines); i++ {
+		if i < 0 || i >= len(klines) {
+			continue
+		}
+		c := klines[i].Close
+		if c <= 0 {
+			return 0, 0, false
+		}
+		sum += c
+		count++
+	}
+	if count < 20 {
+		return 0, 0, false
+	}
+	ma20 = sum / float64(count)
+	if !isValidIndexPoint(ma20) {
+		return 0, 0, false
+	}
+	return ma20, closePrice, true
+}
+
 func (ms *MarketService) fetchMarketIndicesFromSina() ([]models.MarketIndex, error) {
 	codeList := strings.Join(defaultIndexCodes, ",")
 	url := fmt.Sprintf(sinaStockURL, time.Now().UnixNano(), codeList)
@@ -1442,6 +2193,35 @@ func normalizeBoardCode(boardCode string) string {
 		return "BK" + candidate
 	}
 	return ""
+}
+
+func formatSymbolByMarket(code string, marketID int64) string {
+	if !isDigits(code) {
+		return ""
+	}
+	switch marketID {
+	case 1:
+		return "sh" + code
+	case 0:
+		return "sz" + code
+	case 2:
+		return "bj" + code
+	default:
+		// 兜底按首位推断
+		switch code[0] {
+		case '6', '9', '5':
+			return "sh" + code
+		case '8', '4':
+			return "bj" + code
+		default:
+			return "sz" + code
+		}
+	}
+}
+
+func isSTName(name string) bool {
+	n := strings.ToUpper(strings.TrimSpace(name))
+	return strings.Contains(n, "ST") || strings.Contains(n, "*ST")
 }
 
 func isDigits(text string) bool {

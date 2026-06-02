@@ -6,6 +6,7 @@ require (
 	cloud.google.com/go/auth v0.17.0
 	github.com/PuerkitoBio/goquery v1.11.0
 	github.com/blang/semver v3.5.1+incompatible
+	github.com/glebarez/go-sqlite v1.22.0
 	github.com/go-ego/gse v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/injoyai/tdx v0.0.79-0.20260225123406-1c15720bfffa
@@ -26,7 +27,6 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/glebarez/go-sqlite v1.22.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect

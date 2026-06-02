@@ -1,15 +1,96 @@
 import React, { useState, useEffect } from 'react';
-import { X, TrendingUp, RefreshCw, Calendar, ChevronDown } from 'lucide-react';
+import { X, TrendingUp, RefreshCw, Calendar, ChevronDown, Plus, Check } from 'lucide-react';
 import { GetLongHuBangList, GetLongHuBangDetail, GetTradeDates } from '../../wailsjs/go/main/App';
 import { models } from '../../wailsjs/go/models';
 import { useCandleColor } from '../contexts/CandleColorContext';
+import type { Stock } from '../types';
+import { isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
 
 interface LongHuBangDialogProps {
   isOpen: boolean;
   onClose: () => void;
+  watchlistSymbols: string[];
+  onAddToWatchlist: (stock: Stock) => Promise<boolean>;
 }
 
-export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onClose }) => {
+const normalizeLongHuSymbol = (item: models.LongHuBangItem): string => {
+  const code = String(item.code || '').trim();
+  const secuCode = String(item.secuCode || '').trim().toUpperCase();
+  if (!code) return '';
+
+  if (secuCode.endsWith('.SH')) return `sh${code}`.toLowerCase();
+  if (secuCode.endsWith('.SZ')) return `sz${code}`.toLowerCase();
+  if (secuCode.endsWith('.BJ')) return `bj${code}`.toLowerCase();
+
+  if (code.startsWith('6') || code.startsWith('9') || code.startsWith('5')) return `sh${code}`.toLowerCase();
+  if (code.startsWith('8') || code.startsWith('4') || code.startsWith('92')) return `bj${code}`.toLowerCase();
+  return `sz${code}`.toLowerCase();
+};
+
+const buildWatchStockFromLongHu = (item: models.LongHuBangItem): Stock => {
+  const symbol = normalizeLongHuSymbol(item);
+  const closePrice = Number(item.closePrice || 0);
+  const pct = Number(item.changePercent || 0);
+  const preClose = Math.abs(100 + pct) > 0.001 ? closePrice / (1 + pct / 100) : 0;
+
+  return {
+    symbol,
+    name: item.name || symbol,
+    price: closePrice,
+    change: closePrice - preClose,
+    changePercent: pct,
+    volume: 0,
+    amount: Number(item.totalAmt || 0),
+    marketCap: item.freeCap > 0 ? `${(item.freeCap / 100000000).toFixed(2)}亿` : '',
+    sector: '',
+    open: 0,
+    high: 0,
+    low: 0,
+    preClose: preClose > 0 ? preClose : 0,
+  };
+};
+
+const AddToWatchlistButton: React.FC<{
+  item: models.LongHuBangItem;
+  watchlistSet: Set<string>;
+  addingSymbols: Record<string, boolean>;
+  addFeedback: Record<string, 'added' | 'exists'>;
+  onAdd: (item: models.LongHuBangItem) => void;
+  compact?: boolean;
+}> = ({ item, watchlistSet, addingSymbols, addFeedback, onAdd, compact = false }) => {
+  const symbol = normalizeLongHuSymbol(item);
+  const inWatchlist = !!symbol && watchlistSet.has(symbol);
+  const isAdding = !!symbol && !!addingSymbols[symbol];
+  const feedback = symbol ? addFeedback[symbol] : undefined;
+  const isDone = inWatchlist || feedback === 'added' || feedback === 'exists';
+  const label = isAdding ? '处理中' : isDone ? '已加自选' : '加自选';
+
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!isDone && !isAdding) onAdd(item);
+      }}
+      disabled={isDone || isAdding}
+      className={`inline-flex items-center gap-1 rounded border text-[11px] transition-colors ${
+        compact ? 'px-2 py-0.5' : 'px-1.5 py-0.5'
+      } ${
+        isDone
+          ? 'border-emerald-500/35 text-emerald-300 bg-emerald-500/10 cursor-default'
+          : isAdding
+            ? 'border-amber-400/35 text-amber-300 bg-amber-500/10 cursor-wait'
+            : 'border-accent/45 text-accent-2 hover:bg-accent/10'
+      }`}
+      title={label}
+    >
+      {isDone ? <Check className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
+      <span>{label}</span>
+    </button>
+  );
+};
+
+export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onClose, watchlistSymbols, onAddToWatchlist }) => {
   const [items, setItems] = useState<models.LongHuBangItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -20,9 +101,23 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
   const [tradeDates, setTradeDates] = useState<string[]>([]);
   const [pageNumber, setPageNumber] = useState(1);
   const [hasMore, setHasMore] = useState(true);
+  const [addingSymbols, setAddingSymbols] = useState<Record<string, boolean>>({});
+  const [addFeedback, setAddFeedback] = useState<Record<string, 'added' | 'exists'>>({});
   const pageSize = 30;
+  const watchlistSet = React.useMemo(
+    () => new Set((watchlistSymbols || []).map(s => String(s).toLowerCase())),
+    [watchlistSymbols],
+  );
 
   const loadList = async (page: number, date: string, append = false) => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('龙虎榜', 'go');
+      setItems([]);
+      setHasMore(false);
+      setLoading(false);
+      setLoadingMore(false);
+      return;
+    }
     if (append) {
       setLoadingMore(true);
     } else {
@@ -50,6 +145,13 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
 
   useEffect(() => {
     if (isOpen) {
+      if (!isWailsGoReady()) {
+        warnWailsUnavailable('龙虎榜', 'go');
+        setItems([]);
+        setTradeDates([]);
+        setTradeDate('');
+        return;
+      }
       // 先获取交易日列表
       GetTradeDates(60).then((dates) => {
         if (dates && dates.length > 0) {
@@ -70,8 +172,27 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
       });
       setSelectedItem(null);
       setDetails([]);
+      setAddFeedback({});
+      setAddingSymbols({});
     }
   }, [isOpen]);
+
+  const handleAddFromLongHu = async (item: models.LongHuBangItem) => {
+    const symbol = normalizeLongHuSymbol(item);
+    if (!symbol) return;
+    if (watchlistSet.has(symbol)) {
+      setAddFeedback(prev => ({ ...prev, [symbol]: 'exists' }));
+      return;
+    }
+
+    setAddingSymbols(prev => ({ ...prev, [symbol]: true }));
+    try {
+      const added = await onAddToWatchlist(buildWatchStockFromLongHu(item));
+      setAddFeedback(prev => ({ ...prev, [symbol]: added ? 'added' : 'exists' }));
+    } finally {
+      setAddingSymbols(prev => ({ ...prev, [symbol]: false }));
+    }
+  };
 
   const handleDateChange = (date: string) => {
     setTradeDate(date);
@@ -113,11 +234,19 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
             setDetails={setDetails}
             setDetailLoading={setDetailLoading}
             onLoadMore={handleLoadMore}
+            watchlistSet={watchlistSet}
+            addingSymbols={addingSymbols}
+            addFeedback={addFeedback}
+            onAddToWatchlist={handleAddFromLongHu}
           />
           <DetailPanel
             item={selectedItem}
             details={details}
             loading={detailLoading}
+            watchlistSet={watchlistSet}
+            addingSymbols={addingSymbols}
+            addFeedback={addFeedback}
+            onAddToWatchlist={handleAddFromLongHu}
           />
         </div>
       </div>
@@ -256,7 +385,11 @@ const ItemList: React.FC<{
   setDetails: (details: models.LongHuBangDetail[]) => void;
   setDetailLoading: (loading: boolean) => void;
   onLoadMore: () => void;
-}> = ({ items, loading, loadingMore, hasMore, selectedItem, onSelect, setDetails, setDetailLoading, onLoadMore }) => {
+  watchlistSet: Set<string>;
+  addingSymbols: Record<string, boolean>;
+  addFeedback: Record<string, 'added' | 'exists'>;
+  onAddToWatchlist: (item: models.LongHuBangItem) => void;
+}> = ({ items, loading, loadingMore, hasMore, selectedItem, onSelect, setDetails, setDetailLoading, onLoadMore, watchlistSet, addingSymbols, addFeedback, onAddToWatchlist }) => {
   const cc = useCandleColor();
   const listRef = React.useRef<HTMLDivElement>(null);
 
@@ -273,6 +406,11 @@ const ItemList: React.FC<{
     onSelect(item);
     setDetailLoading(true);
     try {
+      if (!isWailsGoReady()) {
+        warnWailsUnavailable('龙虎榜明细', 'go');
+        setDetails([]);
+        return;
+      }
       const data = await GetLongHuBangDetail(item.code, item.tradeDate);
       setDetails(data || []);
     } finally {
@@ -326,7 +464,16 @@ const ItemList: React.FC<{
               净买入 {formatAmount(item.netBuyAmt)}
             </span>
           </div>
-          <div className="text-xs fin-text-tertiary mt-1.5 truncate">{item.reason}</div>
+          <div className="mt-1.5 flex items-center justify-between gap-2">
+            <AddToWatchlistButton
+              item={item}
+              watchlistSet={watchlistSet}
+              addingSymbols={addingSymbols}
+              addFeedback={addFeedback}
+              onAdd={onAddToWatchlist}
+            />
+            <div className="text-xs fin-text-tertiary truncate text-right flex-1">{item.reason}</div>
+          </div>
         </div>
       ))}
       {loadingMore && (
@@ -417,13 +564,25 @@ const StatCard: React.FC<{
 const StockHeader: React.FC<{
   item: models.LongHuBangItem;
   formatAmount: (amt: number) => string;
-}> = ({ item, formatAmount }) => {
+  watchlistSet: Set<string>;
+  addingSymbols: Record<string, boolean>;
+  addFeedback: Record<string, 'added' | 'exists'>;
+  onAddToWatchlist: (item: models.LongHuBangItem) => void;
+}> = ({ item, formatAmount, watchlistSet, addingSymbols, addFeedback, onAddToWatchlist }) => {
   const cc = useCandleColor();
   return (
   <div className="mb-5">
-    <div className="flex items-baseline gap-3 mb-4">
+    <div className="flex items-center gap-3 mb-4">
       <span className="text-2xl font-bold fin-text-primary">{item.name}</span>
       <span className="text-sm fin-text-tertiary font-mono">{item.code}</span>
+      <AddToWatchlistButton
+        item={item}
+        watchlistSet={watchlistSet}
+        addingSymbols={addingSymbols}
+        addFeedback={addFeedback}
+        onAdd={onAddToWatchlist}
+        compact
+      />
       <span className={`text-lg font-mono font-semibold ml-auto ${cc.getColorClass(item.changePercent >= 0)}`}>
         {item.changePercent >= 0 ? '+' : ''}{item.changePercent.toFixed(2)}%
       </span>
@@ -449,7 +608,11 @@ const DetailPanel: React.FC<{
   item: models.LongHuBangItem | null;
   details: models.LongHuBangDetail[];
   loading: boolean;
-}> = ({ item, details, loading }) => {
+  watchlistSet: Set<string>;
+  addingSymbols: Record<string, boolean>;
+  addFeedback: Record<string, 'added' | 'exists'>;
+  onAddToWatchlist: (item: models.LongHuBangItem) => void;
+}> = ({ item, details, loading, watchlistSet, addingSymbols, addFeedback, onAddToWatchlist }) => {
   const formatAmount = (amt: number) => {
     if (Math.abs(amt) >= 100000000) {
       return (amt / 100000000).toFixed(2) + '亿';
@@ -478,7 +641,14 @@ const DetailPanel: React.FC<{
 
   return (
     <div className="flex-1 overflow-y-auto p-4 fin-scrollbar text-left">
-      <StockHeader item={item} formatAmount={formatAmount} />
+      <StockHeader
+        item={item}
+        formatAmount={formatAmount}
+        watchlistSet={watchlistSet}
+        addingSymbols={addingSymbols}
+        addFeedback={addFeedback}
+        onAddToWatchlist={onAddToWatchlist}
+      />
       <BrokerSection title="买入前五营业部" details={buyDetails} type="buy" formatAmount={formatAmount} />
       <BrokerSection title="卖出前五营业部" details={sellDetails} type="sell" formatAmount={formatAmount} />
     </div>

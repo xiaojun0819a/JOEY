@@ -4,12 +4,18 @@ interface ResizeHandleProps {
   direction: 'horizontal' | 'vertical';
   onResize: (delta: number) => void;
   onResizeEnd?: () => void;
+  className?: string;
+  showLine?: boolean;
+  lineClassName?: string;
 }
 
 export const ResizeHandle: React.FC<ResizeHandleProps> = ({
   direction,
   onResize,
-  onResizeEnd
+  onResizeEnd,
+  className = '',
+  showLine = false,
+  lineClassName = '',
 }) => {
   const isDragging = useRef(false);
   const lastPos = useRef(0);
@@ -56,14 +62,25 @@ export const ResizeHandle: React.FC<ResizeHandleProps> = ({
     <div
       onMouseDown={handleMouseDown}
       className={`
-        ${isHorizontal ? 'w-1 cursor-col-resize' : 'h-1 cursor-row-resize'}
-        bg-transparent hover:bg-accent/30 active:bg-accent/50
-        transition-colors duration-150 shrink-0
-        ${isHorizontal ? 'hover:w-1' : 'hover:h-1'}
+        ${isHorizontal ? 'w-2 cursor-col-resize' : 'h-2 cursor-row-resize'}
+        bg-transparent hover:bg-accent/35 active:bg-accent/55
+        transition-colors duration-150 shrink-0 group
+        ${isHorizontal ? 'hover:w-2' : 'hover:h-2'}
+        ${className}
       `}
       style={{
         touchAction: 'none',
       }}
-    />
+    >
+      {showLine && (
+        <div
+          className={`
+            ${isHorizontal ? 'h-full w-[1px] mx-auto' : 'w-full h-[2px] my-auto'}
+            transition-colors duration-150
+            ${lineClassName}
+          `}
+        />
+      )}
+    </div>
   );
 };

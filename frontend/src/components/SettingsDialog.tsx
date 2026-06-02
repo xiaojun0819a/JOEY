@@ -1092,7 +1092,7 @@ const IntentSettings: React.FC<IntentSettingsProps> = ({
       <div>
         <h3 className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>意图分析配置</h3>
         <p className={`text-sm mt-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-          配置"小韭菜"使用的 AI 模型，用于分析用户意图和选择专家
+          配置"老板娘"使用的 AI 模型，用于分析用户意图、组织专家交锋并做最终仲裁
         </p>
       </div>
 
@@ -1103,8 +1103,8 @@ const IntentSettings: React.FC<IntentSettingsProps> = ({
             <MessageSquare className="h-5 w-5" />
           </div>
           <div>
-            <div className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>小韭菜</div>
-            <div className={`text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>会议主持 · 意图分析</div>
+            <div className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>老板娘</div>
+            <div className={`text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>会议主持 · 选人编排 · 最终仲裁</div>
           </div>
         </div>
 
@@ -1145,7 +1145,7 @@ const IntentSettings: React.FC<IntentSettingsProps> = ({
         <div className="mt-4 flex items-center justify-between gap-3">
           <div>
             <div className={`text-sm font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>启用二轮复议</div>
-            <div className={`text-xs mt-1 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>开启后会让已选专家根据首轮观点做一次简短复核</div>
+            <div className={`text-xs mt-1 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>开启后会追加简短复议（在默认三轮讨论之后）</div>
           </div>
           <ToggleSwitch checked={enableSecondReview} onChange={onEnableSecondReviewChange} />
         </div>
@@ -1168,7 +1168,7 @@ const IntentSettings: React.FC<IntentSettingsProps> = ({
 
       {/* 说明 */}
       <div className={`text-xs space-y-1 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
-        <p>• 小韭菜负责分析用户问题的意图，并选择合适的专家进行回答</p>
+        <p>• 老板娘负责分析意图、组织三轮讨论（独立陈述→交叉质疑→修正终判）并输出仲裁结论</p>
         <p>• 建议使用响应较快的模型以减少等待时间</p>
         <p>• 留空则使用系统默认的 AI 配置</p>
       </div>

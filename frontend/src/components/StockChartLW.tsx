@@ -1,12 +1,15 @@
 import React, { useEffect, useRef, useCallback, useMemo, useState } from 'react';
-import { ZoomIn, ZoomOut, MoveHorizontal, Eye, EyeOff } from 'lucide-react';
+import { AlertTriangle, Eye, EyeOff, MoveHorizontal, Target, Zap, ZoomIn, ZoomOut } from 'lucide-react';
 import {
   createChart,
+  createSeriesMarkers,
   IChartApi,
+  ISeriesMarkersPluginApi,
   ISeriesApi,
   CandlestickData,
   HistogramData,
   LineData,
+  SeriesMarker,
   Time,
   CrosshairMode,
   LineStyle,
@@ -30,10 +33,11 @@ import {
   calculateRSI,
   calculateKDJ,
 } from '../utils/indicators';
+import { calculateIntradayTradingSignals, calculateTradingSignals, getLatestTradingSignal, TradingSignal } from '../utils/tradingSignals';
 
-const VOLUME_MIN = 20;
-const VOLUME_MAX = 200;
-const VOLUME_DEFAULT = 72;
+const VOLUME_MIN = 18;
+const VOLUME_MAX = 180;
+const VOLUME_DEFAULT = 56;
 
 interface StockChartProps {
   data: KLineData[];
@@ -41,6 +45,7 @@ interface StockChartProps {
   period: TimePeriod;
   onPeriodChange: (p: TimePeriod) => void;
   stock?: Stock;
+  dayKData?: KLineData[];
 }
 
 // 副图类型
@@ -51,6 +56,77 @@ const MA_COLORS = ['#facc15', '#a855f7', '#f97316', '#38bdf8', '#f43f5e'];
 const EMA_COLORS = ['#06b6d4', '#ec4899'];
 const BOLL_COLOR = '#e91e63';
 const CHART_FONT_FAMILY = 'Menlo, Monaco, Consolas, monospace';
+
+function signalPriority(signal: TradingSignal): number {
+  if (signal.action === 'sell') return 120;
+  if (signal.action === 'reduce' && signal.level === 'risk') return 110;
+  if (signal.level === 'S') return 100;
+  if (signal.level === 'S-') return 90;
+  if (signal.level === 'A+') return 80;
+  if (signal.level === 'A') return 70;
+  return 60;
+}
+
+function markerTextForSignal(signal: TradingSignal, isIntraday: boolean): string {
+  if (signal.action === 'sell') return '清';
+  if (signal.action === 'reduce' || signal.level === 'risk') return '减';
+  if (isIntraday) {
+    if (signal.level === 'S') return 'S';
+    if (signal.level === 'S-') return 'S-';
+    if (signal.level === 'A+') return 'A+';
+    return 'A';
+  }
+  return signal.level;
+}
+
+function shouldKeepSignalForMarker(signal: TradingSignal, isIntraday: boolean): boolean {
+  if (signal.action === 'observe') return false;
+  if (!isIntraday) return true;
+  if (signal.level === 'risk') return true;
+  return signal.level === 'S' || signal.level === 'S-' || signal.level === 'A+';
+}
+
+function compactSignalsForMarkers(signals: TradingSignal[], isIntraday: boolean): TradingSignal[] {
+  const filtered = signals.filter(signal => shouldKeepSignalForMarker(signal, isIntraday));
+  const windowed = filtered.slice(-(isIntraday ? 220 : 260));
+  const compacted: TradingSignal[] = [];
+
+  let lastBuySourceIndex = -9999;
+  let lastRiskSourceIndex = -9999;
+  let lastBuyCompactedIndex = -1;
+  let lastRiskCompactedIndex = -1;
+
+  for (let i = 0; i < windowed.length; i += 1) {
+    const signal = windowed[i];
+    const isBuy = signal.action === 'buy';
+    const minGap = isBuy ? (isIntraday ? 7 : 3) : (isIntraday ? 6 : 3);
+
+    if (isBuy) {
+      if (i - lastBuySourceIndex < minGap && lastBuyCompactedIndex >= 0) {
+        if (signalPriority(signal) > signalPriority(compacted[lastBuyCompactedIndex])) {
+          compacted[lastBuyCompactedIndex] = signal;
+        }
+        continue;
+      }
+      compacted.push(signal);
+      lastBuySourceIndex = i;
+      lastBuyCompactedIndex = compacted.length - 1;
+      continue;
+    }
+
+    if (i - lastRiskSourceIndex < minGap && lastRiskCompactedIndex >= 0) {
+      if (signalPriority(signal) > signalPriority(compacted[lastRiskCompactedIndex])) {
+        compacted[lastRiskCompactedIndex] = signal;
+      }
+      continue;
+    }
+    compacted.push(signal);
+    lastRiskSourceIndex = i;
+    lastRiskCompactedIndex = compacted.length - 1;
+  }
+
+  return compacted.slice(-(isIntraday ? 26 : 60));
+}
 
 // 批量移除 series 并清空 ref
 function clearSeriesArray(chart: IChartApi, refs: React.MutableRefObject<ISeriesApi<SeriesType, Time>[]>) {
@@ -79,7 +155,7 @@ function formatTimeDisplay(timeStr: string): string {
   return timeStr.slice(0, 10) + ' 00:00:00';
 }
 
-export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, period, onPeriodChange, stock }) => {
+export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, period, onPeriodChange, stock, dayKData = [] }) => {
   const { colors } = useTheme();
   const cc = useCandleColor();
   const { config: indicatorConfig, updateIndicator } = useIndicator();
@@ -93,6 +169,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
   const emaSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const bollSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const subSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
+  const signalMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const seriesTypeRef = useRef<'line' | 'candle' | null>(null);
   const hasFittedRef = useRef(false);
 
@@ -124,6 +201,13 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
   const [hoverData, setHoverData] = React.useState<KLineData | null>(null);
   const lastData = safeData[safeData.length - 1];
   const displayData = hoverData || lastData;
+  const tradingSignals = useMemo(
+    () => (isIntraday
+      ? calculateIntradayTradingSignals(safeData, preClose, dayKData)
+      : calculateTradingSignals(safeData)),
+    [isIntraday, safeData, preClose, dayKData],
+  );
+  const latestTradingSignal = useMemo(() => getLatestTradingSignal(tradingSignals), [tradingSignals]);
 
   const chartColors = useMemo(() => ({
     background: colors.isDark ? '#0f172a' : '#ffffff',
@@ -169,6 +253,10 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
     if (!chart || !volumeChart) return;
 
     if (mainSeriesRef.current) {
+      if (signalMarkersRef.current) {
+        signalMarkersRef.current.detach();
+        signalMarkersRef.current = null;
+      }
       try { chart.removeSeries(mainSeriesRef.current); } catch { /* already removed */ }
       mainSeriesRef.current = null;
     }
@@ -253,6 +341,8 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
       volumeChartRef.current = null;
       mainSeriesRef.current = null;
       volumeSeriesRef.current = null;
+      signalMarkersRef.current?.detach();
+      signalMarkersRef.current = null;
       maSeriesRefs.current = [];
       emaSeriesRefs.current = [];
       bollSeriesRefs.current = [];
@@ -300,6 +390,22 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
       volumeSeriesRef.current.setData(volData);
     }
   }, [chartColors, safeData]);
+
+  const compactMarkerSignals = useMemo(
+    () => compactSignalsForMarkers(tradingSignals, isIntraday),
+    [tradingSignals, isIntraday],
+  );
+
+  const signalMarkerData = useMemo<SeriesMarker<Time>[]>(() => (
+    compactMarkerSignals.map(signal => ({
+      time: signal.time,
+      position: signal.action === 'buy' ? 'belowBar' : 'aboveBar',
+      shape: signal.action === 'buy' ? 'arrowUp' : 'arrowDown',
+      color: signal.action === 'buy' ? '#f97316' : '#22c55e',
+      text: markerTextForSignal(signal, isIntraday),
+      size: isIntraday ? 0.75 : 0.9,
+    }))
+  ), [compactMarkerSignals, isIntraday]);
 
   // ========== 周期变化：更新 timeScale 选项 + 交互模式 ==========
   useEffect(() => {
@@ -450,6 +556,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
       // 更新数据
       const lineData: LineData[] = safeData.map(d => ({ time: parseTime(d.time), value: d.close }));
       mainSeriesRef.current.setData(lineData);
+      if (!signalMarkersRef.current) {
+        signalMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, signalMarkerData, { zOrder: 'top' });
+      } else {
+        signalMarkersRef.current.setMarkers(signalMarkerData);
+      }
 
       if (maSeriesRefs.current.length > 0) {
         const avgData: LineData[] = safeData.filter(d => d.avg).map(d => ({ time: parseTime(d.time), value: d.avg! }));
@@ -472,6 +583,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
         time: parseTime(d.time), open: d.open, high: d.high, low: d.low, close: d.close,
       }));
       mainSeriesRef.current.setData(candleData);
+      if (!signalMarkersRef.current) {
+        signalMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, signalMarkerData, { zOrder: 'top' });
+      } else {
+        signalMarkersRef.current.setMarkers(signalMarkerData);
+      }
 
       // --- MA 均线（配置驱动） ---
       for (const s of maSeriesRefs.current) seriesIndicatorMap.current.delete(s);
@@ -541,7 +657,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
       volumeChart.timeScale().fitContent();
       hasFittedRef.current = true;
     }
-  }, [safeData, updateMode, preClose, isIntraday, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig]);
+  }, [safeData, updateMode, preClose, isIntraday, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData]);
 
   // ========== 副图指标禁用时自动回退到成交量 ==========
   useEffect(() => {
@@ -664,6 +780,26 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
       Math.max(chartViewport.height - 120, 0),
     )
     : 0;
+  const getSignalClasses = (signal: TradingSignal) => {
+    if (signal.level === 'risk') {
+      return colors.isDark
+        ? 'border-emerald-500/30 bg-emerald-950/80 text-emerald-100'
+        : 'border-emerald-500/30 bg-emerald-50/95 text-emerald-800';
+    }
+    if (signal.level === 'S' || signal.level === 'S-' || signal.level === 'A+') {
+      return colors.isDark
+        ? 'border-orange-500/35 bg-orange-950/80 text-orange-100'
+        : 'border-orange-500/30 bg-orange-50/95 text-orange-800';
+    }
+    return colors.isDark
+      ? 'border-sky-500/30 bg-sky-950/80 text-sky-100'
+      : 'border-sky-500/30 bg-sky-50/95 text-sky-800';
+  };
+  const getSignalIcon = (signal: TradingSignal) => {
+    if (signal.level === 'risk') return <AlertTriangle size={14} />;
+    if (signal.level === 'S' || signal.level === 'S-' || signal.level === 'A+') return <Zap size={14} />;
+    return <Target size={14} />;
+  };
 
   return (
     <div className="h-full w-full fin-panel flex flex-col relative" onMouseDown={() => setIndicatorPopup(null)}>
@@ -812,6 +948,19 @@ export const StockChartLW: React.FC<StockChartProps> = ({ data, updateMode, peri
               ) : (
                 <span className={colors.isDark ? 'text-slate-600 line-through' : 'text-slate-400 line-through'}>BOLL</span>
               )}
+            </div>
+          </div>
+        )}
+
+        {latestTradingSignal && chartViewport.height >= 250 && (
+          <div className={`absolute top-2 right-12 z-20 max-w-[320px] rounded border px-3 py-2 shadow-sm backdrop-blur ${getSignalClasses(latestTradingSignal)}`}>
+            <div className="flex items-center gap-2 text-xs">
+              <span className="shrink-0">{getSignalIcon(latestTradingSignal)}</span>
+              <span className="font-bold">{latestTradingSignal.title}</span>
+              <span className="font-mono opacity-80">{latestTradingSignal.rawTime.slice(0, 10)}</span>
+            </div>
+            <div className="mt-1 line-clamp-2 text-[11px] opacity-85">
+              {latestTradingSignal.reason}
             </div>
           </div>
         )}

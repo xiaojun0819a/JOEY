@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/run-bigpig/jcp/internal/models"
@@ -64,7 +65,10 @@ func (cs *ConfigService) loadConfig() error {
 		VerboseAgentIO      *bool   `json:"verboseAgentIO"`
 		AgentSelectionStyle *string `json:"agentSelectionStyle"`
 		EnableSecondReview  *bool   `json:"enableSecondReview"`
-		Indicators          struct {
+		History             struct {
+			AutoCollectDaily *bool `json:"autoCollectDaily"`
+		} `json:"history"`
+		Indicators struct {
 			MA struct {
 				Enabled *bool `json:"enabled"`
 			} `json:"ma"`
@@ -103,6 +107,16 @@ func (cs *ConfigService) loadConfig() error {
 	}
 	if raw.EnableSecondReview == nil {
 		config.EnableSecondReview = defaultConfig.EnableSecondReview
+	}
+	if raw.History.AutoCollectDaily == nil {
+		config.History = defaultConfig.History
+	} else {
+		if strings.TrimSpace(config.History.CollectStart) == "" {
+			config.History.CollectStart = defaultConfig.History.CollectStart
+		}
+		if strings.TrimSpace(config.History.CollectEnd) == "" {
+			config.History.CollectEnd = defaultConfig.History.CollectEnd
+		}
 	}
 
 	d := defaultConfig.Indicators
@@ -187,6 +201,12 @@ func (cs *ConfigService) defaultConfig() *models.AppConfig {
 			MACD: models.MACDConfig{Enabled: true, Fast: 12, Slow: 26, Signal: 9},
 			RSI:  models.RSIConfig{Enabled: false, Period: 14},
 			KDJ:  models.KDJConfig{Enabled: false, Period: 9, K: 3, D: 3},
+		},
+		History: models.HistoryConfig{
+			AutoCollectDaily: false,
+			CollectStart:     "16:00",
+			CollectEnd:       "17:00",
+			IncludeBeijing:   false,
 		},
 	}
 }

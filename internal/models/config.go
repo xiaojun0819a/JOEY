@@ -89,6 +89,7 @@ type AppConfig struct {
 	Layout              LayoutConfig        `json:"layout"`     // 界面布局配置
 	OpenClaw            OpenClawConfig      `json:"openClaw"`   // OpenClaw 服务配置
 	Indicators          IndicatorConfig     `json:"indicators"` // 技术指标配置
+	History             HistoryConfig       `json:"history"`    // 历史数据采集配置
 }
 
 // ProxyMode 代理模式
@@ -130,6 +131,15 @@ type OpenClawConfig struct {
 	Enabled bool   `json:"enabled"` // 是否启用
 	Port    int    `json:"port"`    // 监听端口
 	APIKey  string `json:"apiKey"`  // API 鉴权密钥（可选）
+}
+
+// HistoryConfig 历史数据采集配置
+type HistoryConfig struct {
+	AutoCollectDaily bool   `json:"autoCollectDaily"` // 是否每日盘后自动采集
+	CollectStart     string `json:"collectStart"`     // 开始时间 HH:MM
+	CollectEnd       string `json:"collectEnd"`       // 结束时间 HH:MM
+	IncludeBeijing   bool   `json:"includeBeijing"`   // 是否包含北交所
+	LastCollectDate  string `json:"lastCollectDate"`  // 上次自动采集日期
 }
 
 // IndicatorConfig 技术指标配置

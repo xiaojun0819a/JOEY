@@ -9,20 +9,37 @@ import { PositionDialog } from './components/PositionDialog';
 import { HotTrendDialog } from './components/HotTrendDialog';
 import { LongHuBangDialog } from './components/LongHuBangDialog';
 import { MarketMovesDialog } from './components/MarketMovesDialog';
+import LowBuyScannerDialog, {
+  type HistoryAutoCollectRequest,
+  type HistoryAutoCollectStatus,
+  type HistoryCollectRequest,
+  type HistoryCollectResult,
+  type LowBuyScannerResult,
+  type LowBuyScannerRequest,
+} from './components/LowBuyScannerDialog';
+import ModelRadarStrip from './components/ModelRadarStrip';
+import SafeBoundary from './components/SafeBoundary';
 import { WelcomePage } from './components/WelcomePage';
 import { ThemeSwitcher } from './components/ThemeSwitcher';
 import { useTheme } from './contexts/ThemeContext';
 import { useCandleColor } from './contexts/CandleColorContext';
 import { ResizeHandle } from './components/ResizeHandle';
+import { isWailsGoReady, isWailsRuntimeReady, warnWailsUnavailable } from './utils/wailsEnv';
 import { getWatchlist, addToWatchlist, removeFromWatchlist } from './services/watchlistService';
 import { getKLineData, getOrderBook } from './services/stockService';
-import { getF10Overview } from './services/f10Service';
+import { getF10Overview, getF10Valuation } from './services/f10Service';
+import {
+  collectDailyHistory,
+  getHistoryAutoCollectStatus,
+  runLowBuyScannerV1,
+  updateHistoryAutoCollect,
+} from './services/scannerService';
 import { getOrCreateSession, StockSession, updateStockPosition } from './services/sessionService';
 import { getConfig, updateConfig } from './services/configService';
 import { useMarketEvents } from './hooks/useMarketEvents';
 import { useMarketStatus } from './hooks/useMarketStatus';
-import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex, F10Overview } from './types';
-import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity } from 'lucide-react';
+import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex, F10Overview, StockValuation } from './types';
+import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity, RefreshCw, Search } from 'lucide-react';
 import logo from './assets/images/logo.png';
 import { GetTelegraphList, OpenURL, WindowMinimize, WindowMaximize, WindowClose } from '../wailsjs/go/main/App';
 import { WindowIsMaximised, WindowSetSize, WindowGetSize } from '../wailsjs/runtime/runtime';
@@ -31,20 +48,63 @@ import { WindowIsMaximised, WindowSetSize, WindowGetSize } from '../wailsjs/runt
 const LAYOUT_DEFAULTS = {
   leftPanelWidth: 280,
   rightPanelWidth: 384,
-  bottomPanelHeight: 180,
+  bottomPanelHeight: 132,
 };
 const LAYOUT_MIN = {
-  leftPanelWidth: 280,
-  rightPanelWidth: 384,
-  bottomPanelHeight: 120,
+  leftPanelWidth: 180,
+  rightPanelWidth: 260,
+  bottomPanelHeight: 96,
 };
 const LAYOUT_MAX = {
-  leftPanelWidth: 500,
-  rightPanelWidth: 700,
-  bottomPanelHeight: 450,
+  leftPanelWidth: 760,
+  rightPanelWidth: 860,
+  bottomPanelHeight: 320,
+};
+const CENTER_PANEL_MIN_WIDTH = 640;
+const RESIZE_HANDLES_TOTAL_WIDTH = 2;
+const ORDERBOOK_COMPACT_CAP = 150;
+const BOOTSTRAP_TIMEOUT_MS = 8000;
+const RADAR_PANEL_MIN_HEIGHT = 72;
+const RADAR_PANEL_MAX_HEIGHT = 560;
+const RADAR_PANEL_DEFAULT_HEIGHT = 138;
+
+const clampValue = (value: number, min: number, max: number): number => (
+  Math.max(min, Math.min(max, value))
+);
+
+const getLeftPanelMax = (viewportWidth: number, rightWidth: number): number => {
+  const byViewport = viewportWidth - rightWidth - CENTER_PANEL_MIN_WIDTH - RESIZE_HANDLES_TOTAL_WIDTH;
+  return Math.max(
+    LAYOUT_MIN.leftPanelWidth,
+    Math.min(LAYOUT_MAX.leftPanelWidth, byViewport),
+  );
+};
+
+const getRightPanelMax = (viewportWidth: number, leftWidth: number): number => {
+  const byViewport = viewportWidth - leftWidth - CENTER_PANEL_MIN_WIDTH - RESIZE_HANDLES_TOTAL_WIDTH;
+  return Math.max(
+    LAYOUT_MIN.rightPanelWidth,
+    Math.min(LAYOUT_MAX.rightPanelWidth, byViewport),
+  );
+};
+
+const normalizeSidePanelWidths = (
+  viewportWidth: number,
+  leftWidth: number,
+  rightWidth: number,
+): { left: number; right: number } => {
+  let left = clampValue(leftWidth, LAYOUT_MIN.leftPanelWidth, getLeftPanelMax(viewportWidth, rightWidth));
+  let right = clampValue(rightWidth, LAYOUT_MIN.rightPanelWidth, getRightPanelMax(viewportWidth, left));
+  left = clampValue(left, LAYOUT_MIN.leftPanelWidth, getLeftPanelMax(viewportWidth, right));
+  return { left, right };
 };
 
 type KLineUpdateMode = 'full' | 'incremental' | 'refresh';
+type MultiCycleKLines = {
+  daily: KLineData[];
+  weekly: KLineData[];
+  monthly: KLineData[];
+};
 
 const App: React.FC = () => {
   const { colors } = useTheme();
@@ -66,13 +126,42 @@ const App: React.FC = () => {
   const [showHotTrend, setShowHotTrend] = useState(false);
   const [showLongHuBang, setShowLongHuBang] = useState(false);
   const [showMarketMoves, setShowMarketMoves] = useState(false);
+  const [showLowBuyScanner, setShowLowBuyScanner] = useState(false);
   const [showF10, setShowF10] = useState(false);
   const [marketIndices, setMarketIndices] = useState<MarketIndex[]>([]);
   const [isMaximized, setIsMaximized] = useState(false);
   const [f10Overview, setF10Overview] = useState<F10Overview | null>(null);
+  const [valuationSnapshot, setValuationSnapshot] = useState<StockValuation | null>(null);
+  const [multiCycleKLines, setMultiCycleKLines] = useState<MultiCycleKLines>({
+    daily: [],
+    weekly: [],
+    monthly: [],
+  });
   const [f10Loading, setF10Loading] = useState(false);
   const [f10Error, setF10Error] = useState('');
+  const [syncingRadar, setSyncingRadar] = useState(false);
+  const [loadingHint, setLoadingHint] = useState('');
+  const [scannerLoading, setScannerLoading] = useState(false);
+  const [scannerError, setScannerError] = useState('');
+  const [scannerResult, setScannerResult] = useState<LowBuyScannerResult | null>(null);
   const klineRequestIdRef = useRef(0);
+  const valuationRequestIdRef = useRef(0);
+  const multiCycleRequestIdRef = useRef(0);
+
+  const withTimeoutOr = useCallback(async <T,>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> => {
+    return await new Promise<T>((resolve) => {
+      const timer = setTimeout(() => resolve(fallback), timeoutMs);
+      promise
+        .then(value => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch(() => {
+          clearTimeout(timer);
+          resolve(fallback);
+        });
+    });
+  }, []);
 
   // 使用纯前端市场状态判断
   const { status: marketStatus } = useMarketStatus();
@@ -81,11 +170,29 @@ const App: React.FC = () => {
   const [leftPanelWidth, setLeftPanelWidth] = useState(LAYOUT_DEFAULTS.leftPanelWidth);
   const [rightPanelWidth, setRightPanelWidth] = useState(LAYOUT_DEFAULTS.rightPanelWidth);
   const [bottomPanelHeight, setBottomPanelHeight] = useState(LAYOUT_DEFAULTS.bottomPanelHeight);
+  const [radarPanelHeight, setRadarPanelHeight] = useState(RADAR_PANEL_DEFAULT_HEIGHT);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clampSidePanelsToViewport = useCallback((left: number, right: number) => {
+    const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 1920;
+    return normalizeSidePanelWidths(viewportWidth, left, right);
+  }, []);
 
   const selectedStock = useMemo(() =>
     watchlist.find(s => s.symbol === selectedSymbol) || watchlist[0]
   , [selectedSymbol, watchlist]);
+
+  const safeKLineData = useMemo(() => (
+    (kLineData || []).filter((item): item is KLineData => (
+      !!item
+      && typeof item.time === 'string'
+      && Number.isFinite(item.open)
+      && Number.isFinite(item.high)
+      && Number.isFinite(item.low)
+      && Number.isFinite(item.close)
+      && Number.isFinite(item.volume)
+    ))
+  ), [kLineData]);
 
   // 处理股票数据更新（来自后端推送）
   const handleStockUpdate = useCallback((stocks: Stock[]) => {
@@ -147,6 +254,7 @@ const App: React.FC = () => {
   }, [selectedSymbol, timePeriod]);
 
   const syncWindowMaximizedState = useCallback(async () => {
+    if (!isWailsRuntimeReady()) return;
     try {
       const maximized = await WindowIsMaximised();
       setIsMaximized(maximized);
@@ -156,6 +264,10 @@ const App: React.FC = () => {
   }, []);
 
   const toggleWindowMaximize = useCallback(async () => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('窗口最大化', 'go');
+      return;
+    }
     try {
       await WindowMaximize();
       await syncWindowMaximizedState();
@@ -170,6 +282,7 @@ const App: React.FC = () => {
     left: number, right: number, bottom: number,
     winWidth?: number, winHeight?: number
   ) => {
+    if (!isWailsGoReady() || !isWailsRuntimeReady()) return;
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
     }
@@ -194,24 +307,28 @@ const App: React.FC = () => {
   // 左侧面板 resize
   const handleLeftResize = useCallback((delta: number) => {
     setLeftPanelWidth(prev => {
-      const newWidth = Math.max(LAYOUT_MIN.leftPanelWidth, Math.min(LAYOUT_MAX.leftPanelWidth, prev + delta));
-      return newWidth;
+      const next = clampSidePanelsToViewport(prev + delta, rightPanelWidth);
+      return next.left;
     });
-  }, []);
+  }, [rightPanelWidth, clampSidePanelsToViewport]);
 
   // 右侧面板 resize
   const handleRightResize = useCallback((delta: number) => {
     setRightPanelWidth(prev => {
-      const newWidth = Math.max(LAYOUT_MIN.rightPanelWidth, Math.min(LAYOUT_MAX.rightPanelWidth, prev - delta));
-      return newWidth;
+      const next = clampSidePanelsToViewport(leftPanelWidth, prev - delta);
+      return next.right;
     });
-  }, []);
+  }, [leftPanelWidth, clampSidePanelsToViewport]);
 
-  // 底部面板 resize
-  const handleBottomResize = useCallback((delta: number) => {
-    setBottomPanelHeight(prev => {
-      const newHeight = Math.max(LAYOUT_MIN.bottomPanelHeight, Math.min(LAYOUT_MAX.bottomPanelHeight, prev - delta));
-      return newHeight;
+  // 模型驾驶舱高度 resize（向上拖动会收缩，向下拖动会展开）
+  const handleRadarResize = useCallback((delta: number) => {
+    setRadarPanelHeight(prev => {
+      const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 1200;
+      const dynamicMax = Math.max(
+        RADAR_PANEL_MIN_HEIGHT,
+        Math.min(RADAR_PANEL_MAX_HEIGHT, Math.round(viewportHeight * 0.58)),
+      );
+      return clampValue(prev + delta, RADAR_PANEL_MIN_HEIGHT, dynamicMax);
     });
   }, []);
 
@@ -240,8 +357,34 @@ const App: React.FC = () => {
     };
   }, [leftPanelWidth, rightPanelWidth, bottomPanelHeight, saveLayoutConfig]);
 
+  // Keep orderbook compact so the middle chart has more visual space.
+  useEffect(() => {
+    if (bottomPanelHeight > ORDERBOOK_COMPACT_CAP) {
+      setBottomPanelHeight(ORDERBOOK_COMPACT_CAP);
+    }
+  }, [bottomPanelHeight]);
+
+  // Prevent an all-black startup if any bridge call gets stuck.
+  useEffect(() => {
+    if (!loading) return;
+    const timer = setTimeout(() => {
+      setLoadingHint('初始化超时，已切换到降级界面');
+      setLoading(false);
+    }, BOOTSTRAP_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [loading]);
+
   // 获取快讯列表
   const handleShowTelegraphList = async () => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('快讯列表', 'go');
+      setShowTelegraphList(prev => !prev);
+      setTelegraphLoading(false);
+      if (!showTelegraphList) {
+        setTelegraphList([]);
+      }
+      return;
+    }
     if (!showTelegraphList) {
       setShowTelegraphList(true);
       setTelegraphLoading(true);
@@ -259,25 +402,102 @@ const App: React.FC = () => {
   // 打开快讯链接
   const handleOpenTelegraph = (telegraph: Telegraph) => {
     if (telegraph.url) {
-      OpenURL(telegraph.url);
+      if (isWailsGoReady()) {
+        OpenURL(telegraph.url);
+      } else {
+        window.open(telegraph.url, '_blank', 'noopener,noreferrer');
+      }
     }
     setShowTelegraphList(false);
   };
 
-  const fetchSelectedF10 = useCallback(async (symbol: string) => {
+  const handleWindowMinimize = useCallback(() => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('窗口最小化', 'go');
+      return;
+    }
+    void WindowMinimize();
+  }, []);
+
+  const handleWindowClose = useCallback(() => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('关闭窗口', 'go');
+      return;
+    }
+    void WindowClose();
+  }, []);
+
+  const fetchSelectedF10 = useCallback(async (symbol: string, options?: { silent?: boolean }) => {
     if (!symbol) return;
-    setF10Loading(true);
-    setF10Error('');
+    const silent = options?.silent === true;
+    if (!silent) {
+      setF10Loading(true);
+      setF10Error('');
+    }
     try {
       const overview = await getF10Overview(symbol);
       setF10Overview(overview);
     } catch (err) {
       console.error('Failed to load F10 overview:', err);
-      setF10Error(err instanceof Error ? err.message : '获取F10数据失败');
+      if (!silent) {
+        setF10Error(err instanceof Error ? err.message : '获取F10数据失败');
+      }
     } finally {
-      setF10Loading(false);
+      if (!silent) {
+        setF10Loading(false);
+      }
     }
   }, []);
+
+  const fetchSelectedValuation = useCallback(async (symbol: string) => {
+    if (!symbol) return;
+    const requestId = ++valuationRequestIdRef.current;
+    try {
+      const valuation = await getF10Valuation(symbol);
+      if (requestId !== valuationRequestIdRef.current) return;
+      if (valuation && (valuation.totalMarketCap || valuation.totalShares || valuation.price)) {
+        setValuationSnapshot(valuation);
+      }
+    } catch (err) {
+      console.warn('Failed to load valuation snapshot:', err);
+    }
+  }, []);
+
+  const fetchMultiCycleKLines = useCallback(async (symbol: string) => {
+    if (!symbol) return;
+    const requestId = ++multiCycleRequestIdRef.current;
+    const [daily, weekly, monthly] = await Promise.all([
+      withTimeoutOr(getKLineData(symbol, '1d', 260), 5000, [] as KLineData[]),
+      withTimeoutOr(getKLineData(symbol, '1w', 220), 5000, [] as KLineData[]),
+      withTimeoutOr(getKLineData(symbol, '1mo', 180), 5000, [] as KLineData[]),
+    ]);
+    if (requestId !== multiCycleRequestIdRef.current) return;
+    setMultiCycleKLines({
+      daily: Array.isArray(daily) ? daily : [],
+      weekly: Array.isArray(weekly) ? weekly : [],
+      monthly: Array.isArray(monthly) ? monthly : [],
+    });
+  }, [withTimeoutOr]);
+
+  const forceSyncSelectedStock = useCallback(async () => {
+    if (!selectedSymbol) return;
+    setSyncingRadar(true);
+    try {
+      const dataLen = timePeriod === '1m' ? 250 : 240;
+      const [latestKline] = await Promise.all([
+        withTimeoutOr(getKLineData(selectedSymbol, timePeriod, dataLen), 4000, [] as KLineData[]),
+        withTimeoutOr(fetchSelectedF10(selectedSymbol, { silent: true }), 5000, undefined as void | undefined),
+        withTimeoutOr(fetchSelectedValuation(selectedSymbol), 5000, undefined as void | undefined),
+        withTimeoutOr(fetchMultiCycleKLines(selectedSymbol), 5500, undefined as void | undefined),
+      ]);
+      if (Array.isArray(latestKline) && latestKline.length > 0) {
+        setKLineUpdateMode('refresh');
+        setKLineData(latestKline);
+      }
+    } finally {
+      setSyncingRadar(false);
+    }
+  }, [selectedSymbol, timePeriod, withTimeoutOr, fetchSelectedF10, fetchSelectedValuation, fetchMultiCycleKLines]);
 
   const handleShowTrend = useCallback(() => {
     setShowF10(false);
@@ -285,6 +505,46 @@ const App: React.FC = () => {
 
   const handleShowF10 = useCallback(() => {
     setShowF10(true);
+  }, []);
+
+  const handlePageRefresh = useCallback(() => {
+    window.location.reload();
+  }, []);
+
+  const handleOpenLowBuyScanner = useCallback(() => {
+    setShowLowBuyScanner(true);
+    setScannerError('');
+  }, []);
+
+  const handleRunLowBuyScanner = useCallback(async (req: LowBuyScannerRequest) => {
+    setScannerLoading(true);
+    setScannerError('');
+    try {
+      const result = await runLowBuyScannerV1(req);
+      if (!result) {
+        setScannerError('当前为浏览器预览模式，请从 Wails 开发入口打开后再扫描。');
+        setScannerResult(null);
+        return;
+      }
+      setScannerResult(result);
+    } catch (err) {
+      setScannerError(err instanceof Error ? err.message : '扫描失败，请稍后重试');
+      setScannerResult(null);
+    } finally {
+      setScannerLoading(false);
+    }
+  }, []);
+
+  const handleCollectDailyHistory = useCallback(async (req: HistoryCollectRequest): Promise<HistoryCollectResult | null> => {
+    return await collectDailyHistory(req);
+  }, []);
+
+  const handleGetHistoryAutoCollectStatus = useCallback(async (): Promise<HistoryAutoCollectStatus | null> => {
+    return await getHistoryAutoCollectStatus();
+  }, []);
+
+  const handleUpdateHistoryAutoCollect = useCallback(async (req: HistoryAutoCollectRequest): Promise<HistoryAutoCollectStatus | null> => {
+    return await updateHistoryAutoCollect(req);
   }, []);
 
   // 使用市场事件 Hook
@@ -315,6 +575,21 @@ const App: React.FC = () => {
       setOrderBook(orderBookData);
     }
   };
+
+  const handleAddFromLongHuBang = useCallback(async (newStock: Stock): Promise<boolean> => {
+    const normalizedSymbol = String(newStock.symbol || '').trim().toLowerCase();
+    if (!normalizedSymbol) return false;
+    if (watchlist.some(s => s.symbol.toLowerCase() === normalizedSymbol)) return false;
+
+    const stockToAdd: Stock = { ...newStock, symbol: normalizedSymbol };
+    await addToWatchlist(stockToAdd);
+    setWatchlist(prev => (
+      prev.some(s => s.symbol.toLowerCase() === normalizedSymbol)
+        ? prev
+        : [...prev, stockToAdd]
+    ));
+    return true;
+  }, [watchlist]);
 
   // Handle Removing Stock
   const handleRemoveStock = async (symbol: string) => {
@@ -351,41 +626,50 @@ const App: React.FC = () => {
     const loadWatchlist = async () => {
       try {
         // 加载布局配置
-        const config = await getConfig();
+        const config = await withTimeoutOr(getConfig(), 3500, null as any);
         if (config.layout) {
-          if (config.layout.leftPanelWidth > 0) setLeftPanelWidth(config.layout.leftPanelWidth);
-          if (config.layout.rightPanelWidth > 0) setRightPanelWidth(config.layout.rightPanelWidth);
-          if (config.layout.bottomPanelHeight > 0) setBottomPanelHeight(config.layout.bottomPanelHeight);
+          const layoutLeft = config.layout.leftPanelWidth > 0 ? config.layout.leftPanelWidth : LAYOUT_DEFAULTS.leftPanelWidth;
+          const layoutRight = config.layout.rightPanelWidth > 0 ? config.layout.rightPanelWidth : LAYOUT_DEFAULTS.rightPanelWidth;
+          const normalized = clampSidePanelsToViewport(layoutLeft, layoutRight);
+          setLeftPanelWidth(normalized.left);
+          setRightPanelWidth(normalized.right);
+          if (config.layout.bottomPanelHeight > 0) {
+            // Keep the orderbook compact to prioritize chart visibility.
+            setBottomPanelHeight(Math.min(config.layout.bottomPanelHeight, 150));
+          }
           // 恢复窗口大小
           if (config.layout.windowWidth > 0 && config.layout.windowHeight > 0) {
             WindowSetSize(config.layout.windowWidth, config.layout.windowHeight);
           }
         }
 
-        const list = await getWatchlist();
+        const list = await withTimeoutOr(getWatchlist(), 3500, [] as Stock[]);
         setWatchlist(list);
         if (list.length > 0) {
           setSelectedSymbol(list[0].symbol);
           // 订阅第一个股票的盘口推送
           subscribeOrderBook(list[0].symbol);
           // 加载第一个股票的Session
-          const session = await getOrCreateSession(list[0].symbol, list[0].name);
-          setCurrentSession(session);
+          const session = await withTimeoutOr(getOrCreateSession(list[0].symbol, list[0].name), 3500, null as StockSession | null);
+          if (session) setCurrentSession(session);
         }
         // 主动获取一次快讯数据（解决启动时后端推送早于前端监听注册的时序问题）
-        const telegraphs = await GetTelegraphList();
-        if (telegraphs && telegraphs.length > 0) {
-          const latest = telegraphs[0];
-          setMarketMessage(`[${latest.time}] ${latest.content}`);
+        if (isWailsGoReady()) {
+          const telegraphs = await withTimeoutOr(GetTelegraphList(), 2500, [] as Telegraph[]);
+          if (telegraphs && telegraphs.length > 0) {
+            const latest = telegraphs[0];
+            setMarketMessage(`[${latest.time}] ${latest.content}`);
+          }
         }
       } catch (err) {
         console.error('Failed to load watchlist:', err);
+        setLoadingHint('初始化异常，已进入降级模式');
       } finally {
         setLoading(false);
       }
     };
     loadWatchlist();
-  }, [subscribeOrderBook]);
+  }, [subscribeOrderBook, withTimeoutOr, clampSidePanelsToViewport]);
 
   // Load K-line data when symbol or period changes
   useEffect(() => {
@@ -428,21 +712,123 @@ const App: React.FC = () => {
 
   useEffect(() => {
     setShowF10(false);
-    setF10Overview(null);
     setF10Error('');
-  }, [selectedSymbol]);
+    setValuationSnapshot(null);
+    setMultiCycleKLines({ daily: [], weekly: [], monthly: [] });
+    if (selectedSymbol) {
+      void fetchSelectedF10(selectedSymbol, { silent: true });
+      void fetchSelectedValuation(selectedSymbol);
+      void fetchMultiCycleKLines(selectedSymbol);
+    }
+  }, [selectedSymbol, fetchSelectedF10, fetchSelectedValuation, fetchMultiCycleKLines]);
 
   useEffect(() => {
     if (!showF10 || !selectedSymbol) return;
-    void fetchSelectedF10(selectedSymbol);
+    void fetchSelectedF10(selectedSymbol, { silent: false });
   }, [showF10, selectedSymbol, fetchSelectedF10]);
+
+  // Periodically pull latest K-line to avoid stale data when push is delayed.
+  useEffect(() => {
+    if (!selectedSymbol) return;
+    let cancelled = false;
+    let inFlight = false;
+    const intervalMs = timePeriod === '1m' ? 45_000 : 180_000;
+
+    const syncLatest = async () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
+      try {
+        const dataLen = timePeriod === '1m' ? 250 : 240;
+        const latest = await withTimeoutOr(getKLineData(selectedSymbol, timePeriod, dataLen), 4000, [] as KLineData[]);
+        if (!cancelled && Array.isArray(latest) && latest.length > 0) {
+          setKLineUpdateMode('refresh');
+          setKLineData(latest);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const bootstrapTimer = setTimeout(syncLatest, 1600);
+    const intervalTimer = setInterval(syncLatest, intervalMs);
+    return () => {
+      cancelled = true;
+      clearTimeout(bootstrapTimer);
+      clearInterval(intervalTimer);
+    };
+  }, [selectedSymbol, timePeriod, withTimeoutOr]);
+
+  // Slow-cycle K data for daily/weekly/monthly resonance validation.
+  useEffect(() => {
+    if (!selectedSymbol) return;
+    let cancelled = false;
+    let inFlight = false;
+
+    const syncMultiCycle = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        await fetchMultiCycleKLines(selectedSymbol);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const bootstrapTimer = setTimeout(syncMultiCycle, 1800);
+    const intervalTimer = setInterval(syncMultiCycle, 6 * 60_000);
+    return () => {
+      cancelled = true;
+      clearTimeout(bootstrapTimer);
+      clearInterval(intervalTimer);
+    };
+  }, [selectedSymbol, fetchMultiCycleKLines]);
 
   // 初始化窗口最大化状态
   useEffect(() => {
     void syncWindowMaximizedState();
   }, [syncWindowMaximizedState]);
 
-  if (loading) return <div className="h-screen w-screen flex items-center justify-center fin-app text-white">加载中...</div>;
+  // Keep side panels valid when the window is resized.
+  useEffect(() => {
+    const applyViewportClamp = () => {
+      const normalized = clampSidePanelsToViewport(leftPanelWidth, rightPanelWidth);
+      if (normalized.left !== leftPanelWidth) {
+        setLeftPanelWidth(normalized.left);
+      }
+      if (normalized.right !== rightPanelWidth) {
+        setRightPanelWidth(normalized.right);
+      }
+    };
+    applyViewportClamp();
+    window.addEventListener('resize', applyViewportClamp);
+    return () => window.removeEventListener('resize', applyViewportClamp);
+  }, [leftPanelWidth, rightPanelWidth, clampSidePanelsToViewport]);
+
+  // Keep radar panel height in a usable range.
+  useEffect(() => {
+    const clampRadarHeight = () => {
+      const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 1200;
+      const dynamicMax = Math.max(
+        RADAR_PANEL_MIN_HEIGHT,
+        Math.min(RADAR_PANEL_MAX_HEIGHT, Math.round(viewportHeight * 0.58)),
+      );
+      setRadarPanelHeight(prev => clampValue(prev, RADAR_PANEL_MIN_HEIGHT, dynamicMax));
+    };
+    clampRadarHeight();
+    window.addEventListener('resize', clampRadarHeight);
+    return () => window.removeEventListener('resize', clampRadarHeight);
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="h-screen w-screen flex items-center justify-center fin-app text-white">
+        <div className="text-center">
+          <div>加载中...</div>
+          {loadingHint && <div className="text-xs mt-2 text-amber-300">{loadingHint}</div>}
+        </div>
+      </div>
+    );
+  }
 
   // 没有自选股时显示欢迎页面
   if (watchlist.length === 0) {
@@ -466,7 +852,7 @@ const App: React.FC = () => {
       >
         <div className="flex items-center gap-2" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}>
           <img src={logo} alt="logo" className="h-8 w-8 rounded-lg" />
-          <span className={`font-bold text-lg tracking-tight ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>韭菜盘 <span className="text-accent-2">AI</span></span>
+          <span className={`font-bold text-lg tracking-tight ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>JOEY <span className="text-accent-2">AI</span></span>
         </div>
         
         <div className="flex items-center gap-4 fin-panel-soft px-4 py-1.5 rounded-full border fin-divider relative" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}>
@@ -515,6 +901,14 @@ const App: React.FC = () => {
 
         <div className="flex items-center gap-3" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}>
           <button
+            onClick={handleOpenLowBuyScanner}
+            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-fuchsia-400/40`}
+            title="V1.1 高胜率短线规则（全A扫描）"
+          >
+            <Search className="h-3.5 w-3.5" />
+            <span>低吸选股</span>
+          </button>
+          <button
             onClick={() => setShowLongHuBang(true)}
             className={`p-2 rounded-lg fin-panel border fin-divider transition-colors ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-red-400/40`}
             title="龙虎榜"
@@ -534,6 +928,13 @@ const App: React.FC = () => {
             title="异动中心"
           >
             <Activity className="h-4 w-4" />
+          </button>
+          <button
+            onClick={handlePageRefresh}
+            className={`p-2 rounded-lg fin-panel border fin-divider transition-colors ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-emerald-400/40`}
+            title="刷新页面"
+          >
+            <RefreshCw className="h-4 w-4" />
           </button>
           <ThemeSwitcher />
           <button
@@ -556,7 +957,7 @@ const App: React.FC = () => {
           {/* 窗口控制按钮 */}
           <div className="flex items-center ml-2 border-l fin-divider pl-3">
             <button
-              onClick={() => WindowMinimize()}
+              onClick={handleWindowMinimize}
               className={`p-1.5 rounded transition-colors ${colors.isDark ? 'hover:bg-slate-700/50 text-slate-400 hover:text-white' : 'hover:bg-slate-200/50 text-slate-500 hover:text-slate-900'}`}
               title="最小化"
             >
@@ -570,7 +971,7 @@ const App: React.FC = () => {
               {isMaximized ? <Copy className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
             </button>
             <button
-              onClick={() => WindowClose()}
+              onClick={handleWindowClose}
               className={`p-1.5 rounded hover:bg-red-500/80 hover:text-white transition-colors ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}
               title="关闭"
             >
@@ -600,65 +1001,107 @@ const App: React.FC = () => {
         {/* Center Panel: Charts & Data */}
         <div className="flex-1 flex flex-col min-w-0 fin-panel-center">
           {/* Stock Header - A股风格 */}
-          <div className="px-6 py-3 shrink-0 border-b fin-divider-soft">
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-3">
-                <span className={`text-lg font-bold ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>{selectedStock.name}</span>
-                <span className={`text-sm font-mono ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>{selectedStock.symbol}</span>
-                <button
-                  onClick={() => setShowPosition(true)}
-                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${colors.isDark ? 'text-slate-400 hover:bg-slate-700/50' : 'text-slate-500 hover:bg-slate-200/50'} hover:text-accent-2`}
-                  title="持仓设置"
-                >
-                  <Briefcase className="h-3.5 w-3.5" />
-                  {currentSession?.position && currentSession.position.shares > 0 ? (
-                    (() => {
-                      const pos = currentSession.position;
-                      const marketValue = pos.shares * selectedStock.price;
-                      const costAmount = pos.shares * pos.costPrice;
-                      const profitLoss = marketValue - costAmount;
-                      const profitPercent = costAmount > 0 ? (profitLoss / costAmount) * 100 : 0;
-                      const isProfit = profitLoss >= 0;
-                      return (
-                        <span className={isProfit ? cc.upClass : cc.downClass}>
-                          {pos.shares}股 {isProfit ? '+' : ''}{profitLoss.toFixed(0)} ({isProfit ? '+' : ''}{profitPercent.toFixed(2)}%)
-                        </span>
-                      );
-                    })()
-                  ) : (
-                    <span>设置持仓</span>
-                  )}
-                </button>
+          <div className="px-6 py-2 shrink-0 border-b fin-divider-soft">
+            <div className="grid grid-cols-[auto_1fr_auto] items-start gap-3">
+              <div className="flex min-w-0 flex-col gap-1.5">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className={`text-lg font-bold ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>{selectedStock.name}</span>
+                  <span className={`text-sm font-mono ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>{selectedStock.symbol}</span>
+                  <button
+                    onClick={() => setShowPosition(true)}
+                    className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${colors.isDark ? 'text-slate-400 hover:bg-slate-700/50' : 'text-slate-500 hover:bg-slate-200/50'} hover:text-accent-2`}
+                    title="持仓设置"
+                  >
+                    <Briefcase className="h-3.5 w-3.5" />
+                    {currentSession?.position && currentSession.position.shares > 0 ? (
+                      (() => {
+                        const pos = currentSession.position;
+                        const marketValue = pos.shares * selectedStock.price;
+                        const costAmount = pos.shares * pos.costPrice;
+                        const profitLoss = marketValue - costAmount;
+                        const profitPercent = costAmount > 0 ? (profitLoss / costAmount) * 100 : 0;
+                        const isProfit = profitLoss >= 0;
+                        return (
+                          <span className={isProfit ? cc.upClass : cc.downClass}>
+                            {pos.shares}股 {isProfit ? '+' : ''}{profitLoss.toFixed(0)} ({isProfit ? '+' : ''}{profitPercent.toFixed(2)}%)
+                          </span>
+                        );
+                      })()
+                    ) : (
+                      <span>设置持仓</span>
+                    )}
+                  </button>
+                </div>
+                <div className="flex items-center gap-4 text-sm">
+                  <span className={`font-mono ${cc.getColorClass(selectedStock.change >= 0)}`}>
+                    {selectedStock.change >= 0 ? '+' : ''}{selectedStock.change.toFixed(2)}
+                  </span>
+                  <span className={`font-mono ${cc.getColorClass(selectedStock.change >= 0)}`}>
+                    {selectedStock.change >= 0 ? '+' : ''}{selectedStock.changePercent.toFixed(2)}%
+                  </span>
+                </div>
               </div>
-              <div className={`text-3xl font-mono font-bold ${cc.getColorClass(selectedStock.change >= 0)}`}>
-                {selectedStock.price.toFixed(2)}
+
+              <div className="min-w-0 w-full max-w-[860px]">
+                <OrderBookComponent
+                  data={orderBook}
+                  compact
+                  levels={5}
+                  className="h-[108px]"
+                />
               </div>
-            </div>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-4 text-sm">
-                <span className={`font-mono ${cc.getColorClass(selectedStock.change >= 0)}`}>
-                  {selectedStock.change >= 0 ? '+' : ''}{selectedStock.change.toFixed(2)}
-                </span>
-                <span className={`font-mono ${cc.getColorClass(selectedStock.change >= 0)}`}>
-                  {selectedStock.change >= 0 ? '+' : ''}{selectedStock.changePercent.toFixed(2)}%
-                </span>
-              </div>
-              <div className={`text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
-                {new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+
+              <div className="flex flex-col items-end gap-1.5">
+                <div className={`text-3xl font-mono font-bold text-right ${cc.getColorClass(selectedStock.change >= 0)}`}>
+                  {selectedStock.price.toFixed(2)}
+                </div>
+                <div className={`text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+                  {new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                </div>
               </div>
             </div>
           </div>
 
-          {/* A股传统行情数据 */}
-          <div className="grid grid-cols-4 gap-px p-2 border-b fin-divider-soft shrink-0 text-xs">
-            <AStockStatItem label="今开" value={selectedStock.open} preClose={selectedStock.preClose} isDark={colors.isDark} />
-            <AStockStatItem label="最高" value={selectedStock.high} preClose={selectedStock.preClose} isDark={colors.isDark} />
-            <AStockStatItem label="成交量" value={formatVolume(selectedStock.volume)} isPlain isDark={colors.isDark} />
-            <AStockStatItem label="昨收" value={selectedStock.preClose} isPlain isDark={colors.isDark} />
-            <AStockStatItem label="最低" value={selectedStock.low} preClose={selectedStock.preClose} isDark={colors.isDark} />
-            <AStockStatItem label="成交额" value={formatAmount(selectedStock.amount)} isPlain isDark={colors.isDark} />
-            <AStockStatItem label="振幅" value={selectedStock.preClose > 0 ? ((selectedStock.high - selectedStock.low) / selectedStock.preClose * 100).toFixed(2) + '%' : '--'} isPlain isDark={colors.isDark} />
+          {/* A股传统行情数据（单行展示） */}
+          <div className="border-b fin-divider-soft shrink-0 text-xs overflow-x-auto fin-scrollbar">
+            <div className="grid grid-cols-7 gap-1 px-2 py-1.5 min-w-[860px]">
+              <AStockStatItem label="今开" value={selectedStock.open} preClose={selectedStock.preClose} isDark={colors.isDark} />
+              <AStockStatItem label="最高" value={selectedStock.high} preClose={selectedStock.preClose} isDark={colors.isDark} />
+              <AStockStatItem label="成交量" value={formatVolume(selectedStock.volume)} isPlain isDark={colors.isDark} />
+              <AStockStatItem label="昨收" value={selectedStock.preClose} isPlain isDark={colors.isDark} />
+              <AStockStatItem label="最低" value={selectedStock.low} preClose={selectedStock.preClose} isDark={colors.isDark} />
+              <AStockStatItem label="成交额" value={formatAmount(selectedStock.amount)} isPlain isDark={colors.isDark} />
+              <AStockStatItem label="振幅" value={selectedStock.preClose > 0 ? ((selectedStock.high - selectedStock.low) / selectedStock.preClose * 100).toFixed(2) + '%' : '--'} isPlain isDark={colors.isDark} />
+            </div>
           </div>
+
+          <SafeBoundary title="模型驾驶舱渲染异常" resetKey={`${selectedSymbol}:${timePeriod}`}>
+            <ModelRadarStrip
+              stock={selectedStock}
+              kLineData={safeKLineData}
+              period={timePeriod}
+              panelHeight={radarPanelHeight}
+              dayKLineData={multiCycleKLines.daily}
+              weekKLineData={multiCycleKLines.weekly}
+              monthKLineData={multiCycleKLines.monthly}
+              marketIndices={marketIndices}
+              f10Overview={f10Overview}
+              valuationSnapshot={valuationSnapshot}
+              marketMessage={marketMessage}
+              marketStatusText={marketStatus?.statusText}
+              marketStatusCode={marketStatus?.status}
+              onForceSync={forceSyncSelectedStock}
+              syncing={syncingRadar}
+            />
+          </SafeBoundary>
+
+          <ResizeHandle
+            direction="vertical"
+            onResize={handleRadarResize}
+            className="h-3"
+            showLine
+            lineClassName={colors.isDark ? 'bg-accent/45 group-hover:bg-accent/80' : 'bg-accent/40 group-hover:bg-accent/70'}
+          />
 
           <div className="px-4 py-1 border-b fin-divider-soft shrink-0">
             <div className="flex items-center gap-1.5">
@@ -691,21 +1134,16 @@ const App: React.FC = () => {
             {!showF10 ? (
               <>
                 <div className="flex-1 p-1 relative min-h-0">
-                  <StockChartLW
-                    data={kLineData}
-                    updateMode={kLineUpdateMode}
-                    period={timePeriod}
-                    onPeriodChange={setTimePeriod}
-                    stock={selectedStock}
-                  />
-                </div>
-
-                <ResizeHandle direction="vertical" onResize={handleBottomResize} onResizeEnd={handleResizeEnd} />
-
-                <div style={{ height: bottomPanelHeight }} className="border-t fin-divider-soft flex shrink-0">
-                  <div className="flex-1 overflow-hidden relative">
-                    <OrderBookComponent data={orderBook} />
-                  </div>
+                  <SafeBoundary title="图表渲染异常" resetKey={`${selectedSymbol}:${timePeriod}`}>
+                    <StockChartLW
+                      data={safeKLineData}
+                      updateMode={kLineUpdateMode}
+                      period={timePeriod}
+                      onPeriodChange={setTimePeriod}
+                      stock={selectedStock}
+                      dayKData={multiCycleKLines.daily}
+                    />
+                  </SafeBoundary>
                 </div>
               </>
             ) : (
@@ -729,7 +1167,7 @@ const App: React.FC = () => {
         <div style={{ width: rightPanelWidth }} className="shrink-0 fin-panel overflow-hidden">
           <AgentRoom
             stock={selectedStock}
-            kLineData={kLineData}
+            kLineData={safeKLineData}
             session={currentSession}
             onSessionUpdate={setCurrentSession}
           />
@@ -751,8 +1189,26 @@ const App: React.FC = () => {
         }}
       />
       <HotTrendDialog isOpen={showHotTrend} onClose={() => setShowHotTrend(false)} />
-      <LongHuBangDialog isOpen={showLongHuBang} onClose={() => setShowLongHuBang(false)} />
+      <LongHuBangDialog
+        isOpen={showLongHuBang}
+        onClose={() => setShowLongHuBang(false)}
+        watchlistSymbols={watchlist.map(stock => stock.symbol)}
+        onAddToWatchlist={handleAddFromLongHuBang}
+      />
       <MarketMovesDialog isOpen={showMarketMoves} onClose={() => setShowMarketMoves(false)} />
+      <LowBuyScannerDialog
+        isOpen={showLowBuyScanner}
+        loading={scannerLoading}
+        result={scannerResult}
+        error={scannerError}
+        onClose={() => setShowLowBuyScanner(false)}
+        onScan={handleRunLowBuyScanner}
+        onCollectHistory={handleCollectDailyHistory}
+        onGetHistoryAutoCollectStatus={handleGetHistoryAutoCollectStatus}
+        onUpdateHistoryAutoCollect={handleUpdateHistoryAutoCollect}
+        onAddToWatchlist={handleAddFromLongHuBang}
+        watchlistSymbols={watchlist.map(stock => stock.symbol)}
+      />
     </div>
   );
 };
@@ -777,8 +1233,8 @@ const AStockStatItem: React.FC<AStockStatItemProps> = ({ label, value, preClose,
   }
 
   return (
-    <div className="flex justify-between items-center px-3 py-1.5">
-      <span className={isDark ? 'text-slate-500' : 'text-slate-400'}>{label}</span>
+    <div className="flex items-center gap-2 px-1.5 py-1 whitespace-nowrap">
+      <span className={`shrink-0 ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>{label}</span>
       <span className={`font-mono ${colorClass}`}>{displayValue}</span>
     </div>
   );

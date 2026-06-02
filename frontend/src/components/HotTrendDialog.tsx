@@ -3,6 +3,7 @@ import { X, TrendingUp, RefreshCw, ExternalLink } from 'lucide-react';
 import { GetAllHotTrends, OpenURL } from '../../wailsjs/go/main/App';
 import { hottrend } from '../../wailsjs/go/models';
 import { useTheme } from '../contexts/ThemeContext';
+import { isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
 
 interface HotTrendDialogProps {
   isOpen: boolean;
@@ -17,6 +18,13 @@ export const HotTrendDialog: React.FC<HotTrendDialogProps> = ({ isOpen, onClose 
 
   // 加载热点数据
   const loadHotTrends = async () => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('全网热点', 'go');
+      setResults([]);
+      setSelectedPlatform('');
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const data = await GetAllHotTrends();
@@ -181,7 +189,11 @@ const HotItemList: React.FC<{
 const HotItemRow: React.FC<{ item: hottrend.HotItem; isDark: boolean }> = ({ item, isDark }) => {
   const handleClick = () => {
     if (item.url) {
-      OpenURL(item.url);
+      if (isWailsGoReady()) {
+        OpenURL(item.url);
+      } else {
+        window.open(item.url, '_blank', 'noopener,noreferrer');
+      }
     }
   };
 

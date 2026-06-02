@@ -23,6 +23,8 @@ export function CheckForUpdate():Promise<services.UpdateInfo>;
 
 export function ClearSessionMessages(arg1:string):Promise<string>;
 
+export function CollectDailyHistory(arg1:models.HistoryCollectRequest):Promise<models.HistoryCollectResult>;
+
 export function DeleteAgentConfig(arg1:string):Promise<string>;
 
 export function DeleteMCPServer(arg1:string):Promise<string>;
@@ -54,6 +56,8 @@ export function GetCurrentVersion():Promise<string>;
 export function GetF10Overview(arg1:string):Promise<models.F10Overview>;
 
 export function GetF10Valuation(arg1:string):Promise<models.StockValuation>;
+
+export function GetHistoryAutoCollectStatus():Promise<models.HistoryAutoCollectStatus>;
 
 export function GetHotTrend(arg1:string):Promise<hottrend.HotTrendResult>;
 
@@ -111,6 +115,8 @@ export function RetryAgent(arg1:string,arg2:string,arg3:string):Promise<models.C
 
 export function RetryAgentAndContinue(arg1:string):Promise<Array<models.ChatMessage>>;
 
+export function RunLowBuyScannerV1(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
+
 export function SearchStocks(arg1:string):Promise<Array<services.StockSearchResult>>;
 
 export function SendMeetingMessage(arg1:main.MeetingMessageRequest):Promise<Array<models.ChatMessage>>;
@@ -124,6 +130,8 @@ export function TestMCPConnection(arg1:string):Promise<mcp.ServerStatus>;
 export function UpdateAgentConfig(arg1:models.AgentConfig):Promise<string>;
 
 export function UpdateConfig(arg1:models.AppConfig):Promise<string>;
+
+export function UpdateHistoryAutoCollect(arg1:models.HistoryAutoCollectRequest):Promise<models.HistoryAutoCollectStatus>;
 
 export function UpdateMCPServer(arg1:models.MCPServerConfig):Promise<string>;
 

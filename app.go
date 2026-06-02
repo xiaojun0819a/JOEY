@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"github.com/run-bigpig/jcp/internal/adk/mcp"
 	"github.com/run-bigpig/jcp/internal/adk/tools"
 	"github.com/run-bigpig/jcp/internal/agent"
+	"github.com/run-bigpig/jcp/internal/embed"
 	"github.com/run-bigpig/jcp/internal/logger"
 	"github.com/run-bigpig/jcp/internal/meeting"
 	"github.com/run-bigpig/jcp/internal/memory"
@@ -30,6 +34,12 @@ var log = logger.New("app")
 
 const defaultCoreContextCacheTTL = 30 * time.Second
 
+const (
+	lowBuyGateLimitUpMin   = 50
+	lowBuyGateLimitDownMax = 60
+	lowBuyGateAmountMin    = 9e11
+)
+
 type coreContextCacheEntry struct {
 	context   string
 	timestamp time.Time
@@ -42,6 +52,7 @@ type App struct {
 	marketService     *services.MarketService
 	newsService       *services.NewsService
 	f10Service        *services.F10Service
+	historyService    *services.HistoryService
 	hotTrendService   *hottrend.HotTrendService
 	longHuBangService *services.LongHuBangService
 	marketPusher      *services.MarketDataPusher
@@ -94,6 +105,10 @@ func NewApp() *App {
 
 	marketService := services.NewMarketService()
 	newsService := services.NewNewsService()
+	historyService, err := services.NewHistoryService(dataDir, marketService, configService)
+	if err != nil {
+		log.Warn("History service error: %v", err)
+	}
 
 	// 初始化龙虎榜服务
 	longHuBangService := services.NewLongHuBangService()
@@ -194,6 +209,7 @@ func NewApp() *App {
 		marketService:       marketService,
 		newsService:         newsService,
 		f10Service:          f10Service,
+		historyService:      historyService,
 		hotTrendService:     hotTrendSvc,
 		longHuBangService:   longHuBangService,
 		meetingService:      meetingService,
@@ -241,6 +257,11 @@ func (a *App) startup(ctx context.Context) {
 	a.marketPusher.Start(ctx)
 	log.Info("市场数据推送服务已启动")
 
+	if a.historyService != nil {
+		a.historyService.StartAutoCollect(ctx)
+		log.Info("历史数据自动采集检查服务已启动")
+	}
+
 	// 启动 OpenClaw 服务（如果已启用）
 	cfg := a.configService.GetConfig()
 	if cfg.OpenClaw.Enabled && cfg.OpenClaw.Port > 0 {
@@ -258,6 +279,9 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 	if a.marketPusher != nil {
 		a.marketPusher.Stop()
+	}
+	if a.historyService != nil {
+		a.historyService.Close()
 	}
 	logger.Close()
 }
@@ -464,6 +488,452 @@ func (a *App) GetMarketIndices() []models.MarketIndex {
 	return indices
 }
 
+// CollectDailyHistory 采集全A每日快照并写入本地历史库
+func (a *App) CollectDailyHistory(req models.HistoryCollectRequest) models.HistoryCollectResult {
+	if a.historyService == nil {
+		return models.HistoryCollectResult{
+			TradeDate:  req.TradeDate,
+			Status:     "failed",
+			Message:    "历史采集服务未初始化",
+			StartedAt:  time.Now().Format("2006-01-02 15:04:05"),
+			FinishedAt: time.Now().Format("2006-01-02 15:04:05"),
+		}
+	}
+	return a.historyService.CollectDailyHistory(req)
+}
+
+// GetHistoryAutoCollectStatus 获取历史数据自动采集状态
+func (a *App) GetHistoryAutoCollectStatus() models.HistoryAutoCollectStatus {
+	if a.historyService == nil {
+		return models.HistoryAutoCollectStatus{
+			Enabled:      false,
+			CollectStart: "16:00",
+			CollectEnd:   "17:00",
+			Message:      "历史采集服务未初始化",
+		}
+	}
+	return a.historyService.GetAutoCollectStatus()
+}
+
+// UpdateHistoryAutoCollect 更新历史数据自动采集配置
+func (a *App) UpdateHistoryAutoCollect(req models.HistoryAutoCollectRequest) models.HistoryAutoCollectStatus {
+	if a.historyService == nil {
+		return models.HistoryAutoCollectStatus{
+			Enabled:      false,
+			CollectStart: "16:00",
+			CollectEnd:   "17:00",
+			Message:      "历史采集服务未初始化",
+		}
+	}
+	status, err := a.historyService.UpdateAutoCollect(req)
+	if err != nil {
+		status.Message = "保存自动采集配置失败：" + err.Error()
+	}
+	return status
+}
+
+// RunLowBuyScannerV1 全A低吸选股扫描（V1.1 高胜率短线规则）
+func (a *App) RunLowBuyScannerV1(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
+	start := time.Now()
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	historyOpts := normalizeLowBuyHistoryOptions(req)
+	historyCheckedCount := 0
+	historyFailedCount := 0
+	historyRejectedCount := 0
+
+	result := models.LowBuyScannerResult{
+		AsOf:        start.Format("2006-01-02 15:04:05"),
+		RuleVersion: "V1.1 高胜率短线规则（全A扫描）",
+		Items:       []models.LowBuyScannerItem{},
+		Warning:     "",
+	}
+
+	snapshots, err := a.marketService.GetAllAStockSnapshot(req.IncludeBeijing)
+	if err != nil {
+		result.Warning = combineWarnings(result.Warning, "全A快照获取失败："+err.Error())
+		return result
+	}
+	result.UniverseCount = len(snapshots)
+
+	marketSnap, marketErr := a.marketService.BuildScanMarketSnapshot()
+	marketPrimaryFailed := marketErr != nil
+	// 同源回退：若大盘统计字段异常，用全A快照反算
+	if (marketSnap.TotalAmount <= 0 || (marketSnap.LimitUpCount == 0 && marketSnap.LimitDownCount == 0)) && len(snapshots) > 0 {
+		var fallbackAmount float64
+		var fallbackLimitUp int
+		var fallbackLimitDown int
+		for _, row := range snapshots {
+			fallbackAmount += row.Amount
+			if row.ChangePercent >= 9.8 {
+				fallbackLimitUp++
+			}
+			if row.ChangePercent <= -9.8 {
+				fallbackLimitDown++
+			}
+		}
+		// 仅在回退数据有效时覆盖
+		if fallbackAmount > 0 {
+			marketSnap.TotalAmount = fallbackAmount
+		}
+		if fallbackLimitUp > 0 || fallbackLimitDown > 0 {
+			marketSnap.LimitUpCount = fallbackLimitUp
+			marketSnap.LimitDownCount = fallbackLimitDown
+		}
+	}
+	result.MarketOverview = models.LowBuyMarketOverview{
+		ShPrice:        marketSnap.ShPrice,
+		ShMA20:         marketSnap.ShMA20,
+		LimitUpCount:   marketSnap.LimitUpCount,
+		LimitDownCount: marketSnap.LimitDownCount,
+		TotalAmount:    marketSnap.TotalAmount,
+	}
+	marketSnapshotReady := isPlausibleIndexPoint(marketSnap.ShPrice) &&
+		isPlausibleIndexPoint(marketSnap.ShMA20) &&
+		marketSnap.TotalAmount > 0 &&
+		(marketSnap.LimitUpCount > 0 || marketSnap.LimitDownCount > 0)
+	if marketPrimaryFailed {
+		if marketSnapshotReady {
+			result.Warning = combineWarnings(result.Warning, "大盘主源波动，已自动回退补齐")
+		} else {
+			result.Warning = combineWarnings(result.Warning, "大盘快照获取失败，已降级为仅个股规则评分")
+		}
+	}
+
+	marketReasons := make([]string, 0, 4)
+	gateScore := 0
+	if isPlausibleIndexPoint(marketSnap.ShPrice) && isPlausibleIndexPoint(marketSnap.ShMA20) && marketSnap.ShPrice > marketSnap.ShMA20 {
+		gateScore++
+		marketReasons = append(marketReasons, "上证指数站上20日均线")
+	} else if isPlausibleIndexPoint(marketSnap.ShPrice) && isPlausibleIndexPoint(marketSnap.ShMA20) {
+		marketReasons = append(marketReasons, "上证指数未站上20日均线")
+	} else {
+		marketReasons = append(marketReasons, "上证指数数据异常（已忽略该子条件）")
+	}
+	if marketSnap.LimitUpCount > lowBuyGateLimitUpMin {
+		gateScore++
+		marketReasons = append(marketReasons, fmt.Sprintf("涨停家数 %d > %d", marketSnap.LimitUpCount, lowBuyGateLimitUpMin))
+	} else {
+		marketReasons = append(marketReasons, fmt.Sprintf("涨停家数 %d 未达 > %d", marketSnap.LimitUpCount, lowBuyGateLimitUpMin))
+	}
+	if marketSnap.LimitDownCount < lowBuyGateLimitDownMax {
+		gateScore++
+		marketReasons = append(marketReasons, fmt.Sprintf("跌停家数 %d < %d", marketSnap.LimitDownCount, lowBuyGateLimitDownMax))
+	} else {
+		marketReasons = append(marketReasons, fmt.Sprintf("跌停家数 %d 未达 < %d", marketSnap.LimitDownCount, lowBuyGateLimitDownMax))
+	}
+	// 两市成交额阈值
+	if marketSnap.TotalAmount > lowBuyGateAmountMin {
+		gateScore++
+		marketReasons = append(marketReasons, fmt.Sprintf("两市成交额 %.0f 亿 > %.0f 亿", marketSnap.TotalAmount/1e8, lowBuyGateAmountMin/1e8))
+	} else if marketSnap.TotalAmount > 0 {
+		marketReasons = append(marketReasons, fmt.Sprintf("两市成交额 %.0f 亿 未达 > %.0f 亿", marketSnap.TotalAmount/1e8, lowBuyGateAmountMin/1e8))
+	} else {
+		marketReasons = append(marketReasons, "两市成交额数据异常（已忽略该子条件）")
+	}
+	// 按“有效条件数”动态判定，防止上游脏数据导致整关误杀
+	validGateCount := 4
+	if !isPlausibleIndexPoint(marketSnap.ShPrice) || !isPlausibleIndexPoint(marketSnap.ShMA20) {
+		validGateCount--
+	}
+	if marketSnap.TotalAmount <= 0 {
+		validGateCount--
+	}
+	if validGateCount < 2 {
+		validGateCount = 2
+	}
+	required := 3
+	if validGateCount == 3 {
+		required = 2
+	}
+	if validGateCount == 2 {
+		required = 2
+	}
+	result.MarketGatePassed = gateScore >= required
+	result.MarketGateReasons = marketReasons
+
+	if marketSnap.TotalAmount <= 0 {
+		result.Warning = combineWarnings(result.Warning, "两市成交额统计仍为空，可能为上游盘后异常或接口限流")
+	}
+
+	// 补行业映射（来自 embedded stock_basic）
+	industryMap := buildIndustryMapFromEmbedded()
+
+	// V1.1 行业白/黑名单（用行业关键词做粗过滤）
+	allowIndustryKeywords := []string{"半导体", "军工", "新能源", "医疗", "医药", "器械", "软件", "通信", "元器件", "计算机", "人工智能", "算力"}
+	blockIndustryKeywords := []string{"地产", "农业", "林业", "建筑", "零售", "百货"}
+
+	candidates := make([]models.LowBuyScannerItem, 0, 256)
+	for _, row := range snapshots {
+		industry := industryMap[row.Symbol]
+		if industry == "" {
+			industry = "未知"
+		}
+
+		// 第一层：硬过滤
+		if row.Price <= 0 || row.Amount <= 0 {
+			continue
+		}
+		if row.IsST {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(row.Symbol), "bj") && !req.IncludeBeijing {
+			continue
+		}
+
+		// 市值过滤（20~100 亿）
+		totalCap := row.TotalMarketCap
+		if totalCap <= 0 {
+			continue
+		}
+		if totalCap < 20e8 || totalCap > 100e8 {
+			continue
+		}
+
+		if hitKeyword(industry, blockIndustryKeywords) {
+			continue
+		}
+		if !hitKeyword(industry, allowIndustryKeywords) {
+			// 对行业未知/不在白名单的，降级不入候选（V1先严格）
+			continue
+		}
+		// 新规则：当日涨幅 <= +1.5%（低吸不追涨）
+		if row.ChangePercent > 1.5 {
+			continue
+		}
+		// 新规则：当日涨跌 >= -3%
+		if row.ChangePercent < -3.0 {
+			continue
+		}
+		// 新规则：当日换手率 <= 8%
+		if row.TurnoverRate > 8.0 {
+			continue
+		}
+
+		// 触发逻辑：4选3
+		triggers := make([]string, 0, 4)
+		reasons := make([]string, 0, 8)
+		riskFlags := make([]string, 0, 4)
+
+		// 主力硬过滤：真实源 + 强度 >= 1% + 主力净流入 >= 800万
+		hasMainFlow := !math.IsNaN(row.MainNetInflow) && !math.IsNaN(row.MainNetInflowRatio)
+		isRealMainFlowSource := row.MainFlowSource == "eastmoney" || row.MainFlowSource == "tencent-fundflow"
+		if !hasMainFlow || !isRealMainFlowSource {
+			continue
+		}
+		if row.MainNetInflowRatio < 1.0 {
+			continue
+		}
+		if row.MainNetInflow < 8e6 {
+			continue
+		}
+
+		// 触发信号（基础）：4选3
+		// 1) 当日换手率 <= 2.5%
+		if row.TurnoverRate > 0 && row.TurnoverRate <= 2.5 {
+			triggers = append(triggers, "换手收敛(<=2.5%)")
+		}
+		// 2) 主力净流入为正
+		if row.MainNetInflow > 0 {
+			switch row.MainFlowSource {
+			case "eastmoney", "tencent-fundflow":
+				triggers = append(triggers, "主力净流入为正")
+			default:
+				triggers = append(triggers, "主力代理资金为正")
+			}
+		}
+		// 3) 主力强度 >= 3%
+		if row.MainNetInflowRatio >= 3.0 {
+			triggers = append(triggers, "主力强度>=3%")
+		}
+		// 4) 当日涨跌 >= -2%
+		if row.ChangePercent >= -2.0 {
+			triggers = append(triggers, "当日涨跌>=-2%")
+		}
+
+		if len(triggers) < 3 {
+			continue
+		}
+
+		if historyOpts.Enabled {
+			history, err := a.loadLowBuyStockHistory(row, historyOpts)
+			if err != nil {
+				historyFailedCount++
+				continue
+			}
+			historyCheckedCount++
+			historyTriggers, historyReasons, historyRisks, passed := evaluateLowBuyHistory(history, historyOpts)
+			if !passed {
+				historyRejectedCount++
+				continue
+			}
+			triggers = append(triggers, historyTriggers...)
+			reasons = append(reasons, historyReasons...)
+			riskFlags = append(riskFlags, historyRisks...)
+		}
+
+		// 评分
+		// 基础分 50 + 资金分 + 换手分 + 市值分 + 强弱分
+		score := 50.0
+		flowRatio := row.MainNetInflowRatio
+		turnover := row.TurnoverRate
+		chg := row.ChangePercent
+
+		if hasMainFlow {
+			score += clamp(flowRatio*3.0, -8, 14)
+		}
+		score += clamp((3.0-turnover)*3.0, -6, 10)
+		// 市值分层
+		switch {
+		case totalCap <= 40e8:
+			score += 12
+		case totalCap <= 60e8:
+			score += 10
+		case totalCap <= 80e8:
+			score += 7
+		default:
+			score += 4
+		}
+		// 涨跌结构分
+		if chg >= -2.0 && chg < 0 {
+			score += 6
+		} else if chg >= 0 && chg < 1.0 {
+			score += 4
+		} else if chg >= 1.0 && chg <= 1.5 {
+			score -= 3
+		}
+		// 主力金额分
+		if row.MainNetInflow >= 2e7 {
+			score += 8
+		} else if row.MainNetInflow >= 1e7 {
+			score += 5
+		} else if row.MainNetInflow >= 8e6 {
+			score += 2
+		}
+		if turnover > 6 {
+			score -= 4
+			riskFlags = append(riskFlags, "换手偏高(>6%)")
+		} else if turnover > 4 {
+			score -= 2
+			riskFlags = append(riskFlags, "换手偏高(>4%)")
+		}
+		if hasMainFlow && flowRatio < 0 {
+			switch row.MainFlowSource {
+			case "eastmoney", "tencent-fundflow":
+				riskFlags = append(riskFlags, "主力资金流出")
+			default:
+				riskFlags = append(riskFlags, "主力代理流出")
+			}
+		}
+		score = math.Round(clamp(score, 0, 100)*10) / 10
+
+		reasons = append(reasons, fmt.Sprintf("触发信号：%s", strings.Join(triggers, " / ")))
+		reasons = append(reasons, fmt.Sprintf("总市值 %.1f 亿，流通市值 %.1f 亿", totalCap/1e8, row.FloatMarketCap/1e8))
+		if hasMainFlow {
+			switch row.MainFlowSource {
+			case "eastmoney":
+				reasons = append(reasons, fmt.Sprintf("东财主力净流入 %.2f 亿，主力净占比 %.2f%%", row.MainNetInflow/1e8, flowRatio))
+			case "tencent-fundflow":
+				reasons = append(reasons, fmt.Sprintf("腾讯主力净流入 %.2f 亿，主力强弱 %.2f%%", row.MainNetInflow/1e8, flowRatio))
+			default:
+				reasons = append(reasons, fmt.Sprintf("主力代理净流入 %.2f 亿，主力代理强弱 %.2f%%", row.MainNetInflow/1e8, flowRatio))
+			}
+		} else {
+			reasons = append(reasons, "主力净流入：当前数据源不可用（非0值，属缺失）")
+		}
+		reasons = append(reasons, fmt.Sprintf("换手率 %.2f%%，当日涨跌 %.2f%%，主力净流入门槛 >= 0.08 亿", turnover, chg))
+
+		capBucket := classifyCapBucket(totalCap)
+
+		item := models.LowBuyScannerItem{
+			Symbol:             row.Symbol,
+			Name:               row.Name,
+			Price:              row.Price,
+			ChangePercent:      chg,
+			Amount:             row.Amount,
+			TurnoverRate:       turnover,
+			MainNetInflow:      row.MainNetInflow,
+			MainNetInflowRatio: flowRatio,
+			MainFlowSource:     row.MainFlowSource,
+			TotalMarketCap:     totalCap,
+			FloatMarketCap:     row.FloatMarketCap,
+			CapBucket:          capBucket,
+			Industry:           industry,
+			Score:              score,
+			TriggerCount:       len(triggers),
+			Triggers:           triggers,
+			Reasons:            reasons,
+			RiskFlags:          riskFlags,
+			BuyPointHint:       "尾盘14:30-15:00分批，优先回踩不破均线结构",
+			SellPointHint:      "3日累计+15%减半；单日换手>12%先走；持仓5日涨幅<3%清仓",
+			StopLossHint:       "跌破买入价-5%无条件止损；跌破10日线次日不收回离场",
+			UpdatedAt:          chooseFirstNonEmpty(row.UpdateTime, result.AsOf),
+		}
+		candidates = append(candidates, item)
+	}
+
+	result.CandidateCount = len(candidates)
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Score == candidates[j].Score {
+			if candidates[i].TriggerCount == candidates[j].TriggerCount {
+				return candidates[i].MainNetInflow > candidates[j].MainNetInflow
+			}
+			return candidates[i].TriggerCount > candidates[j].TriggerCount
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	// 新规则3：单行业候选 <= 3 只
+	industryCounts := make(map[string]int, 32)
+	filtered := make([]models.LowBuyScannerItem, 0, len(candidates))
+	for _, item := range candidates {
+		ind := strings.TrimSpace(item.Industry)
+		if ind == "" {
+			ind = "未知"
+		}
+		if industryCounts[ind] >= 3 {
+			continue
+		}
+		industryCounts[ind]++
+		filtered = append(filtered, item)
+	}
+	candidates = filtered
+
+	result.Items = candidates
+	result.SelectedCount = len(candidates)
+	result.Warning = combineWarnings(result.Warning, "已启用V1.1筛选：涨幅[-3%,1.5%]、换手<=8%、主力强度>=1%且净流入>=800万（真实源）、单行业最多3只")
+	if historyOpts.Enabled {
+		result.Warning = combineWarnings(result.Warning, fmt.Sprintf(
+			"已追加历史维度：连续%d日换手<%.2f%%、近%d日主力至少%d日净流入为正、站上MA%d；已验证%d只，剔除%d只，历史质量数据拉取失败%d只",
+			historyOpts.TurnoverDays,
+			historyOpts.TurnoverMax,
+			historyOpts.MainFlowDays,
+			historyOpts.MainFlowPositiveDays,
+			historyOpts.MAPeriod,
+			historyCheckedCount,
+			historyRejectedCount,
+			historyFailedCount,
+		))
+	}
+	if hasMainFlowMissing(candidates) {
+		result.Warning = combineWarnings(result.Warning, "主力资金字段存在缺失，当前以量价与市值规则降级评分")
+	} else if usedMainFlowProxy(candidates) {
+		result.Warning = combineWarnings(result.Warning, "主力数据部分来自腾讯盘口强弱代理（非东财主力净流入原值）")
+	}
+	if usedQQFundFlow(candidates) {
+		result.Warning = combineWarnings(result.Warning, "主力数据已补齐腾讯资金流接口（真实主力净流入）")
+	}
+	return result
+}
+
 // GetF10Overview 获取 F10 综合数据
 func (a *App) GetF10Overview(code string) models.F10Overview {
 	if a.f10Service == nil {
@@ -480,6 +950,325 @@ func (a *App) GetF10Overview(code string) models.F10Overview {
 		}
 	}
 	return result
+}
+
+func classifyCapBucket(totalCap float64) string {
+	switch {
+	case totalCap < 50e8:
+		return "微盘"
+	case totalCap < 100e8:
+		return "小盘"
+	case totalCap < 300e8:
+		return "中小盘"
+	case totalCap < 800e8:
+		return "中盘"
+	case totalCap < 2000e8:
+		return "大盘"
+	default:
+		return "超大盘"
+	}
+}
+
+func hitKeyword(text string, keywords []string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" {
+		return false
+	}
+	for _, kw := range keywords {
+		if strings.Contains(t, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	return false
+}
+
+func clamp(v float64, min float64, max float64) float64 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func chooseFirstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func combineWarnings(curr string, next string) string {
+	if strings.TrimSpace(curr) == "" {
+		return next
+	}
+	if strings.TrimSpace(next) == "" {
+		return curr
+	}
+	return curr + "；" + next
+}
+
+func hasMainFlowMissing(items []models.LowBuyScannerItem) bool {
+	for _, item := range items {
+		if math.IsNaN(item.MainNetInflow) || math.IsNaN(item.MainNetInflowRatio) {
+			return true
+		}
+	}
+	return false
+}
+
+func usedMainFlowProxy(items []models.LowBuyScannerItem) bool {
+	for _, item := range items {
+		if item.MainFlowSource == "tencent-pk-proxy" {
+			return true
+		}
+	}
+	return false
+}
+
+func usedQQFundFlow(items []models.LowBuyScannerItem) bool {
+	for _, item := range items {
+		if item.MainFlowSource == "tencent-fundflow" {
+			return true
+		}
+	}
+	return false
+}
+
+type lowBuyHistoryOptions struct {
+	Enabled              bool
+	TurnoverDays         int
+	TurnoverMax          float64
+	MainFlowDays         int
+	MainFlowPositiveDays int
+	MAPeriod             int
+}
+
+type lowBuyStockHistory struct {
+	Turnovers      []float64
+	MainNetInflows []float64
+	ClosePrice     float64
+	MA             float64
+	MAPeriod       int
+}
+
+func normalizeLowBuyHistoryOptions(req models.LowBuyScannerRequest) lowBuyHistoryOptions {
+	opts := lowBuyHistoryOptions{
+		Enabled:              req.HistoryFilterEnabled,
+		TurnoverDays:         req.HistoryTurnoverDays,
+		TurnoverMax:          req.HistoryTurnoverMax,
+		MainFlowDays:         req.HistoryMainFlowDays,
+		MainFlowPositiveDays: req.HistoryMainFlowPositiveDays,
+		MAPeriod:             req.HistoryMAPeriod,
+	}
+	if opts.TurnoverDays <= 0 {
+		opts.TurnoverDays = 3
+	}
+	if opts.TurnoverDays > 20 {
+		opts.TurnoverDays = 20
+	}
+	if opts.TurnoverMax <= 0 {
+		opts.TurnoverMax = 3
+	}
+	if opts.TurnoverMax > 20 {
+		opts.TurnoverMax = 20
+	}
+	if opts.MainFlowDays <= 0 {
+		opts.MainFlowDays = 3
+	}
+	if opts.MainFlowDays > 20 {
+		opts.MainFlowDays = 20
+	}
+	if opts.MainFlowPositiveDays <= 0 {
+		opts.MainFlowPositiveDays = 2
+	}
+	if opts.MainFlowPositiveDays > opts.MainFlowDays {
+		opts.MainFlowPositiveDays = opts.MainFlowDays
+	}
+	if opts.MAPeriod <= 0 {
+		opts.MAPeriod = 10
+	}
+	if opts.MAPeriod > 60 {
+		opts.MAPeriod = 60
+	}
+	return opts
+}
+
+func (a *App) loadLowBuyStockHistory(row services.ScanSnapshotRow, opts lowBuyHistoryOptions) (lowBuyStockHistory, error) {
+	needKDays := opts.MAPeriod
+	if opts.TurnoverDays > needKDays {
+		needKDays = opts.TurnoverDays
+	}
+	needKDays += 8
+	klines, err := a.marketService.GetKLineData(row.Symbol, "1d", needKDays)
+	if err != nil {
+		return lowBuyStockHistory{}, fmt.Errorf("日K拉取失败: %w", err)
+	}
+	if len(klines) < opts.MAPeriod || len(klines) < opts.TurnoverDays {
+		return lowBuyStockHistory{}, fmt.Errorf("日K数量不足")
+	}
+	if row.FloatMarketCap <= 0 {
+		return lowBuyStockHistory{}, fmt.Errorf("流通市值为空，无法估算历史换手")
+	}
+
+	turnovers := make([]float64, 0, opts.TurnoverDays)
+	for _, k := range klines[len(klines)-opts.TurnoverDays:] {
+		if k.Amount <= 0 || k.Close <= 0 {
+			return lowBuyStockHistory{}, fmt.Errorf("日K成交额/收盘价为空，无法估算历史换手")
+		}
+		turnovers = append(turnovers, (k.Amount/row.FloatMarketCap)*100)
+	}
+
+	ma, closePrice, ok := computeLowBuyMA(klines, opts.MAPeriod)
+	if !ok {
+		return lowBuyStockHistory{}, fmt.Errorf("MA%d计算失败", opts.MAPeriod)
+	}
+
+	flows, err := a.marketService.GetQQMainFlowHistory(row.Symbol, opts.MainFlowDays)
+	if err != nil {
+		return lowBuyStockHistory{}, fmt.Errorf("历史主力拉取失败: %w", err)
+	}
+	if len(flows) < opts.MainFlowDays {
+		return lowBuyStockHistory{}, fmt.Errorf("历史主力数量不足")
+	}
+	mainFlows := make([]float64, 0, opts.MainFlowDays)
+	for _, p := range flows[len(flows)-opts.MainFlowDays:] {
+		mainFlows = append(mainFlows, p.MainNetInflow)
+	}
+
+	return lowBuyStockHistory{
+		Turnovers:      turnovers,
+		MainNetInflows: mainFlows,
+		ClosePrice:     closePrice,
+		MA:             ma,
+		MAPeriod:       opts.MAPeriod,
+	}, nil
+}
+
+func evaluateLowBuyHistory(history lowBuyStockHistory, opts lowBuyHistoryOptions) ([]string, []string, []string, bool) {
+	triggers := make([]string, 0, 3)
+	reasons := make([]string, 0, 3)
+	risks := make([]string, 0, 2)
+
+	turnoverPassed := true
+	maxTurnover := 0.0
+	for _, t := range history.Turnovers {
+		if t > maxTurnover {
+			maxTurnover = t
+		}
+		if t >= opts.TurnoverMax {
+			turnoverPassed = false
+		}
+	}
+	if turnoverPassed {
+		triggers = append(triggers, fmt.Sprintf("连续%d日换手<%.2f%%", opts.TurnoverDays, opts.TurnoverMax))
+		reasons = append(reasons, fmt.Sprintf("历史换手验证：近%d日估算最大换手 %.2f%%，低于 %.2f%%", opts.TurnoverDays, maxTurnover, opts.TurnoverMax))
+	} else {
+		risks = append(risks, fmt.Sprintf("历史换手未收敛(最大%.2f%%)", maxTurnover))
+	}
+
+	positiveDays := 0
+	for _, flow := range history.MainNetInflows {
+		if flow > 0 {
+			positiveDays++
+		}
+	}
+	flowPassed := positiveDays >= opts.MainFlowPositiveDays
+	if flowPassed {
+		triggers = append(triggers, fmt.Sprintf("近%d日主力%d日为正", opts.MainFlowDays, positiveDays))
+		reasons = append(reasons, fmt.Sprintf("历史主力验证：近%d日主力净流入为正 %d 日，要求至少 %d 日", opts.MainFlowDays, positiveDays, opts.MainFlowPositiveDays))
+	} else {
+		risks = append(risks, fmt.Sprintf("历史主力连续性不足(%d/%d)", positiveDays, opts.MainFlowDays))
+	}
+
+	maPassed := history.ClosePrice > history.MA
+	if maPassed {
+		triggers = append(triggers, fmt.Sprintf("站上MA%d", opts.MAPeriod))
+		reasons = append(reasons, fmt.Sprintf("均线验证：收盘 %.2f > MA%d %.2f", history.ClosePrice, opts.MAPeriod, history.MA))
+	} else {
+		risks = append(risks, fmt.Sprintf("未站上MA%d", opts.MAPeriod))
+	}
+
+	return triggers, reasons, risks, turnoverPassed && flowPassed && maPassed
+}
+
+func computeLowBuyMA(klines []models.KLineData, period int) (float64, float64, bool) {
+	if period <= 0 || len(klines) < period {
+		return 0, 0, false
+	}
+	start := len(klines) - period
+	sum := 0.0
+	for _, k := range klines[start:] {
+		if k.Close <= 0 {
+			return 0, 0, false
+		}
+		sum += k.Close
+	}
+	closePrice := klines[len(klines)-1].Close
+	return sum / float64(period), closePrice, closePrice > 0
+}
+
+func buildIndustryMapFromEmbedded() map[string]string {
+	m := make(map[string]string, 8000)
+	type stockBasicData struct {
+		Data struct {
+			Fields []string        `json:"fields"`
+			Items  [][]interface{} `json:"items"`
+		} `json:"data"`
+	}
+	var basic stockBasicData
+	if err := json.Unmarshal(embed.StockBasicJSON, &basic); err != nil {
+		return m
+	}
+	symbolIdx, tsCodeIdx, industryIdx := -1, -1, -1
+	for i, field := range basic.Data.Fields {
+		switch field {
+		case "symbol":
+			symbolIdx = i
+		case "ts_code":
+			tsCodeIdx = i
+		case "industry":
+			industryIdx = i
+		}
+	}
+	if symbolIdx < 0 || industryIdx < 0 {
+		return m
+	}
+	for _, item := range basic.Data.Items {
+		if symbolIdx >= len(item) || industryIdx >= len(item) {
+			continue
+		}
+		code, _ := item[symbolIdx].(string)
+		industry, _ := item[industryIdx].(string)
+		if code == "" || industry == "" {
+			continue
+		}
+		prefix := "sz"
+		if tsCodeIdx >= 0 && tsCodeIdx < len(item) {
+			tsCode, _ := item[tsCodeIdx].(string)
+			switch {
+			case strings.HasSuffix(strings.ToUpper(tsCode), ".SH"):
+				prefix = "sh"
+			case strings.HasSuffix(strings.ToUpper(tsCode), ".BJ"):
+				prefix = "bj"
+			}
+		} else {
+			if strings.HasPrefix(code, "6") || strings.HasPrefix(code, "9") {
+				prefix = "sh"
+			} else if strings.HasPrefix(code, "8") || strings.HasPrefix(code, "4") {
+				prefix = "bj"
+			}
+		}
+		m[prefix+code] = industry
+	}
+	return m
+}
+
+func isPlausibleIndexPoint(v float64) bool {
+	return v > 10 && v < 30000
 }
 
 // GetF10Valuation 获取估值快照

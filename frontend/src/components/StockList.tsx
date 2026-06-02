@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Stock, MarketIndex } from '../types';
 import { searchStocks, StockSearchResult } from '../services/stockService';
-import { TrendingUp, TrendingDown, Search, X } from 'lucide-react';
+import { Plus, TrendingUp, TrendingDown, Search, X } from 'lucide-react';
 import { MarketIndices } from './MarketIndices';
 import { useTheme } from '../contexts/ThemeContext';
 import { useCandleColor } from '../contexts/CandleColorContext';
@@ -14,6 +14,16 @@ interface StockListProps {
   onRemoveStock?: (symbol: string) => void;
   marketIndices?: MarketIndex[];
 }
+
+const normalizeInputSymbol = (raw: string): string | null => {
+  const value = raw.trim().toLowerCase();
+  if (!value) return null;
+  if (/^(sh|sz|bj)\d{6}$/.test(value)) return value;
+  if (!/^\d{6}$/.test(value)) return null;
+  if (value.startsWith('6') || value.startsWith('5') || value.startsWith('9')) return `sh${value}`;
+  if (value.startsWith('8') || value.startsWith('4') || value.startsWith('92')) return `bj${value}`;
+  return `sz${value}`;
+};
 
 export const StockList: React.FC<StockListProps> = ({
   stocks,
@@ -95,6 +105,41 @@ export const StockList: React.FC<StockListProps> = ({
     setShowDropdown(false);
   };
 
+  const normalizedSymbol = normalizeInputSymbol(searchTerm);
+  const canQuickAdd = Boolean(normalizedSymbol);
+  const canQuickAddNotExist = Boolean(
+    normalizedSymbol && !stocks.some(s => s.symbol.toLowerCase() === normalizedSymbol),
+  );
+
+  const handleQuickAdd = () => {
+    if (!normalizedSymbol) return;
+    if (stocks.some(s => s.symbol.toLowerCase() === normalizedSymbol)) {
+      setSearchTerm('');
+      setShowDropdown(false);
+      return;
+    }
+    const plainCode = normalizedSymbol.slice(2);
+    const stock: Stock = {
+      symbol: normalizedSymbol,
+      name: plainCode,
+      price: 0,
+      change: 0,
+      changePercent: 0,
+      volume: 0,
+      amount: 0,
+      marketCap: '',
+      sector: '',
+      open: 0,
+      high: 0,
+      low: 0,
+      preClose: 0,
+    };
+    onAddStock(stock);
+    setSearchTerm('');
+    setSearchResults([]);
+    setShowDropdown(false);
+  };
+
   return (
     <div className="flex flex-col h-full relative">
       <div className="p-4 border-b fin-divider-soft">
@@ -110,11 +155,36 @@ export const StockList: React.FC<StockListProps> = ({
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               onFocus={() => searchResults.length > 0 && setShowDropdown(true)}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return;
+                e.preventDefault();
+                if (showDropdown && searchResults.length > 0) {
+                  handleSelectResult(searchResults[0]);
+                  return;
+                }
+                if (canQuickAddNotExist) {
+                  handleQuickAdd();
+                }
+              }}
               placeholder="搜索股票代码或名称..."
-              className={`w-full fin-input rounded-lg pl-9 pr-4 py-2 text-sm ${colors.isDark ? 'placeholder-slate-500' : 'placeholder-slate-400'}`}
+              className={`w-full fin-input rounded-lg pl-9 pr-24 py-2 text-sm ${colors.isDark ? 'placeholder-slate-500' : 'placeholder-slate-400'}`}
             />
+            <button
+              type="button"
+              onClick={handleQuickAdd}
+              disabled={!canQuickAddNotExist}
+              className={`absolute right-2 top-1.5 h-7 px-2 rounded text-[11px] flex items-center gap-1 border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                colors.isDark
+                  ? 'bg-slate-700/80 border-slate-500 text-slate-200 hover:bg-slate-600'
+                  : 'bg-slate-100 border-slate-300 text-slate-700 hover:bg-slate-200'
+              }`}
+              title={canQuickAdd && !canQuickAddNotExist ? '已在自选中' : '快速添加代码'}
+            >
+              <Plus className="h-3 w-3" />
+              添加
+            </button>
             {isSearching && (
-              <div className="absolute right-3 top-2.5 h-4 w-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+              <div className="absolute right-16 top-2.5 h-4 w-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
             )}
           </div>
 

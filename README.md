@@ -1,4 +1,4 @@
-# 韭菜盘 (JCP AI)
+# JOEY AI
 
 > AI 驱动的智能股票分析系统 - 多 Agent 协作，让投资决策更智能
 
@@ -10,7 +10,7 @@
 
 ## 项目简介
 
-韭菜盘是一款基于 Wails 框架开发的跨平台桌面应用，集成了多个 AI 大模型（OpenAI、Google Gemini、DeepSeek、Kimi、GLM 等 OpenAI 兼容接口），通过多 Agent 协作讨论的方式，为用户提供专业的股票分析和投资建议。
+JOEY 是一款基于 Wails 框架开发的跨平台桌面应用，集成了多个 AI 大模型（OpenAI、Google Gemini、DeepSeek、Kimi、GLM 等 OpenAI 兼容接口），通过多 Agent 协作讨论的方式，为用户提供专业的股票分析和投资建议。
 
 ### 核心特性
 

@@ -228,6 +228,12 @@ const (
 	MeetingModeDirect = "direct" // 独立模式（@ 指定专家）
 )
 
+const (
+	ModeratorAgentID = "moderator"
+	ModeratorName    = "老板娘"
+	ModeratorRole    = "会议主持"
+)
+
 // ChatResponse 聊天响应
 type ChatResponse struct {
 	AgentID     string `json:"agentId"`
@@ -238,6 +244,14 @@ type ChatResponse struct {
 	MsgType     string `json:"msgType"`               // opening/opinion/summary
 	Error       string `json:"error,omitempty"`       // 失败时的错误信息，前端据此显示重试按钮
 	MeetingMode string `json:"meetingMode,omitempty"` // smart=串行, direct=独立
+}
+
+type DebateChallenge struct {
+	ChallengerID   string
+	ChallengerName string
+	TargetID       string
+	TargetName     string
+	Question       string
 }
 
 // ResponseCallback 响应回调函数类型
@@ -427,10 +441,10 @@ func (s *Service) RunSmartMeetingSync(ctx context.Context, aiConfig *models.AICo
 	}
 
 	if s.enableSecondRound {
-		reviewResponses := s.runSecondReviewRound(meetingCtx, aiConfig, &req.Stock, req.Query, selectedAgents, history, req.Position, nil, MeetingModeSmart)
+		reviewResponses := s.runSecondReviewRound(meetingCtx, aiConfig, &req.Stock, req.Query, selectedAgents, history, req.Position, nil, MeetingModeSmart, 4)
 		for _, resp := range reviewResponses {
 			history = append(history, DiscussionEntry{
-				Round: 2, AgentID: resp.AgentID, AgentName: resp.AgentName, Role: resp.Role, Content: resp.Content,
+				Round: resp.Round, AgentID: resp.AgentID, AgentName: resp.AgentName, Role: resp.Role, Content: resp.Content,
 			})
 		}
 	}
@@ -531,7 +545,7 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 
 	// 第0轮：小韭菜分析意图并选择专家（带超时）
 	emitProgress(progressCallback, ProgressEvent{
-		Type: "agent_start", AgentID: "moderator", AgentName: "小韭菜", Detail: "分析问题意图",
+		Type: "agent_start", AgentID: ModeratorAgentID, AgentName: ModeratorName, Detail: "分析问题意图",
 	})
 
 	moderatorCtx, moderatorCancel := context.WithTimeout(meetingCtx, ModeratorTimeout)
@@ -540,7 +554,7 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 
 	if err != nil {
 		emitProgress(progressCallback, ProgressEvent{
-			Type: "agent_done", AgentID: "moderator", AgentName: "小韭菜",
+			Type: "agent_done", AgentID: ModeratorAgentID, AgentName: ModeratorName,
 		})
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: 小韭菜分析超时", ErrModeratorTimeout)
@@ -549,16 +563,16 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 	}
 
 	emitProgress(progressCallback, ProgressEvent{
-		Type: "agent_done", AgentID: "moderator", AgentName: "小韭菜",
+		Type: "agent_done", AgentID: ModeratorAgentID, AgentName: ModeratorName,
 	})
 
 	log.Debug("decision: selected=%v, topic=%s", decision.Selected, decision.Topic)
 
 	// 添加开场白并立即回调
 	openingResp := ChatResponse{
-		AgentID:     "moderator",
-		AgentName:   "小韭菜",
-		Role:        "会议主持",
+		AgentID:     ModeratorAgentID,
+		AgentName:   ModeratorName,
+		Role:        ModeratorRole,
 		Content:     decision.Opening,
 		Round:       0,
 		MsgType:     "opening",
@@ -578,11 +592,14 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 		}
 	}
 
-	// 第1轮：专家串行发言，后一个参考前面的内容
+	// 三轮讨论：
+	// R1 独立陈述 -> R2 强制交锋 -> R3 修正终判
 	var history []DiscussionEntry
+	var roundOneHistory []DiscussionEntry
+	var roundTwoHistory []DiscussionEntry
 
+	// ---------- R1: 独立陈述 ----------
 	for i, agentCfg := range selectedAgents {
-		// 检查会议是否已超时
 		select {
 		case <-meetingCtx.Done():
 			log.Warn("meeting timeout, got %d responses", len(responses))
@@ -590,12 +607,8 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 		default:
 		}
 
-		log.Debug("agent %d/%d: %s starting", i+1, len(selectedAgents), agentCfg.Name)
-
-		// 获取该专家的 AI 配置
+		log.Debug("round1 agent %d/%d: %s starting", i+1, len(selectedAgents), agentCfg.Name)
 		agentAIConfig := s.resolveAgentAIConfig(&agentCfg, aiConfig)
-
-		// 为该专家创建 LLM
 		agentLLM, err := s.modelFactory.CreateModel(meetingCtx, agentAIConfig)
 		if err != nil {
 			log.Error("create agent LLM error: %v", err)
@@ -603,31 +616,27 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 		}
 		builder := s.createBuilder(agentLLM, agentAIConfig)
 
-		// 发送专家开始事件
 		emitProgress(progressCallback, ProgressEvent{
-			Type: "agent_start", AgentID: agentCfg.ID, AgentName: agentCfg.Name, Detail: agentCfg.Role,
+			Type: "agent_start", AgentID: agentCfg.ID, AgentName: agentCfg.Name, Detail: "第一轮·独立陈述",
 		})
 
-		// 构建前面专家发言的上下文
-		previousContext := s.buildPreviousContext(history)
-		// 合并记忆上下文
-		if memoryContext != "" {
-			previousContext = memoryContext + "\n" + previousContext
-		}
-
-		// 获取主持人为该专家分配的专属任务，若无则降级为用户原始问题
 		agentQuery := req.Query
 		if decision.Tasks != nil {
 			if task, ok := decision.Tasks[agentCfg.ID]; ok && task != "" {
 				agentQuery = task
 			}
 		}
+		roundPrompt := buildRoundOnePrompt(agentQuery)
 
-		// 运行单个专家（带超时控制 + 指数退避重试）
+		roundCoreContext := req.CoreContext
+		if memoryContext != "" {
+			roundCoreContext = strings.TrimSpace(memoryContext + "\n\n" + roundCoreContext)
+		}
+
 		content, err := retryRun(meetingCtx, s.retryCount, func() (string, error) {
 			agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
 			defer agentCancel()
-			return s.runSingleAgent(agentCtx, builder, &agentCfg, &req.Stock, agentQuery, previousContext, req.CoreContext, progressCallback, req.Position)
+			return s.runSingleAgent(agentCtx, builder, &agentCfg, &req.Stock, roundPrompt, "", roundCoreContext, progressCallback, req.Position)
 		})
 
 		if err != nil {
@@ -637,9 +646,8 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 			emitProgress(progressCallback, ProgressEvent{
 				Type: "agent_done", AgentID: agentCfg.ID, AgentName: agentCfg.Name,
 			})
-			log.Error("agent %s failed after retries: %v", agentCfg.ID, err)
+			log.Error("round1 agent %s failed after retries: %v", agentCfg.ID, err)
 
-			// 将失败的 agent 加入响应，标记错误
 			failedResp := ChatResponse{
 				AgentID:     agentCfg.ID,
 				AgentName:   agentCfg.Name,
@@ -655,7 +663,6 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 				respCallback(failedResp)
 			}
 
-			// 缓存中断状态，用于后续恢复继续执行
 			if req.StockCode != "" {
 				s.cacheMeetingState(req.StockCode, &MeetingState{
 					AIConfig:       aiConfig,
@@ -672,29 +679,22 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 					CreatedAt:      time.Now(),
 				})
 
-				// 收集剩余专家 ID
 				remainingIDs := make([]string, 0, len(selectedAgents)-i-1)
 				for _, ra := range selectedAgents[i+1:] {
 					remainingIDs = append(remainingIDs, ra.ID)
 				}
-
-				// 发送 meeting_interrupted 事件
 				emitProgress(progressCallback, ProgressEvent{
 					Type: "meeting_interrupted", AgentID: agentCfg.ID, AgentName: agentCfg.Name,
 					Detail: err.Error(), Content: strings.Join(remainingIDs, ","),
 				})
 			}
-
-			// 中断串行执行，不再继续后续专家
 			break
 		}
 
-		// 发送专家完成事件
 		emitProgress(progressCallback, ProgressEvent{
 			Type: "agent_done", AgentID: agentCfg.ID, AgentName: agentCfg.Name,
 		})
 
-		// 添加到响应并立即回调
 		resp := ChatResponse{
 			AgentID:     agentCfg.ID,
 			AgentName:   agentCfg.Name,
@@ -709,16 +709,17 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 			respCallback(resp)
 		}
 
-		// 记录到历史
-		history = append(history, DiscussionEntry{
+		entry := DiscussionEntry{
 			Round:     1,
 			AgentID:   agentCfg.ID,
 			AgentName: agentCfg.Name,
 			Role:      agentCfg.Role,
 			Content:   content,
-		})
+		}
+		history = append(history, entry)
+		roundOneHistory = append(roundOneHistory, entry)
 
-		log.Debug("agent %s done, content len: %d", agentCfg.ID, len(content))
+		log.Debug("round1 agent %s done, content len: %d", agentCfg.ID, len(content))
 	}
 
 	// 检查是否被中断（有缓存状态说明中断了，跳过总结）
@@ -732,22 +733,171 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 		}
 	}
 
+	// ---------- R2: 强制交锋（每位专家至少质疑一位） ----------
+	if len(roundOneHistory) > 1 {
+		for _, challenger := range selectedAgents {
+			select {
+			case <-meetingCtx.Done():
+				log.Warn("meeting timeout during round2, got %d responses", len(responses))
+				return responses, ErrMeetingTimeout
+			default:
+			}
+
+			target := pickDebateTarget(challenger, selectedAgents)
+			if target.ID == "" {
+				continue
+			}
+
+			challenge := DebateChallenge{
+				ChallengerID:   challenger.ID,
+				ChallengerName: challenger.Name,
+				TargetID:       target.ID,
+				TargetName:     target.Name,
+				Question:       buildDebateQuestion(challenger, target),
+			}
+
+			agentAIConfig := s.resolveAgentAIConfig(&target, aiConfig)
+			agentLLM, err := s.modelFactory.CreateModel(meetingCtx, agentAIConfig)
+			if err != nil {
+				log.Error("round2 create agent LLM error: %v", err)
+				continue
+			}
+			builder := s.createBuilder(agentLLM, agentAIConfig)
+
+			emitProgress(progressCallback, ProgressEvent{
+				Type: "agent_start", AgentID: target.ID, AgentName: target.Name, Detail: "第二轮·交叉质疑",
+			})
+
+			roundPrompt := buildChallengePrompt(challenge, req.Query, roundOneHistory)
+			roundCoreContext := req.CoreContext
+			if memoryContext != "" {
+				roundCoreContext = strings.TrimSpace(memoryContext + "\n\n" + roundCoreContext)
+			}
+
+			content, err := retryRun(meetingCtx, s.retryCount, func() (string, error) {
+				agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
+				defer agentCancel()
+				return s.runSingleAgent(agentCtx, builder, &target, &req.Stock, roundPrompt, "", roundCoreContext, progressCallback, req.Position)
+			})
+
+			emitProgress(progressCallback, ProgressEvent{
+				Type: "agent_done", AgentID: target.ID, AgentName: target.Name,
+			})
+			if err != nil || strings.TrimSpace(content) == "" {
+				log.Warn("round2 target %s skipped: %v", target.ID, err)
+				continue
+			}
+
+			contentWithTag := fmt.Sprintf("【交锋】%s -> %s：%s\n%s", challenge.ChallengerName, challenge.TargetName, challenge.Question, content)
+			resp := ChatResponse{
+				AgentID:     target.ID,
+				AgentName:   target.Name,
+				Role:        target.Role,
+				Content:     contentWithTag,
+				Round:       2,
+				MsgType:     "opinion",
+				MeetingMode: MeetingModeSmart,
+			}
+			responses = append(responses, resp)
+			if respCallback != nil {
+				respCallback(resp)
+			}
+
+			entry := DiscussionEntry{
+				Round:     2,
+				AgentID:   target.ID,
+				AgentName: target.Name,
+				Role:      target.Role,
+				Content:   contentWithTag,
+			}
+			history = append(history, entry)
+			roundTwoHistory = append(roundTwoHistory, entry)
+		}
+	}
+
+	// ---------- R3: 修正终判 ----------
+	if len(roundOneHistory) > 0 {
+		for _, agentCfg := range selectedAgents {
+			select {
+			case <-meetingCtx.Done():
+				log.Warn("meeting timeout during round3, got %d responses", len(responses))
+				return responses, ErrMeetingTimeout
+			default:
+			}
+
+			agentAIConfig := s.resolveAgentAIConfig(&agentCfg, aiConfig)
+			agentLLM, err := s.modelFactory.CreateModel(meetingCtx, agentAIConfig)
+			if err != nil {
+				log.Error("round3 create agent LLM error: %v", err)
+				continue
+			}
+			builder := s.createBuilder(agentLLM, agentAIConfig)
+
+			emitProgress(progressCallback, ProgressEvent{
+				Type: "agent_start", AgentID: agentCfg.ID, AgentName: agentCfg.Name, Detail: "第三轮·修正终判",
+			})
+
+			roundPrompt := buildFinalRevisionPrompt(req.Query, roundOneHistory, roundTwoHistory)
+			roundCoreContext := req.CoreContext
+			if memoryContext != "" {
+				roundCoreContext = strings.TrimSpace(memoryContext + "\n\n" + roundCoreContext)
+			}
+
+			content, err := retryRun(meetingCtx, s.retryCount, func() (string, error) {
+				agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
+				defer agentCancel()
+				return s.runSingleAgent(agentCtx, builder, &agentCfg, &req.Stock, roundPrompt, "", roundCoreContext, progressCallback, req.Position)
+			})
+
+			emitProgress(progressCallback, ProgressEvent{
+				Type: "agent_done", AgentID: agentCfg.ID, AgentName: agentCfg.Name,
+			})
+			if err != nil || strings.TrimSpace(content) == "" {
+				log.Warn("round3 agent %s skipped: %v", agentCfg.ID, err)
+				continue
+			}
+
+			resp := ChatResponse{
+				AgentID:     agentCfg.ID,
+				AgentName:   agentCfg.Name,
+				Role:        agentCfg.Role,
+				Content:     content,
+				Round:       3,
+				MsgType:     "opinion",
+				MeetingMode: MeetingModeSmart,
+			}
+			responses = append(responses, resp)
+			if respCallback != nil {
+				respCallback(resp)
+			}
+
+			history = append(history, DiscussionEntry{
+				Round:     3,
+				AgentID:   agentCfg.ID,
+				AgentName: agentCfg.Name,
+				Role:      agentCfg.Role,
+				Content:   content,
+			})
+		}
+	}
+
+	// ---------- 可选 R4: 复议 ----------
 	if s.enableSecondRound && len(history) > 0 {
-		reviewResponses := s.runSecondReviewRound(meetingCtx, aiConfig, &req.Stock, req.Query, selectedAgents, history, req.Position, progressCallback, MeetingModeSmart)
+		reviewResponses := s.runSecondReviewRound(meetingCtx, aiConfig, &req.Stock, req.Query, selectedAgents, history, req.Position, progressCallback, MeetingModeSmart, 4)
 		for _, resp := range reviewResponses {
 			responses = append(responses, resp)
 			if respCallback != nil {
 				respCallback(resp)
 			}
 			history = append(history, DiscussionEntry{
-				Round: 2, AgentID: resp.AgentID, AgentName: resp.AgentName, Role: resp.Role, Content: resp.Content,
+				Round: resp.Round, AgentID: resp.AgentID, AgentName: resp.AgentName, Role: resp.Role, Content: resp.Content,
 			})
 		}
 	}
 
 	// 最终轮：小韭菜总结（带超时）
 	emitProgress(progressCallback, ProgressEvent{
-		Type: "agent_start", AgentID: "moderator", AgentName: "小韭菜", Detail: "总结讨论",
+		Type: "agent_start", AgentID: ModeratorAgentID, AgentName: ModeratorName, Detail: "总结讨论",
 	})
 
 	summaryCtx, summaryCancel := context.WithTimeout(meetingCtx, ModeratorTimeout)
@@ -755,7 +905,7 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 	summaryCancel()
 
 	emitProgress(progressCallback, ProgressEvent{
-		Type: "agent_done", AgentID: "moderator", AgentName: "小韭菜",
+		Type: "agent_done", AgentID: ModeratorAgentID, AgentName: ModeratorName,
 	})
 
 	if err != nil {
@@ -770,9 +920,9 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 
 	if summary != "" {
 		summaryResp := ChatResponse{
-			AgentID:     "moderator",
-			AgentName:   "小韭菜",
-			Role:        "会议主持",
+			AgentID:     ModeratorAgentID,
+			AgentName:   ModeratorName,
+			Role:        ModeratorRole,
 			Content:     summary,
 			Round:       summaryRound(history),
 			MsgType:     "summary",
@@ -1016,6 +1166,154 @@ func (s *Service) buildPreviousContext(history []DiscussionEntry) string {
 		fmt.Fprintf(&sb, "- %s（%s）：%s\n\n", entry.AgentName, entry.Role, entry.Content)
 	}
 	return sb.String()
+}
+
+func buildRoundContext(title string, entries []DiscussionEntry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("【")
+	sb.WriteString(title)
+	sb.WriteString("】\n")
+	for _, entry := range entries {
+		fmt.Fprintf(&sb, "- %s（%s）：%s\n\n", entry.AgentName, entry.Role, entry.Content)
+	}
+	return sb.String()
+}
+
+func buildRoundOnePrompt(baseQuery string) string {
+	return "【第一轮：独立陈述】\n" +
+		"请独立给出你的初判，不要被其他专家预设立场影响。\n" +
+		"要求：必须包含【结论】【核心证据】【买点/卖点或观望条件】【止损或失效条件】【仓位建议】。\n" +
+		"若数据不足，明确写“数据不足”。\n\n用户问题：" + baseQuery
+}
+
+func buildChallengePrompt(challenge DebateChallenge, baseQuery string, roundOneHistory []DiscussionEntry) string {
+	var sb strings.Builder
+	sb.WriteString("【第二轮：交叉质疑（强制交锋）】\n")
+	sb.WriteString("你不是原发言人，请站在你的专业视角回应下面这条质疑。\n")
+	sb.WriteString("要求：先回答质疑，再给出你认可/不认可的理由，最后给可执行修正建议。\n")
+	sb.WriteString("若不同意，必须给可证伪条件；若同意，必须给新增约束。\n\n")
+	sb.WriteString(fmt.Sprintf("用户原问题：%s\n\n", baseQuery))
+	sb.WriteString("【原始观点摘要】\n")
+	for _, entry := range roundOneHistory {
+		fmt.Fprintf(&sb, "- %s：%s\n", entry.AgentName, entry.Content)
+	}
+	sb.WriteString("\n")
+	sb.WriteString("【当前质疑】\n")
+	sb.WriteString(fmt.Sprintf("%s -> %s：%s\n", challenge.ChallengerName, challenge.TargetName, challenge.Question))
+	sb.WriteString("\n请在180字内完成回应。")
+	return sb.String()
+}
+
+func buildFinalRevisionPrompt(baseQuery string, roundOneHistory []DiscussionEntry, roundTwoResponses []DiscussionEntry) string {
+	var sb strings.Builder
+	sb.WriteString("【第三轮：修正终判】\n")
+	sb.WriteString("请基于第一轮观点与第二轮交叉质疑，给出你的最终修正版结论。\n")
+	sb.WriteString("必须输出：\n")
+	sb.WriteString("1) 最终立场（看多/中性/看空）+ 置信度\n")
+	sb.WriteString("2) 相比第一轮，你修正了什么\n")
+	sb.WriteString("3) 触发失效的关键条件\n")
+	sb.WriteString("4) 可执行动作（买/卖/观望 + 仓位）\n")
+	sb.WriteString("若你坚持原观点，也要说明为何不修正。\n\n")
+	sb.WriteString(fmt.Sprintf("用户问题：%s\n\n", baseQuery))
+	sb.WriteString(buildRoundContext("第一轮观点", roundOneHistory))
+	sb.WriteString(buildRoundContext("第二轮交叉质疑回应", roundTwoResponses))
+	sb.WriteString("请在180字内回答。")
+	return sb.String()
+}
+
+func pickDebateTarget(self models.AgentConfig, selectedAgents []models.AgentConfig) models.AgentConfig {
+	if len(selectedAgents) <= 1 {
+		return models.AgentConfig{}
+	}
+	selfRisk := strings.Contains(self.ID, "risk")
+	selfTech := strings.Contains(self.ID, "technical")
+	selfCapital := strings.Contains(self.ID, "capital")
+	selfFundamental := strings.Contains(self.ID, "fundamental")
+
+	chooseByID := func(preferred []string) models.AgentConfig {
+		for _, pid := range preferred {
+			for _, candidate := range selectedAgents {
+				if candidate.ID == self.ID {
+					continue
+				}
+				if candidate.ID == pid {
+					return candidate
+				}
+			}
+		}
+		return models.AgentConfig{}
+	}
+
+	if selfRisk {
+		if t := chooseByID([]string{"fundamental", "technical", "capital", "policy", "hottrend", "quant"}); t.ID != "" {
+			return t
+		}
+	}
+	if selfFundamental {
+		if t := chooseByID([]string{"risk", "policy", "quant", "capital", "technical", "hottrend"}); t.ID != "" {
+			return t
+		}
+	}
+	if selfTech {
+		if t := chooseByID([]string{"risk", "capital", "quant", "fundamental", "policy", "hottrend"}); t.ID != "" {
+			return t
+		}
+	}
+	if selfCapital {
+		if t := chooseByID([]string{"technical", "risk", "quant", "hottrend", "fundamental", "policy"}); t.ID != "" {
+			return t
+		}
+	}
+	if strings.Contains(self.ID, "policy") {
+		if t := chooseByID([]string{"fundamental", "risk", "quant", "technical", "capital", "hottrend"}); t.ID != "" {
+			return t
+		}
+	}
+	if strings.Contains(self.ID, "hottrend") {
+		if t := chooseByID([]string{"capital", "risk", "technical", "quant", "fundamental", "policy"}); t.ID != "" {
+			return t
+		}
+	}
+	if strings.Contains(self.ID, "quant") {
+		if t := chooseByID([]string{"technical", "capital", "fundamental", "risk", "policy", "hottrend"}); t.ID != "" {
+			return t
+		}
+	}
+
+	for _, candidate := range selectedAgents {
+		if candidate.ID != self.ID {
+			return candidate
+		}
+	}
+	return models.AgentConfig{}
+}
+
+func buildDebateQuestion(challenger models.AgentConfig, target models.AgentConfig) string {
+	if target.ID == "" || challenger.ID == "" {
+		return "你的结论在什么条件下会失效？请给出可量化触发条件。"
+	}
+
+	switch challenger.ID {
+	case "fundamental":
+		return fmt.Sprintf("你给出的交易结论如何映射到盈利与估值分位？若EPS不达预期，你的结论如何修正？")
+	case "technical":
+		return fmt.Sprintf("你的判断对应的关键价位与失效位是什么？如果放量不持续，你是否撤回观点？")
+	case "capital":
+		return fmt.Sprintf("你的逻辑如何被资金行为验证？若出现价滞量增，你的结论会否反转？")
+	case "policy":
+		return fmt.Sprintf("你的结论里有哪些政策因素已price-in？若政策落地弱于预期，影响有多大？")
+	case "risk":
+		return fmt.Sprintf("你的观点最脆弱的假设是什么？给出最大下行空间和触发条件。")
+	case "hottrend":
+		return fmt.Sprintf("你的结论是否受情绪拥挤影响？若热度转折，观点要怎么调整？")
+	case "quant":
+		return fmt.Sprintf("你的结论在历史样本中的胜率和回撤分布是什么？统计上是否显著？")
+	default:
+		return fmt.Sprintf("请给出你观点的反证条件：什么情况下你会承认当前结论失效？")
+	}
 }
 
 // extractKeyPointsFromHistory 从讨论历史中提取关键点
@@ -1307,7 +1605,7 @@ func (s *Service) runMeetingSummary(
 	progressCallback ProgressCallback,
 ) ([]ChatResponse, error) {
 	emitProgress(progressCallback, ProgressEvent{
-		Type: "agent_start", AgentID: "moderator", AgentName: "小韭菜", Detail: "总结讨论",
+		Type: "agent_start", AgentID: ModeratorAgentID, AgentName: ModeratorName, Detail: "总结讨论",
 	})
 
 	summaryCtx, summaryCancel := context.WithTimeout(ctx, ModeratorTimeout)
@@ -1315,7 +1613,7 @@ func (s *Service) runMeetingSummary(
 	summaryCancel()
 
 	emitProgress(progressCallback, ProgressEvent{
-		Type: "agent_done", AgentID: "moderator", AgentName: "小韭菜",
+		Type: "agent_done", AgentID: ModeratorAgentID, AgentName: ModeratorName,
 	})
 
 	if err != nil {
@@ -1329,8 +1627,8 @@ func (s *Service) runMeetingSummary(
 
 	if summary != "" {
 		summaryResp := ChatResponse{
-			AgentID: "moderator", AgentName: "小韭菜",
-			Role: "会议主持", Content: summary,
+			AgentID: ModeratorAgentID, AgentName: ModeratorName,
+			Role: ModeratorRole, Content: summary,
 			Round: summaryRound(history), MsgType: "summary", MeetingMode: MeetingModeSmart,
 		}
 		responses = append(responses, summaryResp)
@@ -1417,9 +1715,13 @@ func (s *Service) runSecondReviewRound(
 	position *models.StockPosition,
 	progressCallback ProgressCallback,
 	meetingMode string,
+	round int,
 ) []ChatResponse {
 	if len(history) == 0 || len(selectedAgents) == 0 {
 		return nil
+	}
+	if round <= 0 {
+		round = 2
 	}
 
 	reviewQuery := buildSecondReviewQuery(query)
@@ -1458,7 +1760,7 @@ func (s *Service) runSecondReviewRound(
 			AgentName:   agentCfg.Name,
 			Role:        agentCfg.Role,
 			Content:     content,
-			Round:       2,
+			Round:       round,
 			MsgType:     "opinion",
 			MeetingMode: meetingMode,
 		})

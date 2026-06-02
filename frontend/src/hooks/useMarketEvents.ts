@@ -2,6 +2,7 @@ import { useEffect, useCallback, useRef } from 'react';
 import { EventsOn, EventsOff, EventsEmit } from '@wailsjs/runtime/runtime';
 import { NotifyFrontendReady } from '../../wailsjs/go/main/App';
 import { Stock, OrderBook, Telegraph, MarketIndex, KLineData } from '../types';
+import { isWailsBridgeReady, warnWailsUnavailable } from '../utils/wailsEnv';
 
 // K线推送数据结构
 interface KLineUpdateData {
@@ -54,6 +55,11 @@ export function useMarketEvents(options: UseMarketEventsOptions) {
 
   // 注册事件监听
   useEffect(() => {
+    if (!isWailsBridgeReady()) {
+      warnWailsUnavailable('实时推送', 'both');
+      return;
+    }
+
     // 监听股票数据更新
     EventsOn(EVENT_STOCK_UPDATE, (stocks: Stock[]) => {
       stockCallbackRef.current?.(stocks);
@@ -105,16 +111,19 @@ export function useMarketEvents(options: UseMarketEventsOptions) {
 
   // 订阅股票
   const subscribe = useCallback((codes: string[]) => {
+    if (!isWailsBridgeReady()) return;
     EventsEmit(EVENT_MARKET_SUBSCRIBE, codes);
   }, []);
 
   // 订阅盘口（指定当前选中的股票）
   const subscribeOrderBook = useCallback((code: string) => {
+    if (!isWailsBridgeReady()) return;
     EventsEmit(EVENT_ORDERBOOK_SUBSCRIBE, code);
   }, []);
 
   // 订阅K线（指定股票代码和周期）
   const subscribeKLine = useCallback((code: string, period: string) => {
+    if (!isWailsBridgeReady()) return;
     EventsEmit(EVENT_KLINE_SUBSCRIBE, code, period);
   }, []);
 

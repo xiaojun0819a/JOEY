@@ -80,6 +80,85 @@ const tabs: Array<{ id: TabId; label: string }> = [
   { id: 'valuation', label: '估值分析' },
 ];
 
+const errorSectionNames: Record<string, string> = {
+  service: '服务',
+  request: '请求',
+  company: '公司概况',
+  financials: '财务报表',
+  performance: '业绩事件',
+  fundFlow: '资金流向',
+  valuation: '估值快照',
+  institutions: '机构持仓',
+  bonus: '分红融资',
+  business: '经营分析',
+  shareholders: '股东户数',
+  pledge: '股权质押',
+  lockup: '限售解禁',
+  holderChange: '股东增减持',
+  buyback: '股票回购',
+  operations: '操盘必读',
+  coreThemes: '核心题材',
+  industryMetrics: '同行比较',
+  mainIndicators: '主要指标',
+  management: '公司高管',
+  capitalOperation: '资本运作',
+  equityStructure: '股本结构',
+  relatedStocks: '关联个股',
+  valuationTrend: '估值趋势',
+};
+
+type FriendlyError = {
+  message: string;
+  detail?: string;
+};
+
+function cleanBackendError(raw: string): string {
+  return raw
+    .replace(/(?:Get|Post)\s+"https?:\/\/[^"]+"\s*:\s*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function toFriendlyError(raw: string): FriendlyError {
+  const cleaned = cleanBackendError(raw);
+  const text = cleaned || raw;
+  const lower = text.toLowerCase();
+
+  if (lower.includes('使用缓存数据')) {
+    return {
+      message: '上游接口波动，已自动使用缓存数据',
+      detail: text,
+    };
+  }
+  if (
+    lower.includes('eof')
+    || lower.includes('timeout')
+    || lower.includes('dial tcp')
+    || lower.includes('connection reset')
+    || lower.includes('no such host')
+    || lower.includes('tls')
+  ) {
+    return {
+      message: '网络波动，暂未拉到该分项最新数据，可稍后刷新',
+      detail: text,
+    };
+  }
+  if (text.includes('上游返回HTML响应')) {
+    return {
+      message: '上游接口返回异常页面，已跳过该分项',
+      detail: text,
+    };
+  }
+  if (lower.includes('empty') || text.includes('为空')) {
+    return {
+      message: '该分项暂未返回有效数据',
+      detail: text,
+    };
+  }
+
+  return { message: text || '数据拉取失败' };
+}
+
 const F10Panel: React.FC<F10PanelProps> = ({ overview, loading, error, onRefresh, onCollapse }) => {
   const [activeTab, setActiveTab] = useState<TabId>('overview');
   const [hideNoPlanDividends, setHideNoPlanDividends] = useState(false);
@@ -89,9 +168,26 @@ const F10Panel: React.FC<F10PanelProps> = ({ overview, loading, error, onRefresh
   const [financialViewMode, setFinancialViewMode] = useState<FinancialViewMode>('report');
 
   const overviewErrors = useMemo(() => {
-    if (!overview?.errors) return [];
-    return Object.values(overview.errors).filter(Boolean);
+    if (!overview?.errors) return [] as Array<{ message: string; detail?: string }>;
+    const dedup = new Set<string>();
+    const result: Array<{ message: string; detail?: string }> = [];
+    for (const [key, raw] of Object.entries(overview.errors)) {
+      if (!raw) continue;
+      const section = errorSectionNames[key] || key;
+      const friendly = toFriendlyError(raw);
+      const fullMessage = `${section}: ${friendly.message}`;
+      const dedupKey = `${section}|${friendly.message}`;
+      if (dedup.has(dedupKey)) continue;
+      dedup.add(dedupKey);
+      result.push({
+        message: fullMessage,
+        detail: friendly.detail,
+      });
+    }
+    return result;
   }, [overview]);
+
+  const requestError = useMemo(() => (error ? toFriendlyError(error) : null), [error]);
 
   return (
     <div className="f10-panel h-full min-w-0 overflow-hidden flex flex-col text-left">
@@ -154,9 +250,17 @@ const F10Panel: React.FC<F10PanelProps> = ({ overview, loading, error, onRefresh
                   数据获取提示
                 </div>
                 <ul className="mt-1 space-y-1 text-orange-200/80">
-                  {error && <li>{error}</li>}
-                  {overviewErrors.map((msg, idx) => (
-                    <li key={idx}>{msg}</li>
+                  {requestError && <li>请求: {requestError.message}</li>}
+                  {overviewErrors.map((item, idx) => (
+                    <li key={`${item.message}-${idx}`}>
+                      <div>{item.message}</div>
+                      {item.detail && (
+                        <details className="mt-0.5 text-[11px] text-orange-200/60">
+                          <summary className="cursor-pointer select-none">技术细节</summary>
+                          <div className="break-all mt-0.5">{item.detail}</div>
+                        </details>
+                      )}
+                    </li>
                   ))}
                 </ul>
               </div>
@@ -4542,5 +4646,4 @@ const mergeRecords = (...records: Array<Record<string, any> | undefined>) => {
 };
 
 export { F10Panel };
-
 

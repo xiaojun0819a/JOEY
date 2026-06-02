@@ -83,6 +83,7 @@ export namespace hottrend {
 	}
 
 }
+
 export namespace main {
 	
 	export class EnhancePromptRequest {
@@ -299,6 +300,26 @@ export namespace models {
 	        this.mcpServers = source["mcpServers"];
 	        this.enabled = source["enabled"];
 	        this.aiConfigId = source["aiConfigId"];
+	    }
+	}
+	export class HistoryConfig {
+	    autoCollectDaily: boolean;
+	    collectStart: string;
+	    collectEnd: string;
+	    includeBeijing: boolean;
+	    lastCollectDate: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new HistoryConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.autoCollectDaily = source["autoCollectDaily"];
+	        this.collectStart = source["collectStart"];
+	        this.collectEnd = source["collectEnd"];
+	        this.includeBeijing = source["includeBeijing"];
+	        this.lastCollectDate = source["lastCollectDate"];
 	    }
 	}
 	export class KDJConfig {
@@ -550,6 +571,7 @@ export namespace models {
 	    layout: LayoutConfig;
 	    openClaw: OpenClawConfig;
 	    indicators: IndicatorConfig;
+	    history: HistoryConfig;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppConfig(source);
@@ -573,6 +595,7 @@ export namespace models {
 	        this.layout = this.convertValues(source["layout"], LayoutConfig);
 	        this.openClaw = this.convertValues(source["openClaw"], OpenClawConfig);
 	        this.indicators = this.convertValues(source["indicators"], IndicatorConfig);
+	        this.history = this.convertValues(source["history"], HistoryConfig);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -1287,6 +1310,95 @@ export namespace models {
 	
 	
 	
+	export class HistoryAutoCollectRequest {
+	    enabled: boolean;
+	    collectStart: string;
+	    collectEnd: string;
+	    includeBeijing: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new HistoryAutoCollectRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	        this.collectStart = source["collectStart"];
+	        this.collectEnd = source["collectEnd"];
+	        this.includeBeijing = source["includeBeijing"];
+	    }
+	}
+	export class HistoryAutoCollectStatus {
+	    enabled: boolean;
+	    collectStart: string;
+	    collectEnd: string;
+	    includeBeijing: boolean;
+	    lastCollectDate: string;
+	    dbPath: string;
+	    message: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new HistoryAutoCollectStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	        this.collectStart = source["collectStart"];
+	        this.collectEnd = source["collectEnd"];
+	        this.includeBeijing = source["includeBeijing"];
+	        this.lastCollectDate = source["lastCollectDate"];
+	        this.dbPath = source["dbPath"];
+	        this.message = source["message"];
+	    }
+	}
+	export class HistoryCollectRequest {
+	    tradeDate: string;
+	    includeBeijing: boolean;
+	    triggeredByAuto?: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new HistoryCollectRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.tradeDate = source["tradeDate"];
+	        this.includeBeijing = source["includeBeijing"];
+	        this.triggeredByAuto = source["triggeredByAuto"];
+	    }
+	}
+	export class HistoryCollectResult {
+	    tradeDate: string;
+	    startedAt: string;
+	    finishedAt: string;
+	    dbPath: string;
+	    totalCount: number;
+	    savedCount: number;
+	    failedCount: number;
+	    maUpdated: boolean;
+	    status: string;
+	    message: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new HistoryCollectResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.tradeDate = source["tradeDate"];
+	        this.startedAt = source["startedAt"];
+	        this.finishedAt = source["finishedAt"];
+	        this.dbPath = source["dbPath"];
+	        this.totalCount = source["totalCount"];
+	        this.savedCount = source["savedCount"];
+	        this.failedCount = source["failedCount"];
+	        this.maUpdated = source["maUpdated"];
+	        this.status = source["status"];
+	        this.message = source["message"];
+	    }
+	}
+	
 	
 	
 	
@@ -1404,6 +1516,154 @@ export namespace models {
 	        this.d10Change = source["d10Change"];
 	        this.securityType = source["securityType"];
 	    }
+	}
+	export class LowBuyMarketOverview {
+	    shPrice: number;
+	    shMA20: number;
+	    limitUpCount: number;
+	    limitDownCount: number;
+	    totalAmount: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LowBuyMarketOverview(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.shPrice = source["shPrice"];
+	        this.shMA20 = source["shMA20"];
+	        this.limitUpCount = source["limitUpCount"];
+	        this.limitDownCount = source["limitDownCount"];
+	        this.totalAmount = source["totalAmount"];
+	    }
+	}
+	export class LowBuyScannerItem {
+	    symbol: string;
+	    name: string;
+	    price: number;
+	    changePercent: number;
+	    amount: number;
+	    turnoverRate: number;
+	    mainNetInflow: number;
+	    mainNetInflowRatio: number;
+	    mainFlowSource: string;
+	    totalMarketCap: number;
+	    floatMarketCap: number;
+	    capBucket: string;
+	    industry: string;
+	    score: number;
+	    triggerCount: number;
+	    triggers: string[];
+	    reasons: string[];
+	    riskFlags: string[];
+	    buyPointHint: string;
+	    sellPointHint: string;
+	    stopLossHint: string;
+	    updatedAt: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new LowBuyScannerItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.symbol = source["symbol"];
+	        this.name = source["name"];
+	        this.price = source["price"];
+	        this.changePercent = source["changePercent"];
+	        this.amount = source["amount"];
+	        this.turnoverRate = source["turnoverRate"];
+	        this.mainNetInflow = source["mainNetInflow"];
+	        this.mainNetInflowRatio = source["mainNetInflowRatio"];
+	        this.mainFlowSource = source["mainFlowSource"];
+	        this.totalMarketCap = source["totalMarketCap"];
+	        this.floatMarketCap = source["floatMarketCap"];
+	        this.capBucket = source["capBucket"];
+	        this.industry = source["industry"];
+	        this.score = source["score"];
+	        this.triggerCount = source["triggerCount"];
+	        this.triggers = source["triggers"];
+	        this.reasons = source["reasons"];
+	        this.riskFlags = source["riskFlags"];
+	        this.buyPointHint = source["buyPointHint"];
+	        this.sellPointHint = source["sellPointHint"];
+	        this.stopLossHint = source["stopLossHint"];
+	        this.updatedAt = source["updatedAt"];
+	    }
+	}
+	export class LowBuyScannerRequest {
+	    limit: number;
+	    includeBeijing: boolean;
+	    historyFilterEnabled: boolean;
+	    historyTurnoverDays: number;
+	    historyTurnoverMax: number;
+	    historyMainFlowDays: number;
+	    historyMainFlowPositiveDays: number;
+	    historyMAPeriod: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LowBuyScannerRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.limit = source["limit"];
+	        this.includeBeijing = source["includeBeijing"];
+	        this.historyFilterEnabled = source["historyFilterEnabled"];
+	        this.historyTurnoverDays = source["historyTurnoverDays"];
+	        this.historyTurnoverMax = source["historyTurnoverMax"];
+	        this.historyMainFlowDays = source["historyMainFlowDays"];
+	        this.historyMainFlowPositiveDays = source["historyMainFlowPositiveDays"];
+	        this.historyMAPeriod = source["historyMAPeriod"];
+	    }
+	}
+	export class LowBuyScannerResult {
+	    asOf: string;
+	    ruleVersion: string;
+	    universeCount: number;
+	    candidateCount: number;
+	    selectedCount: number;
+	    marketGatePassed: boolean;
+	    marketGateReasons: string[];
+	    marketOverview: LowBuyMarketOverview;
+	    items: LowBuyScannerItem[];
+	    warning?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new LowBuyScannerResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.asOf = source["asOf"];
+	        this.ruleVersion = source["ruleVersion"];
+	        this.universeCount = source["universeCount"];
+	        this.candidateCount = source["candidateCount"];
+	        this.selectedCount = source["selectedCount"];
+	        this.marketGatePassed = source["marketGatePassed"];
+	        this.marketGateReasons = source["marketGateReasons"];
+	        this.marketOverview = this.convertValues(source["marketOverview"], LowBuyMarketOverview);
+	        this.items = this.convertValues(source["items"], LowBuyScannerItem);
+	        this.warning = source["warning"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	
 	
@@ -1923,3 +2183,4 @@ export namespace tools {
 	}
 
 }
+

@@ -47,6 +47,14 @@
         height: 100vh;
         text-align: center;
     }
+
+    /* In browser-mode dev, stale Wails spinner overlays can look like a full black screen. */
+    #wails-spinner {
+        display: none !important;
+        visibility: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+    }
 }
 
 @layer components {

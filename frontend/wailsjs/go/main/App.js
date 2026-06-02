@@ -34,6 +34,10 @@ export function ClearSessionMessages(arg1) {
   return window['go']['main']['App']['ClearSessionMessages'](arg1);
 }
 
+export function CollectDailyHistory(arg1) {
+  return window['go']['main']['App']['CollectDailyHistory'](arg1);
+}
+
 export function DeleteAgentConfig(arg1) {
   return window['go']['main']['App']['DeleteAgentConfig'](arg1);
 }
@@ -96,6 +100,10 @@ export function GetF10Overview(arg1) {
 
 export function GetF10Valuation(arg1) {
   return window['go']['main']['App']['GetF10Valuation'](arg1);
+}
+
+export function GetHistoryAutoCollectStatus() {
+  return window['go']['main']['App']['GetHistoryAutoCollectStatus']();
 }
 
 export function GetHotTrend(arg1) {
@@ -210,6 +218,10 @@ export function RetryAgentAndContinue(arg1) {
   return window['go']['main']['App']['RetryAgentAndContinue'](arg1);
 }
 
+export function RunLowBuyScannerV1(arg1) {
+  return window['go']['main']['App']['RunLowBuyScannerV1'](arg1);
+}
+
 export function SearchStocks(arg1) {
   return window['go']['main']['App']['SearchStocks'](arg1);
 }
@@ -236,6 +248,10 @@ export function UpdateAgentConfig(arg1) {
 
 export function UpdateConfig(arg1) {
   return window['go']['main']['App']['UpdateConfig'](arg1);
+}
+
+export function UpdateHistoryAutoCollect(arg1) {
+  return window['go']['main']['App']['UpdateHistoryAutoCollect'](arg1);
 }
 
 export function UpdateMCPServer(arg1) {

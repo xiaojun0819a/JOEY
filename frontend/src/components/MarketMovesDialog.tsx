@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Activity, RefreshCw, TrendingUp, X } from 'lucide-react';
 import { GetBoardFundFlow, GetBoardLeaders, GetStockMoves } from '../../wailsjs/go/main/App';
+import { isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
 
 interface MarketMovesDialogProps {
   isOpen: boolean;
@@ -111,6 +112,13 @@ export const MarketMovesDialog: React.FC<MarketMovesDialogProps> = ({ isOpen, on
   }, []);
 
   const loadBoardLeaders = useCallback(async (boardCode: string) => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('板块龙头', 'go');
+      setLeaderResult(null);
+      setLeaderError('浏览器预览模式暂不支持该数据源');
+      setLeaderLoading(false);
+      return;
+    }
     setLeaderLoading(true);
     setLeaderError('');
     try {
@@ -134,6 +142,15 @@ export const MarketMovesDialog: React.FC<MarketMovesDialogProps> = ({ isOpen, on
   }, []);
 
   const loadBoardFlow = useCallback(async (nextCategory: BoardCategory, preferredBoardCode?: string) => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('板块异动', 'go');
+      setBoardFlow(null);
+      setSelectedBoard(null);
+      setLeaderResult(null);
+      setError('浏览器预览模式暂不支持该数据源');
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -168,6 +185,13 @@ export const MarketMovesDialog: React.FC<MarketMovesDialogProps> = ({ isOpen, on
   }, [loadBoardLeaders]);
 
   const loadStockMoves = useCallback(async (nextType: StockMoveType) => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('盘口异动', 'go');
+      setStockMoves(null);
+      setStockError('浏览器预览模式暂不支持该数据源');
+      setStockLoading(false);
+      return;
+    }
     setStockLoading(true);
     setStockError('');
     try {

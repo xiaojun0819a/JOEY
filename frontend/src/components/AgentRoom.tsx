@@ -1,15 +1,29 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Stock, KLineData } from '../types';
 import { getAgentConfigs, AgentConfig } from '../services/strategyService';
 import { StockSession, ChatMessage, sendMeetingMessage, MeetingMessageRequest, getSessionMessages, retryAgent, retryAgentAndContinue, cancelInterruptedMeeting } from '../services/sessionService';
-import { MessageSquare, Loader2, Send, User, Users, X, Reply, Trash2, Wrench, CheckCircle2, AlertCircle, Copy, Check, RotateCcw, Pencil, Square } from 'lucide-react';
+import { MessageSquare, Loader2, Send, User, Users, X, Reply, Trash2, Wrench, CheckCircle2, AlertCircle, Copy, Check, RotateCcw, Pencil, Square, Zap } from 'lucide-react';
 import { clearSessionMessages } from '../services/sessionService';
 import { NodeRenderer } from 'markstream-react';
 import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime';
 import { useMentionPicker } from '../hooks/useMentionPicker';
 import { useTheme } from '../contexts/ThemeContext';
 import { CancelMeeting } from '../../wailsjs/go/main/App';
+import { ResizeHandle } from './ResizeHandle';
+import { isWailsBridgeReady, isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
 import 'markstream-react/index.css';
+
+const BATTLE_AGENT_ID_PRIORITY = ['fundamental', 'technical', 'capital', 'risk', 'quant'];
+const BATTLE_AGENT_NAME_PRIORITY = ['老陈', 'K线王', '钱姐', '风控李', '数据老李'];
+const BATTLE_PROMPT = `针对当前股票做多空Battle。每位被@专家都必须按统一格式回复：
+【立场】看多/中性/看空（置信度0-100）
+【核心证据】1) 2) 3)
+【买点】触发条件或价格区间
+【止损】明确价格或条件
+【卖点】第一止盈 / 第二止盈
+【仓位】建议仓位（%）
+【时效】该判断有效到何时
+要求：可执行、少空话、150字内。`;
 
 // 进度事件类型
 interface ProgressEvent {
@@ -37,12 +51,16 @@ interface AgentRoomProps {
 
 export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }) => {
   const { colors } = useTheme();
+  const COMPOSER_MIN_WIDTH = 260;
+  const COMPOSER_BUTTON_SPACE = 56;
   const [allAgents, setAllAgents] = useState<AgentConfig[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [simulatingMap, setSimulatingMap] = useState<Record<string, boolean>>({});
   const [userQuery, setUserQuery] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const composerRowRef = useRef<HTMLFormElement>(null);
+  const [composerWidth, setComposerWidth] = useState<number | null>(null);
 
   // 当前会话是否在会议中
   const isSimulating = session?.stockCode ? simulatingMap[session.stockCode] || false : false;
@@ -101,6 +119,10 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
 
   // 取消指定股票的会议
   const cancelMeeting = (stockCode: string) => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('会议取消', 'go');
+      return;
+    }
     // 调用后端取消 API
     CancelMeeting(stockCode).catch(err => {
       console.error('[AgentRoom] 取消会议失败:', err);
@@ -134,6 +156,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
 
   // 监听策略切换事件，重新加载Agent配置
   useEffect(() => {
+    if (!isWailsBridgeReady()) return;
     const cleanup = EventsOn('strategy:changed', () => {
       console.log('[AgentRoom] 策略已切换，重新加载Agent配置');
       loadAgents();
@@ -173,6 +196,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
 
   // 订阅会议消息事件（实时接收发言）
   useEffect(() => {
+    if (!isWailsBridgeReady()) return;
     if (!session?.stockCode) return;
 
     const stockCode = session.stockCode;
@@ -193,6 +217,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
 
   // 订阅进度事件（工具调用、流式输出等）
   useEffect(() => {
+    if (!isWailsBridgeReady()) return;
     if (!session?.stockCode) return;
 
     const stockCode = session.stockCode;
@@ -342,6 +367,27 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
     handleMentionInput(value, cursorPos);
   };
 
+  const handleComposerResize = useCallback((delta: number) => {
+    setComposerWidth(prev => {
+      const rowWidth = composerRowRef.current?.clientWidth || 0;
+      const maxWidth = rowWidth > 0
+        ? Math.max(COMPOSER_MIN_WIDTH, rowWidth - COMPOSER_BUTTON_SPACE)
+        : 900;
+      const base = prev ?? maxWidth;
+      return Math.max(COMPOSER_MIN_WIDTH, Math.min(maxWidth, base + delta));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (composerWidth == null) return;
+    const rowWidth = composerRowRef.current?.clientWidth || 0;
+    if (rowWidth <= 0) return;
+    const maxWidth = Math.max(COMPOSER_MIN_WIDTH, rowWidth - COMPOSER_BUTTON_SPACE);
+    if (composerWidth > maxWidth) {
+      setComposerWidth(maxWidth);
+    }
+  }, [composerWidth]);
+
   // 选择@韭菜（包装 Hook 方法）
   const onSelectMention = (agent: AgentConfig) => {
     const newQuery = handleSelectMention(agent, userQuery);
@@ -445,6 +491,31 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
     setShowClearConfirm(true);
   };
 
+  // 一键 Battle：固定专家 + 统一格式提问
+  const handleOneClickBattle = useCallback(() => {
+    if (!session || isSimulating) return;
+
+    const availableAgentIds = new Set(allAgents.map(agent => agent.id));
+    const mentionIdsByID = BATTLE_AGENT_ID_PRIORITY.filter(id => availableAgentIds.has(id));
+    const mentionIdsByName = BATTLE_AGENT_NAME_PRIORITY
+      .map(name => allAgents.find(agent => agent.name === name)?.id)
+      .filter((id): id is string => Boolean(id));
+    const mentionIds = mentionIdsByID.length > 0
+      ? mentionIdsByID
+      : Array.from(new Set(mentionIdsByName));
+
+    if (mentionIds.length === 0) {
+      addSystemMessage('未找到可用Battle专家，请先在策略里启用专家');
+      return;
+    }
+
+    setUserQuery('');
+    clearMentions();
+    setReplyToMessage(null);
+    closePicker();
+    handleSendMessage(BATTLE_PROMPT, mentionIds, null);
+  }, [session, isSimulating, allAgents, clearMentions, closePicker, handleSendMessage]);
+
   // 确认清空消息
   const confirmClearMessages = async () => {
     if (!session) return;
@@ -486,7 +557,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
           <div className={`h-full flex flex-col items-center justify-center text-sm p-8 text-center opacity-60 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
             <MessageSquare size={32} className="mb-2" />
             <p>直接提问或 @ 选择韭菜专家</p>
-            <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-600' : 'text-slate-400'}`}>不@任何人时，小韭菜会自动安排韭菜专家讨论</p>
+            <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-600' : 'text-slate-400'}`}>不@任何人时，老板娘会自动安排专家三轮讨论</p>
           </div>
         )}
         
@@ -562,7 +633,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
             )
           }
 
-          // 小韭菜消息（开场白/总结）
+          // 主持人消息（开场白/总结）
           const isModerator = msg.agentId === 'moderator';
           if (isModerator) {
             const isOpening = msg.msgType === 'opening';
@@ -794,40 +865,62 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
           )}
 
           {/* 输入框 */}
-          <form onSubmit={handleSubmit} className="flex gap-2">
-            <input
-               ref={inputRef}
-               type="text"
-               value={userQuery}
-               onChange={handleInputChange}
-               onKeyDown={handleKeyDown}
-               disabled={isSimulating}
-               placeholder="直接提问或输入 @ 选择韭菜专家..."
-               className="flex-1 fin-input rounded-lg px-4 py-2 text-sm placeholder-slate-500 border fin-divider"
-            />
-            {isSimulating ? (
+          <form ref={composerRowRef} onSubmit={handleSubmit} className="flex items-stretch gap-2">
+            <div
+              className="min-w-0"
+              style={composerWidth == null ? { flex: '1 1 auto' } : { width: `${composerWidth}px`, flex: '0 0 auto' }}
+            >
+              <input
+                 ref={inputRef}
+                 type="text"
+                 value={userQuery}
+                 onChange={handleInputChange}
+                 onKeyDown={handleKeyDown}
+                 disabled={isSimulating}
+                 placeholder="直接提问或输入 @ 选择韭菜专家..."
+                 className="w-full fin-input rounded-lg px-4 py-2 text-sm placeholder-slate-500 border fin-divider"
+              />
+            </div>
+            <ResizeHandle direction="horizontal" onResize={handleComposerResize} />
+            <div className="relative w-10 shrink-0">
               <button
                 type="button"
-                onClick={() => session?.stockCode && cancelMeeting(session.stockCode)}
-                className="text-white p-2 rounded-lg transition-colors flex items-center justify-center w-10 h-10 bg-red-500 hover:bg-red-400"
-                title="停止讨论"
+                onClick={handleOneClickBattle}
+                disabled={isSimulating || allAgents.length === 0}
+                className={`absolute right-0 bottom-full mb-2 px-3 h-9 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap z-20 shadow-md ${
+                  colors.isDark
+                    ? 'border-slate-700 text-amber-300 bg-slate-900/95 hover:bg-slate-800 disabled:opacity-40'
+                    : 'border-slate-300 text-amber-700 bg-white/95 hover:bg-amber-50 disabled:opacity-40'
+                }`}
+                title="固定专家多空Battle"
               >
-                <Square size={14} fill="currentColor" />
+                <Zap size={14} />
+                一键Battle
               </button>
-            ) : (
-              <button
-                type="submit"
-                disabled={!userQuery.trim()}
-                className="text-white p-2 rounded-lg transition-colors flex items-center justify-center w-10 h-10 disabled:opacity-50"
-                style={{ background: !userQuery.trim() ? '#334155' : `linear-gradient(to bottom right, var(--accent), var(--accent-2))` }}
-              >
-                <Send size={18} />
-              </button>
-            )}
+              {isSimulating ? (
+                <button
+                  type="button"
+                  onClick={() => session?.stockCode && cancelMeeting(session.stockCode)}
+                  className="text-white p-2 rounded-lg transition-colors flex items-center justify-center w-10 h-10 bg-red-500 hover:bg-red-400"
+                  title="停止讨论"
+                >
+                  <Square size={14} fill="currentColor" />
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!userQuery.trim()}
+                  className="text-white p-2 rounded-lg transition-colors flex items-center justify-center w-10 h-10 disabled:opacity-50"
+                  style={{ background: !userQuery.trim() ? '#334155' : `linear-gradient(to bottom right, var(--accent), var(--accent-2))` }}
+                >
+                  <Send size={18} />
+                </button>
+              )}
+            </div>
           </form>
         </div>
         <div className="mt-1 text-center">
-          <span className={`text-[10px] ${colors.isDark ? 'text-slate-600' : 'text-slate-400'}`}>直接提问由小韭菜安排韭菜专家，@ 可指定韭菜专家</span>
+          <span className={`text-[10px] ${colors.isDark ? 'text-slate-600' : 'text-slate-400'}`}>直接提问由老板娘组织三轮专家讨论，@ 可指定专家</span>
         </div>
       </div>
 

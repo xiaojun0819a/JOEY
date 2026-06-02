@@ -1,6 +1,6 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "韭菜盘",
+  "name": "JOEY",
   "outputfilename": "jcp",
   "frontend:install": "npm install",
   "frontend:build": "npm run build",

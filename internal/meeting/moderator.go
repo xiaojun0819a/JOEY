@@ -40,7 +40,8 @@ type ModeratorDecision struct {
 	Selected []string          `json:"selected"`
 	Topic    string            `json:"topic"`
 	Opening  string            `json:"opening"`
-	Tasks    map[string]string `json:"tasks"` // 专家ID -> 专属分析任务
+	Tasks    map[string]string `json:"tasks"`  // 专家ID -> 专属分析任务
+	Rounds   int               `json:"rounds"` // 讨论轮次，默认3
 }
 
 // DiscussionEntry 讨论条目
@@ -105,7 +106,7 @@ func (m *Moderator) generate(ctx context.Context, prompt string) (string, error)
 // buildAnalyzePrompt 构建意图分析 Prompt
 func (m *Moderator) buildAnalyzePrompt(stock *models.Stock, query string, agents []models.AgentConfig) string {
 	var sb strings.Builder
-	sb.WriteString("你是「财经会议室」的小韭菜，负责组织专家讨论。\n\n")
+	sb.WriteString("你是「财经会议室」的主持人老板娘，负责组织专家讨论并强制暴露分歧。\n\n")
 	sb.WriteString("## 当前股票\n")
 	fmt.Fprintf(&sb, "%s (%s)，现价 %.2f，涨跌幅 %.2f%%\n\n", stock.Name, stock.Symbol, stock.Price, stock.ChangePercent)
 	sb.WriteString("## 老韭菜问题\n")
@@ -118,7 +119,8 @@ func (m *Moderator) buildAnalyzePrompt(stock *models.Stock, query string, agents
 	sb.WriteString("1. 分析老韭菜问题的核心意图\n")
 	sb.WriteString(fmt.Sprintf("2. 除非用户特别约束专家数量,否则选择 1-%d 位最相关的专家\n", len(agents)))
 	sb.WriteString("3. 为每位选中的专家制定一个明确的、与其专业匹配的分析任务（不要照搬用户原话，要根据专家角色拆解）\n")
-	sb.WriteString("4. 生成讨论议题和开场白\n\n")
+	sb.WriteString("4. 会议默认3轮：R1独立陈述，R2交叉质疑，R3修正终判\n")
+	sb.WriteString("5. 生成讨论议题和开场白\n\n")
 	sb.WriteString("## 选人风格\n")
 	switch m.selectionStyle {
 	case models.AgentSelectionConservative:
@@ -129,14 +131,14 @@ func (m *Moderator) buildAnalyzePrompt(stock *models.Stock, query string, agents
 		sb.WriteString("综合短中线视角，兼顾风险、基本面和交易节奏，默认推荐。\n\n")
 	}
 	sb.WriteString("## 输出格式（仅输出JSON）\n")
-	sb.WriteString(`{"intent":"意图","selected":["id1","id2"],"tasks":{"id1":"该专家需要分析的具体问题","id2":"该专家需要分析的具体问题"},"topic":"议题","opening":"开场白"}`)
+	sb.WriteString(`{"intent":"意图","selected":["id1","id2"],"tasks":{"id1":"该专家需要分析的具体问题","id2":"该专家需要分析的具体问题"},"topic":"议题","opening":"开场白","rounds":3}`)
 	return sb.String()
 }
 
 // buildSummarizePrompt 构建总结 Prompt
 func (m *Moderator) buildSummarizePrompt(stock *models.Stock, query string, history []DiscussionEntry, extraContext string) string {
 	var sb strings.Builder
-	sb.WriteString("你是会议小韭菜，请总结讨论并给老韭菜结论。\n\n")
+	sb.WriteString("你是会议主持人「老板娘」，你的职责是仲裁分歧并给出可执行交易方案。\n\n")
 	fmt.Fprintf(&sb, "## 股票：%s (%s)\n\n", stock.Name, stock.Symbol)
 	sb.WriteString("## 老韭菜问题\n")
 	sb.WriteString(query + "\n\n")
@@ -148,11 +150,20 @@ func (m *Moderator) buildSummarizePrompt(stock *models.Stock, query string, hist
 	for _, e := range history {
 		fmt.Fprintf(&sb, "【%s（%s）】\n%s\n\n", e.AgentName, e.Role, e.Content)
 	}
-	sb.WriteString("## 输出要求\n")
-	sb.WriteString("1. 核心结论（直接回答老韭菜）\n")
-	sb.WriteString("2. 各方观点摘要\n")
-	sb.WriteString("3. 综合建议\n\n")
-	sb.WriteString("控制在 300 字以内。")
+	sb.WriteString("## 输出要求（必须严格按结构输出）\n")
+	sb.WriteString("1. 【综合结论】一句话直接结论\n")
+	sb.WriteString("2. 【多空概率】看多 __% / 中性 __% / 看空 __%（三者合计100%）\n")
+	sb.WriteString("3. 【关键分歧】列出至少2组冲突观点：谁vs谁 + 冲突点\n")
+	sb.WriteString("4. 【仲裁理由】明确说明你为何采纳哪一方（基于时效性、数据质量、当前市场状态）\n")
+	sb.WriteString("5. 【执行方案】\n")
+	sb.WriteString("   - 入场区间\n")
+	sb.WriteString("   - 仓位建议（%）\n")
+	sb.WriteString("   - 止损位（或失效条件）\n")
+	sb.WriteString("   - 止盈位（第一/第二）\n")
+	sb.WriteString("   - 时效（到具体日期或事件）\n")
+	sb.WriteString("6. 【三条记忆点】如果今天只记3件事\n")
+	sb.WriteString("7. 若证据不足，明确写“数据不足，不建议交易”。\n\n")
+	sb.WriteString("要求：结构化、可执行、少空话，控制在380字以内。")
 	return sb.String()
 }
 
@@ -174,6 +185,9 @@ func (m *Moderator) parseDecision(content string) (*ModeratorDecision, error) {
 	// 验证必要字段
 	if len(decision.Selected) == 0 {
 		return nil, fmt.Errorf("小韭菜未选择任何专家")
+	}
+	if decision.Rounds <= 0 {
+		decision.Rounds = 3
 	}
 
 	return &decision, nil

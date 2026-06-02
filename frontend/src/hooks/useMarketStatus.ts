@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { GetTradingSchedule } from '@wailsjs/go/main/App';
+import { isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
 
 // 交易时段
 interface TradingPeriod {
@@ -15,6 +16,17 @@ interface TradingSchedule {
   holidayName: string;
   periods: TradingPeriod[];
 }
+
+const FALLBACK_TRADING_SCHEDULE: TradingSchedule = {
+  isTradeDay: true,
+  holidayName: '',
+  periods: [
+    { status: 'pre_market', text: '盘前', startTime: '09:15', endTime: '09:30' },
+    { status: 'trading', text: '交易中', startTime: '09:30', endTime: '11:30' },
+    { status: 'lunch_break', text: '午休', startTime: '11:30', endTime: '13:00' },
+    { status: 'trading', text: '交易中', startTime: '13:00', endTime: '15:00' },
+  ],
+};
 
 // 市场状态
 export interface MarketStatus {
@@ -80,6 +92,11 @@ export function useMarketStatus() {
 
   // 循环获取交易时间表，直到成功
   const fetchScheduleWithRetry = useCallback(async () => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('市场状态', 'go');
+      setSchedule(FALLBACK_TRADING_SCHEDULE);
+      return;
+    }
     while (true) {
       try {
         const data = await GetTradingSchedule();
