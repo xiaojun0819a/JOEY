@@ -1295,15 +1295,6 @@ const App: React.FC = () => {
             <Wallet className="h-3.5 w-3.5" />
             <span>模拟持仓</span>
           </button>
-          <button
-            onClick={() => setShowWaveModel(true)}
-            disabled={!selectedStock}
-            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium disabled:opacity-40 ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-amber-400/40`}
-            title="波段模型驾驶舱（当前股票）"
-          >
-            <Gauge className="h-3.5 w-3.5" />
-            <span>波段模型</span>
-          </button>
           <div ref={lowBuyStrategyMenuRef} className="relative">
             <button
               onClick={() => setShowLowBuyStrategyMenu(prev => !prev)}
@@ -1925,6 +1916,17 @@ const App: React.FC = () => {
             stock={selectedStock}
             data={safeKLineData}
             period={timePeriod}
+            dayKLineData={multiCycleKLines.daily}
+            weekKLineData={multiCycleKLines.weekly}
+            monthKLineData={multiCycleKLines.monthly}
+            marketIndices={marketIndices}
+            f10Overview={f10Overview}
+            valuationSnapshot={valuationSnapshot}
+            marketMessage={marketMessage}
+            marketStatusText={marketStatus?.statusText}
+            marketStatusCode={marketStatus?.status}
+            onForceSync={forceSyncSelectedStock}
+            syncing={syncingRadar}
           />
           <ResearchReportDialog
             isOpen={showResearchReport}
