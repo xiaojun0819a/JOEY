@@ -257,8 +257,8 @@ func NewApp() *App {
 	agentContainer := agent.NewContainer()
 	agentContainer.LoadAgents(strategyService.GetAllAgents())
 
-	// 初始化更新服务(自更新从本人 fork 的 Release 拉取,不再指向上游 run-bigpig)
-	updateService := services.NewUpdateService("xiaojun0819a", "jcp", Version)
+	// 初始化更新服务(自更新从 xiaojun0819a/JOEY 独立仓库的 Release 拉取)
+	updateService := services.NewUpdateService("xiaojun0819a", "JOEY", Version)
 
 	// 初始化 OpenClaw 服务
 	openClawServer := openclaw.NewServer(meetingService, agentContainer, func(aiConfigID string) *models.AIConfig {
