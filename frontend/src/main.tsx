@@ -79,9 +79,10 @@ const renderApp = () => {
             installRemoteBridge(backend.url, backend.token)
             console.info('[boot] 后端模式: remote →', backend.url)
         } else if (backend.mode === 'fallback') {
-            // 配了 NAS 但没连上：用本地旧数据，挂横幅提示改动不会同步
+            // 配了 NAS 但没连上：用本地旧数据。横幅只给主人(配置里有令牌)看,
+            // 访客(分发版)不显示技术性提示,避免困扰普通用户
             console.warn('[boot] 后端模式: fallback(NAS 未连接) →', backend.url)
-            showOfflineBanner(backend.url || '')
+            if (backend.token) showOfflineBanner(backend.url || '')
         } else {
             console.info('[boot] 后端模式: local')
         }

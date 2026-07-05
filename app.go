@@ -95,6 +95,8 @@ type App struct {
 	remoteMode        bool   // true=桌面探测到 NAS 后端可达,本地进瘦身模式(不启调度器),前端路由到 NAS
 	remoteConfigured  bool   // true=配置了 remoteBackendUrl(不论是否连上);连不上则回落但需提示用户
 	remoteURL         string // 解析后的远程后端地址
+	guestUsername     string // 非空 = 本实例是某访客的分身(headless 多用户隔离),个人数据服务指向该用户私有目录
+	guestDataDir      string // 访客私有数据目录(dataDir/users/<name>);主人实例为空
 	configService     *services.ConfigService
 	marketService     *services.MarketService
 	newsService       *services.NewsService
@@ -435,7 +437,7 @@ func (a *App) detectRemoteBackend() {
 		a.remoteURL = strings.TrimRight(lanURL, "/")
 		return
 	}
-	if pubURL != "" && probe(pubURL, 5*time.Second) {
+	if pubURL != "" && probe(pubURL, 8*time.Second) {
 		a.remoteMode = true
 		a.remoteURL = strings.TrimRight(pubURL, "/")
 		log.Info("内网后端不可达，改走公网隧道: %s", a.remoteURL)
@@ -469,7 +471,15 @@ func (a *App) GetBackendMode() BackendMode {
 		return BackendMode{Mode: "remote", URL: a.remoteURL, Token: token}
 	}
 	if a.remoteConfigured {
-		return BackendMode{Mode: "fallback", URL: a.remoteURL}
+		// 带上 token 供前端区分主人/访客(访客不显示离线横幅);URL 取配置地址用于展示
+		url := ""
+		if a.configService != nil {
+			cfg := a.configService.GetConfig()
+			if url = strings.TrimSpace(cfg.RemoteBackendURL); url == "" {
+				url = strings.TrimSpace(cfg.RemoteBackendPublicURL)
+			}
+		}
+		return BackendMode{Mode: "fallback", URL: url, Token: token}
 	}
 	return BackendMode{Mode: "local"}
 }
