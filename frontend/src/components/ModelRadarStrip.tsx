@@ -24,6 +24,7 @@ interface ModelRadarStripProps {
   marketStatusCode?: string;
   onForceSync?: () => void;
   syncing?: boolean;
+  embed?: boolean; // 嵌入模式(看板报告内):按容器自适应2/3列、无内滚动、字号对齐报告卡片
 }
 
 type StatusTone = 'pass' | 'warn' | 'risk' | 'neutral';
@@ -327,6 +328,7 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
   kLineData,
   period,
   panelHeight = 138,
+  embed = false,
   dayKLineData = [],
   weekKLineData = [],
   monthKLineData = [],
@@ -341,6 +343,11 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
 }) => {
   const { colors } = useTheme();
   const isDark = colors.isDark;
+  // 嵌入模式(看板报告):卡片样式与报告卡完全同款
+  const sectionCls = embed
+    ? `min-w-0 rounded-md border p-3.5 ${isDark ? 'border-slate-700 bg-slate-950/45' : 'border-slate-200 bg-white'}`
+    : `self-start min-w-0 rounded border fin-divider px-1.5 py-1 ${isDark ? 'bg-slate-900/25' : 'bg-white/60'}`;
+  const sectionHeadCls = embed ? 'flex items-center gap-1.5 mb-2.5 text-sm font-bold' : 'flex items-center gap-1 mb-1';
   const [showDetails, setShowDetails] = useState(false);
   const minPanelHeight = 72;
   const compactPanelHeight = 138;
@@ -793,12 +800,12 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
   const stateTone = (ok: boolean, fallback: StatusTone = 'warn'): StatusTone => (ok ? 'pass' : fallback);
 
   return (
-    <div className="px-2 py-1 border-b fin-divider-soft shrink-0">
-      <div className="fin-panel-soft border fin-divider rounded-lg px-2.5 py-1.5">
-        <div className="flex items-center justify-between mb-1">
+    <div className={embed ? 'shrink-0' : 'px-2 py-1 border-b fin-divider-soft shrink-0'}>
+      <div className={embed ? '' : 'fin-panel-soft border fin-divider rounded-lg px-2.5 py-1.5'}>
+        <div className={embed ? 'flex flex-col items-center gap-2 mb-3' : 'flex items-center justify-between mb-1'}>
           <div className="flex items-center gap-2 min-w-0">
-            <Target className="h-4 w-4 text-accent-2 shrink-0" />
-            <span className={`text-xs font-semibold tracking-wide ${isDark ? 'text-slate-100' : 'text-slate-700'}`}>
+            <Target className={embed ? 'h-5 w-5 text-accent-2 shrink-0' : 'h-4 w-4 text-accent-2 shrink-0'} />
+            <span className={`${embed ? 'text-base' : 'text-xs'} font-semibold tracking-wide whitespace-nowrap ${isDark ? 'text-slate-100' : 'text-slate-700'}`}>
               波段模型驾驶舱
             </span>
             {computed.latestSignal && (
@@ -807,7 +814,7 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
               </span>
             )}
           </div>
-          <div className="flex items-center gap-1 flex-wrap justify-end">
+          <div className={embed ? 'flex items-center gap-1 flex-wrap justify-center' : 'flex items-center gap-1 flex-wrap justify-end'}>
             <span
               className={`text-[10px] px-1.5 py-0.5 rounded border ${toneClasses(isDark, computed.quoteFresh ? 'pass' : 'warn')}`}
               title="行情同步状态：基于当前盘口/报价是否已拿到有效价格与成交量。"
@@ -876,12 +883,14 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
         </div>
 
         <div
-          className="overflow-y-auto pr-1 fin-scrollbar"
-          style={{ maxHeight: renderedPanelHeight }}
+          className={embed ? '' : 'overflow-y-auto pr-1 fin-scrollbar'}
+          style={embed ? undefined : { maxHeight: renderedPanelHeight }}
         >
-          <div className="grid grid-cols-1 xl:grid-cols-5 lg:grid-cols-3 md:grid-cols-2 gap-1.5 text-[10px] leading-tight items-start">
-          <section className={`self-start min-w-0 rounded border fin-divider px-1.5 py-1 ${isDark ? 'bg-slate-900/25' : 'bg-white/60'}`}>
-            <div className="flex items-center gap-1 mb-1">
+          <div className={embed
+            ? 'grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 text-[11px] leading-snug items-stretch'
+            : 'grid grid-cols-1 xl:grid-cols-5 lg:grid-cols-3 md:grid-cols-2 gap-1.5 text-[10px] leading-tight items-start'}>
+          <section className={sectionCls}>
+            <div className={sectionHeadCls}>
               <Filter className="h-3.5 w-3.5 text-accent-2" />
               <span className="font-semibold" title="先做风险排除与目标池过滤：市值、ST、板块弹性、财务兜底。">1. 漏斗初筛</span>
             </div>
@@ -913,8 +922,8 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
             </div>
           </section>
 
-          <section className={`self-start min-w-0 rounded border fin-divider px-1.5 py-1 ${isDark ? 'bg-slate-900/25' : 'bg-white/60'}`}>
-            <div className="flex items-center gap-1 mb-1">
+          <section className={sectionCls}>
+            <div className={sectionHeadCls}>
               <Layers3 className="h-3.5 w-3.5 text-accent-2" />
               <span className="font-semibold" title="日/周/月趋势同向性。至少2个周期同步向上，才更容易出现高胜率波段。">2. 多周期共振</span>
             </div>
@@ -934,8 +943,8 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
             </div>
           </section>
 
-          <section className={`self-start min-w-0 rounded border fin-divider px-1.5 py-1 ${isDark ? 'bg-slate-900/25' : 'bg-white/60'}`}>
-            <div className="flex items-center gap-1 mb-1">
+          <section className={sectionCls}>
+            <div className={sectionHeadCls}>
               <Flame className="h-3.5 w-3.5 text-accent-2" />
               <span className="font-semibold" title="量价结构评分：控盘、放量突破、缩量回踩、价量背离。">3. 量价验证</span>
             </div>
@@ -1011,8 +1020,8 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
             </div>
           </section>
 
-          <section className={`self-start min-w-0 rounded border fin-divider px-1.5 py-1 ${isDark ? 'bg-slate-900/25' : 'bg-white/60'}`}>
-            <div className="flex items-center gap-1 mb-1">
+          <section className={sectionCls}>
+            <div className={sectionHeadCls}>
               <TimerReset className="h-3.5 w-3.5 text-accent-2" />
               <span className="font-semibold" title="板块联动 + 大盘过滤：优先做强于指数的个股。">4. 联动环境</span>
             </div>
@@ -1049,8 +1058,8 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
             </div>
           </section>
 
-          <section className={`self-start min-w-0 rounded border fin-divider px-1.5 py-1 ${isDark ? 'bg-slate-900/25' : 'bg-white/60'}`}>
-            <div className="flex items-center gap-1 mb-1">
+          <section className={`${sectionCls}${embed ? ' md:col-span-2' : ''}`}>
+            <div className={sectionHeadCls}>
               <ShieldCheck className="h-3.5 w-3.5 text-accent-2" />
               <span className="font-semibold" title="只做拐点，机械执行：买点试仓、卖点减仓、风险清仓。">5. 择时与仓位</span>
             </div>

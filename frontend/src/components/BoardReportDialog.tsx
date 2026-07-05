@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, FileText, Loader2, RefreshCw, Send, X } from 'lucide-react';
 import { NodeRenderer } from 'markstream-react';
-import type { KLineData, Stock, TimePeriod } from '../types';
+import type { F10Overview, KLineData, MarketIndex, Stock, StockValuation, TimePeriod } from '../types';
+import ModelRadarStrip from './ModelRadarStrip';
 import { askBoardReport, generateBoardReport, getCachedBoardReport } from '../services/boardReportService';
 import {
   buildOpenEatFishSeries,
@@ -19,6 +20,18 @@ interface BoardReportDialogProps {
   stock?: Stock;
   data: KLineData[];
   period: TimePeriod;
+  // 波段模型驾驶舱所需(与主页驾驶舱同源同显),全部可选
+  dayKLineData?: KLineData[];
+  weekKLineData?: KLineData[];
+  monthKLineData?: KLineData[];
+  marketIndices?: MarketIndex[];
+  f10Overview?: F10Overview | null;
+  valuationSnapshot?: StockValuation | null;
+  marketMessage?: string;
+  marketStatusText?: string;
+  marketStatusCode?: string;
+  onForceSync?: () => void;
+  syncing?: boolean;
 }
 
 type Tone = 'good' | 'warn' | 'bad' | 'neutral' | 'hot';
@@ -402,7 +415,12 @@ const buildBoardReport = (stock: Stock | undefined, data: KLineData[]): BoardRep
 
 const fmtTime = (ts: number): string => new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
-export const BoardReportDialog: React.FC<BoardReportDialogProps> = ({ isOpen, onClose, stock, data, period }) => {
+export const BoardReportDialog: React.FC<BoardReportDialogProps> = ({
+  isOpen, onClose, stock, data, period,
+  dayKLineData, weekKLineData, monthKLineData, marketIndices,
+  f10Overview, valuationSnapshot, marketMessage, marketStatusText, marketStatusCode,
+  onForceSync, syncing,
+}) => {
   const { colors } = useTheme();
   const technicalReport = useMemo(() => buildBoardReport(stock, data), [stock, data]);
   const technicalFallbackText = useMemo(() => {
@@ -735,6 +753,30 @@ export const BoardReportDialog: React.FC<BoardReportDialogProps> = ({ isOpen, on
                       </div>
                     </div>
                   </div>
+
+                {/* 波段模型驾驶舱(与主页同源同显):漏斗初筛/多周期共振/量价验证/联动环境/择时仓位 */}
+                {stock && (
+                  <div className="mt-1">
+                    <ModelRadarStrip
+                      embed
+                      stock={stock}
+                      kLineData={data}
+                      period={period}
+                      panelHeight={430}
+                      dayKLineData={dayKLineData}
+                      weekKLineData={weekKLineData}
+                      monthKLineData={monthKLineData}
+                      marketIndices={marketIndices}
+                      f10Overview={f10Overview}
+                      valuationSnapshot={valuationSnapshot}
+                      marketMessage={marketMessage}
+                      marketStatusText={marketStatusText}
+                      marketStatusCode={marketStatusCode}
+                      onForceSync={onForceSync}
+                      syncing={syncing}
+                    />
+                  </div>
+                )}
                 </div>
               )
             ) : reportLoading ? (
