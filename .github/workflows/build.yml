@@ -103,23 +103,23 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cd build/bin
-          tar -czvf jcp_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }} ${{ matrix.output }}
+          tar -czvf JOEY_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }} ${{ matrix.output }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path build/bin/${{ matrix.output }} -DestinationPath build/bin/jcp_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }}
+          Compress-Archive -Path build/bin/${{ matrix.output }} -DestinationPath build/bin/JOEY_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }}
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           cd build/bin
-          zip -r jcp_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }} *.app
+          zip -r JOEY_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }} *.app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jcp-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: JOEY-${{ matrix.goos }}-${{ matrix.goarch }}
           path: build/bin/*.${{ matrix.suffix }}
 
   release:
