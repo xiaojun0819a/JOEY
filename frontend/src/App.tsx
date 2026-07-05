@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { StockList } from './components/StockList';
-import { StockChartLW } from './components/StockChartLW';
+import { StockChartLW, type MainChartTemplate } from './components/StockChartLW';
 import { OrderBook as OrderBookComponent } from './components/OrderBook';
 import { F10Panel } from './components/F10Panel';
 import { AgentRoom } from './components/AgentRoom';
 import { SettingsDialog } from './components/SettingsDialog';
 import { PositionDialog } from './components/PositionDialog';
+import { TradeJournalDialog } from './components/TradeJournalDialog';
 import { HotTrendDialog } from './components/HotTrendDialog';
 import { LongHuBangDialog } from './components/LongHuBangDialog';
 import { MarketMovesDialog } from './components/MarketMovesDialog';
@@ -17,32 +18,53 @@ import LowBuyScannerDialog, {
   type LowBuyScannerResult,
   type LowBuyScannerRequest,
 } from './components/LowBuyScannerDialog';
+import LateDayChaseScannerDialog from './components/LateDayChaseScannerDialog';
 import ModelRadarStrip from './components/ModelRadarStrip';
+import WaveScannerDialog from './components/WaveScannerDialog';
+import BoardReportDialog from './components/BoardReportDialog';
+import { ResearchReportDialog } from './components/ResearchReportDialog';
+import { MarketRegimeBadge } from './components/MarketRegimeBadge';
+import { PaperPortfolioDialog } from './components/PaperPortfolioDialog';
+import FundamentalScanDialog from './components/FundamentalScanDialog';
+import { AddToGroupButton } from './components/AddToGroupButton';
 import SafeBoundary from './components/SafeBoundary';
 import { WelcomePage } from './components/WelcomePage';
-import { ThemeSwitcher } from './components/ThemeSwitcher';
 import { useTheme } from './contexts/ThemeContext';
 import { useCandleColor } from './contexts/CandleColorContext';
 import { ResizeHandle } from './components/ResizeHandle';
 import { isWailsGoReady, isWailsRuntimeReady, warnWailsUnavailable } from './utils/wailsEnv';
-import { getWatchlist, addToWatchlist, removeFromWatchlist } from './services/watchlistService';
-import { getKLineData, getOrderBook } from './services/stockService';
+import { getWatchlist, addToWatchlist, removeFromWatchlist, syncTradeJournalWatchGroup } from './services/watchlistService';
+import { getKLineData, getOrderBook, getStockRealTimeData } from './services/stockService';
 import { getF10Overview, getF10Valuation } from './services/f10Service';
 import {
   collectDailyHistory,
   getHistoryAutoCollectStatus,
+  runCaoYuanStandardScanner4A,
+  runCaoYuanZhuangScanner4B,
+  runDipEntryScannerV8,
+  runHotMoneyBreakoutScannerV7,
+  runLimitPullbackScanner,
   runLowBuyScannerV1,
+  runMonsterScannerV9,
+  runMonsterScannerV10,
+  runTailLazyScannerV2,
+  runTailBuyScannerV6,
+  runTripleVolumeScannerV5,
+  runTailLazyReplayOnDate,
+  runLowBuyReplayOnDate,
   updateHistoryAutoCollect,
 } from './services/scannerService';
 import { getOrCreateSession, StockSession, updateStockPosition } from './services/sessionService';
+import { sellStockPosition } from './services/journalService';
 import { getConfig, updateConfig } from './services/configService';
+import { checkForUpdate } from './services/updateService';
 import { useMarketEvents } from './hooks/useMarketEvents';
 import { useMarketStatus } from './hooks/useMarketStatus';
 import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex, F10Overview, StockValuation } from './types';
-import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity, RefreshCw, Search } from 'lucide-react';
+import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity, RefreshCw, Search, Gauge, FileText, Wallet, ChevronDown, Maximize2 } from 'lucide-react';
 import logo from './assets/images/logo.png';
 import { GetTelegraphList, OpenURL, WindowMinimize, WindowMaximize, WindowClose } from '../wailsjs/go/main/App';
-import { WindowIsMaximised, WindowSetSize, WindowGetSize } from '../wailsjs/runtime/runtime';
+import { WindowIsMaximised, WindowGetSize } from '../wailsjs/runtime/runtime';
 
 // 布局配置常量
 const LAYOUT_DEFAULTS = {
@@ -50,6 +72,9 @@ const LAYOUT_DEFAULTS = {
   rightPanelWidth: 384,
   bottomPanelHeight: 132,
 };
+
+type LowBuyStrategyMode = 'lowbuy' | 'limit-pullback' | 'triple-volume' | 'tail-buy' | 'hot-money' | 'dip-entry' | 'monster' | 'monster-v10' | 'taillazy' | 'caoyuan-standard4a' | 'caoyuan-zhuang4b';
+type ChartFullscreenMode = 'normal' | 'strategy';
 const LAYOUT_MIN = {
   leftPanelWidth: 180,
   rightPanelWidth: 260,
@@ -67,6 +92,18 @@ const BOOTSTRAP_TIMEOUT_MS = 8000;
 const RADAR_PANEL_MIN_HEIGHT = 72;
 const RADAR_PANEL_MAX_HEIGHT = 560;
 const RADAR_PANEL_DEFAULT_HEIGHT = 138;
+
+type PricePanelState = {
+  trendLabel: string;
+  zoneLabel: string;
+  zoneTone: 'high' | 'mid' | 'low';
+};
+
+type StockIdentityState = {
+  boardLabel: string;
+  volatilityLabel: string;
+  volatilityTone: 'hot' | 'warm' | 'calm';
+};
 
 const clampValue = (value: number, min: number, max: number): number => (
   Math.max(min, Math.min(max, value))
@@ -99,6 +136,38 @@ const normalizeSidePanelWidths = (
   return { left, right };
 };
 
+const getPricePanelState = (stock: Stock): PricePanelState => {
+  const trendLabel = stock.change > 0 ? '上涨' : stock.change < 0 ? '下跌' : '平盘';
+  const range = stock.high - stock.low;
+  if (range <= 0 || !Number.isFinite(range)) {
+    return { trendLabel, zoneLabel: '区间中性', zoneTone: 'mid' };
+  }
+  const position = (stock.price - stock.low) / range;
+  if (position >= 0.72) return { trendLabel, zoneLabel: '高位区', zoneTone: 'high' };
+  if (position <= 0.28) return { trendLabel, zoneLabel: '低位区', zoneTone: 'low' };
+  return { trendLabel, zoneLabel: '中位区', zoneTone: 'mid' };
+};
+
+const getPricePanelSizeClass = (priceText: string): string => {
+  const length = priceText.length;
+  if (length <= 5) return 'text-[36px]';
+  if (length <= 6) return 'text-[clamp(30px,2.65vw,36px)]';
+  return 'text-[clamp(26px,2.35vw,32px)]';
+};
+
+const getStockIdentityState = (stock: Stock): StockIdentityState => {
+  const symbol = stock.symbol.toLowerCase();
+  let boardLabel = '主板';
+  if (symbol.includes('688') || symbol.includes('689')) boardLabel = '科创板';
+  else if (symbol.includes('300') || symbol.includes('301')) boardLabel = '创业板';
+  else if (symbol.includes('bj')) boardLabel = '北交所';
+
+  const absChange = Math.abs(stock.changePercent);
+  if (absChange >= 10) return { boardLabel, volatilityLabel: '高波动', volatilityTone: 'hot' };
+  if (absChange >= 5) return { boardLabel, volatilityLabel: '强波动', volatilityTone: 'warm' };
+  return { boardLabel, volatilityLabel: '低波动', volatilityTone: 'calm' };
+};
+
 type KLineUpdateMode = 'full' | 'incremental' | 'refresh';
 type MultiCycleKLines = {
   daily: KLineData[];
@@ -106,11 +175,20 @@ type MultiCycleKLines = {
   monthly: KLineData[];
 };
 
+const isMinuteTrendPeriod = (period: TimePeriod) => period === '1m' || period === '5d';
+
+const getKLineRequestLength = (period: TimePeriod) => {
+  if (period === '5d') return 1250;
+  return period === '1m' ? 250 : 240;
+};
+
 const App: React.FC = () => {
   const { colors } = useTheme();
   const cc = useCandleColor();
   const [watchlist, setWatchlist] = useState<Stock[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState<string>('');
+  const [, setPriceQuoteUpdatedAt] = useState<Date>(() => new Date());
+  const [clockNow, setClockNow] = useState<Date>(() => new Date());
   const [currentSession, setCurrentSession] = useState<StockSession | null>(null);
   const [timePeriod, setTimePeriod] = useState<TimePeriod>('1m');
   const [kLineData, setKLineData] = useState<KLineData[]>([]);
@@ -122,12 +200,29 @@ const App: React.FC = () => {
   const [telegraphLoading, setTelegraphLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<'update' | undefined>(undefined);
+  const [updateAvailable, setUpdateAvailable] = useState<string>('');
   const [showPosition, setShowPosition] = useState(false);
   const [showHotTrend, setShowHotTrend] = useState(false);
   const [showLongHuBang, setShowLongHuBang] = useState(false);
   const [showMarketMoves, setShowMarketMoves] = useState(false);
   const [showLowBuyScanner, setShowLowBuyScanner] = useState(false);
+  const [lowBuyStrategyMode, setLowBuyStrategyMode] = useState<LowBuyStrategyMode>('lowbuy');
+  const [lowBuyStrategyTitle, setLowBuyStrategyTitle] = useState('低吸选股策略1');
+  const [lowBuyStrategySubtitle, setLowBuyStrategySubtitle] = useState('V1.2 高胜率短线规则（全A · 回踩偏好 · Top3）');
+  const [showLowBuyStrategyMenu, setShowLowBuyStrategyMenu] = useState(false);
+  const [showFundamental, setShowFundamental] = useState(false);
+  const [showLateDayChaseScanner, setShowLateDayChaseScanner] = useState(false);
+  const [showWaveScanner, setShowWaveScanner] = useState(false);
+  const [showPaper, setShowPaper] = useState(false);
+  const [showWaveModel, setShowWaveModel] = useState(false);
+  const [showJournal, setShowJournal] = useState(false);
   const [showF10, setShowF10] = useState(false);
+  const [showChartFullscreen, setShowChartFullscreen] = useState(false);
+  const [showBoardReport, setShowBoardReport] = useState(false);
+  const [showResearchReport, setShowResearchReport] = useState(false);
+  const [chartFullscreenMode, setChartFullscreenMode] = useState<ChartFullscreenMode>('normal');
+  const [mainChartTemplate, setMainChartTemplate] = useState<MainChartTemplate>('standard');
   const [marketIndices, setMarketIndices] = useState<MarketIndex[]>([]);
   const [isMaximized, setIsMaximized] = useState(false);
   const [f10Overview, setF10Overview] = useState<F10Overview | null>(null);
@@ -144,9 +239,14 @@ const App: React.FC = () => {
   const [scannerLoading, setScannerLoading] = useState(false);
   const [scannerError, setScannerError] = useState('');
   const [scannerResult, setScannerResult] = useState<LowBuyScannerResult | null>(null);
+  const [scannerResultsByMode, setScannerResultsByMode] = useState<Partial<Record<LowBuyStrategyMode, LowBuyScannerResult>>>({});
+  const [scannerErrorsByMode, setScannerErrorsByMode] = useState<Partial<Record<LowBuyStrategyMode, string>>>({});
+  const [previewStock, setPreviewStock] = useState<Stock | null>(null);
   const klineRequestIdRef = useRef(0);
   const valuationRequestIdRef = useRef(0);
   const multiCycleRequestIdRef = useRef(0);
+  const lowBuyScanRequestIdRef = useRef(0);
+  const lowBuyStrategyMenuRef = useRef<HTMLDivElement>(null);
 
   const withTimeoutOr = useCallback(async <T,>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> => {
     return await new Promise<T>((resolve) => {
@@ -178,9 +278,16 @@ const App: React.FC = () => {
     return normalizeSidePanelWidths(viewportWidth, left, right);
   }, []);
 
-  const selectedStock = useMemo(() =>
-    watchlist.find(s => s.symbol === selectedSymbol) || watchlist[0]
-  , [selectedSymbol, watchlist]);
+  const selectedStock = useMemo(() => {
+    const normalizedSelected = String(selectedSymbol || '').trim().toLowerCase();
+    const watched = watchlist.find(s => s.symbol.toLowerCase() === normalizedSelected);
+    if (watched) return watched;
+    if (previewStock && previewStock.symbol.toLowerCase() === normalizedSelected) return previewStock;
+    return watchlist[0] || previewStock;
+  }, [selectedSymbol, watchlist, previewStock]);
+  const watchlistSubscriptionKey = useMemo(() => (
+    Array.from(new Set(watchlist.map(stock => String(stock.symbol || '').trim()).filter(Boolean))).join(',')
+  ), [watchlist]);
 
   const safeKLineData = useMemo(() => (
     (kLineData || []).filter((item): item is KLineData => (
@@ -194,17 +301,98 @@ const App: React.FC = () => {
     ))
   ), [kLineData]);
 
+  const pricePanelState = useMemo(
+    () => selectedStock ? getPricePanelState(selectedStock) : { trendLabel: '平盘', zoneLabel: '区间中性', zoneTone: 'mid' as const },
+    [selectedStock],
+  );
+  const stockIdentityState = useMemo(
+    () => selectedStock ? getStockIdentityState(selectedStock) : { boardLabel: '主板', volatilityLabel: '低波动', volatilityTone: 'calm' as const },
+    [selectedStock],
+  );
+  const positionSummary = useMemo(() => {
+    const pos = currentSession?.position;
+    if (!selectedStock || !pos || pos.shares <= 0) return null;
+    const marketValue = pos.shares * selectedStock.price;
+    const costAmount = pos.shares * pos.costPrice;
+    const profitLoss = marketValue - costAmount;
+    const profitPercent = costAmount > 0 ? (profitLoss / costAmount) * 100 : 0;
+    return {
+      shares: pos.shares,
+      profitLoss,
+      profitPercent,
+      isProfit: profitLoss >= 0,
+    };
+  }, [currentSession?.position, selectedStock]);
+  const liveClockTime = useMemo(
+    () => clockNow.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    [clockNow],
+  );
+  const selectedPriceText = useMemo(
+    () => selectedStock ? selectedStock.price.toFixed(2) : '--',
+    [selectedStock?.price],
+  );
+  const selectedPriceSizeClass = useMemo(
+    () => getPricePanelSizeClass(selectedPriceText),
+    [selectedPriceText],
+  );
+
+  const refreshCurrentSession = useCallback(async () => {
+    if (!selectedStock?.symbol) return;
+    const session = await getOrCreateSession(selectedStock.symbol, selectedStock.name);
+    setCurrentSession(session);
+  }, [selectedStock?.symbol, selectedStock?.name]);
+
+  const refreshTradeJournalWatchGroup = useCallback(async () => {
+    await syncTradeJournalWatchGroup();
+    const list = await withTimeoutOr(getWatchlist(), 3500, [] as Stock[]);
+    setWatchlist(list);
+    window.dispatchEvent(new CustomEvent('watchlist-groups-changed'));
+    const normalizedSelected = String(selectedSymbol || '').trim().toLowerCase();
+    if ((!normalizedSelected || !list.some(stock => stock.symbol.toLowerCase() === normalizedSelected)) && list.length > 0) {
+      setSelectedSymbol(list[0].symbol);
+    }
+  }, [selectedSymbol, withTimeoutOr]);
+
+  const handleTradeJournalChanged = useCallback(async () => {
+    await refreshTradeJournalWatchGroup();
+    await refreshCurrentSession();
+  }, [refreshTradeJournalWatchGroup, refreshCurrentSession]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // 启动后静默检查更新(CheckForUpdate 在 remoteBridge 白名单里,始终走本地绑定查 GitHub Release);
+  // dev 本地构建时后端会带 error(版本号不可解析),不弹提醒
+  useEffect(() => {
+    const timer = window.setTimeout(async () => {
+      try {
+        const info = await checkForUpdate();
+        if (info.hasUpdate && !info.error) setUpdateAvailable(info.latestVersion);
+      } catch {
+        // 静默失败:离线/GitHub 不可达时不打扰
+      }
+    }, 8000);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   // 处理股票数据更新（来自后端推送）
   const handleStockUpdate = useCallback((stocks: Stock[]) => {
     if (!stocks || !Array.isArray(stocks)) return;
+    const currentSymbol = selectedSymbol.trim().toLowerCase();
+    if (currentSymbol && stocks.some(stock => String(stock.symbol || '').trim().toLowerCase() === currentSymbol)) {
+      setPriceQuoteUpdatedAt(new Date());
+    }
     setWatchlist(prev => {
       // 更新已有股票的数据
       return prev.map(stock => {
-        const updated = stocks.find(s => s.symbol === stock.symbol);
+        const symbol = String(stock.symbol || '').trim().toLowerCase();
+        const updated = stocks.find(s => String(s.symbol || '').trim().toLowerCase() === symbol);
         return updated || stock;
       });
     });
-  }, []);
+  }, [selectedSymbol]);
 
   // 处理盘口数据更新（来自后端推送）
   const handleOrderBookUpdate = useCallback((data: OrderBook) => {
@@ -217,6 +405,44 @@ const App: React.FC = () => {
       setMarketMessage(`[${data.time}] ${data.content}`);
     }
   }, []);
+
+  // 开机即拉最新一条快讯，避免长时间停在"市场数据加载中..."
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!isWailsGoReady()) return;
+      try {
+        const list = await GetTelegraphList();
+        if (!cancelled && list && list.length > 0) {
+          const t = list[0];
+          setMarketMessage(t.time ? `[${t.time}] ${t.content}` : t.content);
+        }
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!showLowBuyStrategyMenu) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (lowBuyStrategyMenuRef.current && !lowBuyStrategyMenuRef.current.contains(event.target as Node)) {
+        setShowLowBuyStrategyMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showLowBuyStrategyMenu]);
+
+  useEffect(() => {
+    if (!showChartFullscreen) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowChartFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [showChartFullscreen]);
 
   // 处理大盘指数更新（来自后端推送）
   const handleMarketIndicesUpdate = useCallback((indices: MarketIndex[]) => {
@@ -242,7 +468,7 @@ const App: React.FC = () => {
           updated[lastIdx] = newBar;
           return updated;
         }
-        return [...prev.slice(-239), newBar]; // 保持240根
+        return [...prev.slice(-(getKLineRequestLength(timePeriod) - 1)), newBar];
       });
     } else {
       // 后端定时推送：用 refresh 模式更新数据但保留用户缩放状态
@@ -483,7 +709,7 @@ const App: React.FC = () => {
     if (!selectedSymbol) return;
     setSyncingRadar(true);
     try {
-      const dataLen = timePeriod === '1m' ? 250 : 240;
+      const dataLen = getKLineRequestLength(timePeriod);
       const [latestKline] = await Promise.all([
         withTimeoutOr(getKLineData(selectedSymbol, timePeriod, dataLen), 4000, [] as KLineData[]),
         withTimeoutOr(fetchSelectedF10(selectedSymbol, { silent: true }), 5000, undefined as void | undefined),
@@ -507,33 +733,144 @@ const App: React.FC = () => {
     setShowF10(true);
   }, []);
 
+  const handleMainChartTemplateChange = useCallback((template: MainChartTemplate) => {
+    setMainChartTemplate(template);
+    if (template === 'openEatFish') {
+      setShowF10(false);
+      if (isMinuteTrendPeriod(timePeriod)) {
+        setTimePeriod('1d');
+      }
+    }
+  }, [timePeriod]);
+
+  const handleOpenChartFullscreen = useCallback(() => {
+    setShowF10(false);
+    setChartFullscreenMode('normal');
+    setShowChartFullscreen(true);
+  }, []);
+
   const handlePageRefresh = useCallback(() => {
     window.location.reload();
   }, []);
 
-  const handleOpenLowBuyScanner = useCallback(() => {
+  const handleOpenLowBuyScanner = useCallback((title = '低吸选股策略1', subtitle = 'V1.2 高胜率短线规则（全A · 回踩偏好 · Top3）', mode: LowBuyStrategyMode = 'lowbuy') => {
+    lowBuyScanRequestIdRef.current += 1;
+    setLowBuyStrategyMode(mode);
+    setLowBuyStrategyTitle(title);
+    setLowBuyStrategySubtitle(subtitle);
     setShowLowBuyScanner(true);
-    setScannerError('');
+    setShowLowBuyStrategyMenu(false);
+    setScannerLoading(false);
+    setScannerError(scannerErrorsByMode[mode] || '');
+    setScannerResult(scannerResultsByMode[mode] || null);
+  }, [scannerErrorsByMode, scannerResultsByMode]);
+
+  const handleOpenLowBuyTailStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('低吸尾盘策略2', '尾盘懒人V2（量比1-2.5 · 涨幅3-6% · 换手5-10% · 多头排列/新高/形态）', 'taillazy');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenLimitPullbackStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('涨停回调低吸4', '近期涨停强启动 · 缩量回踩 · 站稳5/10日线后低吸', 'limit-pullback');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenTripleVolumeStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('三倍量策略5', '未涨停阳线 · 成交量≥前一日3倍 · 一阳穿MA5/10/20/30', 'triple-volume');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenTailBuyStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('尾盘买入策略6', '昨日资金强势触发 · 今日阴线回踩 · 尾盘确认承接', 'tail-buy');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenHotMoneyStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('游资突破策略7', '游资涨停结构 · 量能倍率1-5 · 流通股本分档', 'hot-money');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenDipEntryStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('低吸入场策略8', 'RSI短线反转 · 快速RSI过线 · 动能底背离三选二', 'dip-entry');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenMonsterStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('捉妖策略9', '原“捉妖选股”可落地复刻 · 妖股初启/突破/布林爆发/低点反抽', 'monster');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenMonsterV10Strategy = useCallback(() => {
+    handleOpenLowBuyScanner('捉妖策略10', '通达信公式严格复刻 · GGZY_ZS=FILTER(GGZY_IG=1,3)', 'monster-v10');
+  }, [handleOpenLowBuyScanner]);
+
+  const handleOpenLateDayStrengthStrategy = useCallback(() => {
+    setShowLateDayChaseScanner(true);
+    setShowLowBuyStrategyMenu(false);
   }, []);
 
   const handleRunLowBuyScanner = useCallback(async (req: LowBuyScannerRequest) => {
+    const requestId = ++lowBuyScanRequestIdRef.current;
+    const mode = lowBuyStrategyMode;
+    setScannerLoading(true);
+    setScannerError('');
+    setScannerErrorsByMode(prev => ({ ...prev, [mode]: '' }));
+    try {
+      const result = mode === 'taillazy'
+        ? await runTailLazyScannerV2(req)
+        : mode === 'limit-pullback'
+          ? await runLimitPullbackScanner(req)
+        : mode === 'triple-volume'
+          ? await runTripleVolumeScannerV5(req)
+        : mode === 'tail-buy'
+          ? await runTailBuyScannerV6(req)
+        : mode === 'hot-money'
+          ? await runHotMoneyBreakoutScannerV7(req)
+        : mode === 'dip-entry'
+          ? await runDipEntryScannerV8(req)
+        : mode === 'monster'
+          ? await runMonsterScannerV9(req)
+        : mode === 'monster-v10'
+          ? await runMonsterScannerV10(req)
+        : mode === 'caoyuan-standard4a'
+          ? await runCaoYuanStandardScanner4A(req)
+          : mode === 'caoyuan-zhuang4b'
+            ? await runCaoYuanZhuangScanner4B(req)
+            : await runLowBuyScannerV1(req);
+      if (requestId !== lowBuyScanRequestIdRef.current) return;
+      if (!result) {
+        const message = '当前为浏览器预览模式，请从 Wails 开发入口打开后再扫描。';
+        setScannerError(message);
+        setScannerErrorsByMode(prev => ({ ...prev, [mode]: message }));
+        return;
+      }
+      setScannerResult(result);
+      setScannerResultsByMode(prev => ({ ...prev, [mode]: result }));
+    } catch (err) {
+      if (requestId !== lowBuyScanRequestIdRef.current) return;
+      const message = err instanceof Error ? err.message : '扫描失败，请稍后重试';
+      setScannerError(message);
+      setScannerErrorsByMode(prev => ({ ...prev, [mode]: message }));
+    } finally {
+      if (requestId === lowBuyScanRequestIdRef.current) {
+        setScannerLoading(false);
+      }
+    }
+  }, [lowBuyStrategyMode]);
+
+  const handleRunTailLazyReplay = useCallback(async (date: string) => {
     setScannerLoading(true);
     setScannerError('');
     try {
-      const result = await runLowBuyScannerV1(req);
+      const result = lowBuyStrategyMode === 'taillazy'
+        ? await runTailLazyReplayOnDate(date, 30)
+        : await runLowBuyReplayOnDate(date, 30, 1.5);
       if (!result) {
-        setScannerError('当前为浏览器预览模式，请从 Wails 开发入口打开后再扫描。');
+        setScannerError('当前为浏览器预览模式，请从 Wails 开发入口打开后再复盘。');
         setScannerResult(null);
         return;
       }
       setScannerResult(result);
     } catch (err) {
-      setScannerError(err instanceof Error ? err.message : '扫描失败，请稍后重试');
+      setScannerError(err instanceof Error ? err.message : '历史复盘失败，请稍后重试');
       setScannerResult(null);
     } finally {
       setScannerLoading(false);
     }
-  }, []);
+  }, [lowBuyStrategyMode]);
 
   const handleCollectDailyHistory = useCallback(async (req: HistoryCollectRequest): Promise<HistoryCollectResult | null> => {
     return await collectDailyHistory(req);
@@ -548,7 +885,7 @@ const App: React.FC = () => {
   }, []);
 
   // 使用市场事件 Hook
-  const { subscribeOrderBook, subscribeKLine } = useMarketEvents({
+  const { subscribe, subscribeOrderBook, subscribeKLine } = useMarketEvents({
     onStockUpdate: handleStockUpdate,
     onOrderBookUpdate: handleOrderBookUpdate,
     onTelegraphUpdate: handleTelegraphUpdate,
@@ -556,13 +893,21 @@ const App: React.FC = () => {
     onKLineUpdate: handleKLineUpdate,
   });
 
+  useEffect(() => {
+    const codes = watchlistSubscriptionKey.split(',').filter(Boolean);
+    if (codes.length === 0) return;
+    subscribe(codes);
+  }, [watchlistSubscriptionKey, subscribe]);
+
   // Handle Adding Stock
   const handleAddStock = async (newStock: Stock) => {
     if (!watchlist.find(s => s.symbol === newStock.symbol)) {
       await addToWatchlist(newStock);
       setWatchlist(prev => [...prev, newStock]);
       // 添加后自动选中新股票并加载数据
+      setPreviewStock(null);
       setSelectedSymbol(newStock.symbol);
+      setPriceQuoteUpdatedAt(new Date());
       // 先清空 session，避免显示旧股票的消息
       setCurrentSession(null);
       subscribeOrderBook(newStock.symbol);
@@ -591,6 +936,41 @@ const App: React.FC = () => {
     return true;
   }, [watchlist]);
 
+  const handleOpenStockFromStrategy = useCallback(async (stock: Stock) => {
+    const normalizedSymbol = String(stock.symbol || '').trim().toLowerCase();
+    if (!normalizedSymbol) return;
+    const existing = watchlist.find(s => s.symbol.toLowerCase() === normalizedSymbol);
+    const targetStock: Stock = existing || { ...stock, symbol: normalizedSymbol };
+
+    setShowF10(false);
+    setMainChartTemplate('openEatFish');
+    setTimePeriod('1d');
+    setChartFullscreenMode('strategy');
+    setShowChartFullscreen(true);
+    setSelectedSymbol(normalizedSymbol);
+    setPriceQuoteUpdatedAt(new Date());
+    setCurrentSession(null);
+    if (!existing) {
+      setPreviewStock(targetStock);
+    } else {
+      setPreviewStock(null);
+    }
+    subscribeOrderBook(normalizedSymbol);
+
+    const [session, orderBookData, realtime] = await Promise.all([
+      getOrCreateSession(normalizedSymbol, targetStock.name),
+      getOrderBook(normalizedSymbol),
+      getStockRealTimeData([normalizedSymbol]).catch(() => [] as Stock[]),
+    ]);
+    const realtimeStock = Array.isArray(realtime) ? realtime.find(s => s.symbol.toLowerCase() === normalizedSymbol) : null;
+    if (!existing && realtimeStock) {
+      setPreviewStock(realtimeStock);
+      setPriceQuoteUpdatedAt(new Date());
+    }
+    setCurrentSession(session);
+    setOrderBook(orderBookData);
+  }, [watchlist, subscribeOrderBook]);
+
   // Handle Removing Stock
   const handleRemoveStock = async (symbol: string) => {
     await removeFromWatchlist(symbol);
@@ -606,7 +986,9 @@ const App: React.FC = () => {
 
   // Handle Stock Selection - Load Session and sync data
   const handleSelectStock = async (symbol: string) => {
+    setPreviewStock(null);
     setSelectedSymbol(symbol);
+    setPriceQuoteUpdatedAt(new Date());
     // 订阅该股票的盘口推送
     subscribeOrderBook(symbol);
     const stock = watchlist.find(s => s.symbol === symbol);
@@ -637,16 +1019,13 @@ const App: React.FC = () => {
             // Keep the orderbook compact to prioritize chart visibility.
             setBottomPanelHeight(Math.min(config.layout.bottomPanelHeight, 150));
           }
-          // 恢复窗口大小
-          if (config.layout.windowWidth > 0 && config.layout.windowHeight > 0) {
-            WindowSetSize(config.layout.windowWidth, config.layout.windowHeight);
-          }
         }
 
         const list = await withTimeoutOr(getWatchlist(), 3500, [] as Stock[]);
         setWatchlist(list);
         if (list.length > 0) {
           setSelectedSymbol(list[0].symbol);
+          setPriceQuoteUpdatedAt(new Date());
           // 订阅第一个股票的盘口推送
           subscribeOrderBook(list[0].symbol);
           // 加载第一个股票的Session
@@ -684,7 +1063,7 @@ const App: React.FC = () => {
 
     const loadKLineData = async () => {
       // 与后端推送统一数据长度，降低周/月K空响应概率
-      const dataLen = timePeriod === '1m' ? 250 : 240;
+      const dataLen = getKLineRequestLength(timePeriod);
       const maxRetries = 2;
       for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
         if (requestId !== klineRequestIdRef.current) return;
@@ -732,13 +1111,13 @@ const App: React.FC = () => {
     if (!selectedSymbol) return;
     let cancelled = false;
     let inFlight = false;
-    const intervalMs = timePeriod === '1m' ? 45_000 : 180_000;
+    const intervalMs = isMinuteTrendPeriod(timePeriod) ? 45_000 : 180_000;
 
     const syncLatest = async () => {
       if (inFlight || cancelled) return;
       inFlight = true;
       try {
-        const dataLen = timePeriod === '1m' ? 250 : 240;
+        const dataLen = getKLineRequestLength(timePeriod);
         const latest = await withTimeoutOr(getKLineData(selectedSymbol, timePeriod, dataLen), 4000, [] as KLineData[]);
         if (!cancelled && Array.isArray(latest) && latest.length > 0) {
           setKLineUpdateMode('refresh');
@@ -855,10 +1234,10 @@ const App: React.FC = () => {
           <span className={`font-bold text-lg tracking-tight ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>JOEY <span className="text-accent-2">AI</span></span>
         </div>
         
-        <div className="flex items-center gap-4 fin-panel-soft px-4 py-1.5 rounded-full border fin-divider relative" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}>
-          <Radio className="h-3 w-3 animate-pulse text-accent-2" />
-          <span className={`text-xs font-mono w-96 truncate text-center ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>
-            实时快讯: {marketMessage}
+        <div className="flex items-center gap-1.5 fin-panel-soft px-2.5 py-1.5 rounded-full border fin-divider relative w-[160px] lg:w-[200px] xl:w-[240px] max-w-[18vw] shrink-0" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties} title={marketMessage}>
+          <Radio className="h-3 w-3 shrink-0 animate-pulse text-accent-2" />
+          <span className={`text-xs flex-1 min-w-0 truncate ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>
+            {marketMessage}
           </span>
           <button
             onClick={handleShowTelegraphList}
@@ -901,12 +1280,120 @@ const App: React.FC = () => {
 
         <div className="flex items-center gap-3" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}>
           <button
-            onClick={handleOpenLowBuyScanner}
-            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-fuchsia-400/40`}
-            title="V1.1 高胜率短线规则（全A扫描）"
+            onClick={() => setShowJournal(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-emerald-400/40`}
+            title="交易台账（实盘复盘，验证真实胜率）"
           >
-            <Search className="h-3.5 w-3.5" />
-            <span>低吸选股</span>
+            <FileText className="h-3.5 w-3.5" />
+            <span>交易台账</span>
+          </button>
+          <button
+            onClick={() => setShowPaper(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-amber-400/40`}
+            title="模拟持仓（纸上交易，验证各筛选系统胜率）"
+          >
+            <Wallet className="h-3.5 w-3.5" />
+            <span>模拟持仓</span>
+          </button>
+          <button
+            onClick={() => setShowWaveModel(true)}
+            disabled={!selectedStock}
+            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium disabled:opacity-40 ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-amber-400/40`}
+            title="波段模型驾驶舱（当前股票）"
+          >
+            <Gauge className="h-3.5 w-3.5" />
+            <span>波段模型</span>
+          </button>
+          <div ref={lowBuyStrategyMenuRef} className="relative">
+            <button
+              onClick={() => setShowLowBuyStrategyMenu(prev => !prev)}
+              className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-fuchsia-400/40`}
+              title="低吸策略：选择低吸/尾盘策略入口"
+            >
+              <Search className="h-3.5 w-3.5" />
+              <span>低吸策略</span>
+              <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showLowBuyStrategyMenu ? 'rotate-180' : ''}`} />
+            </button>
+            {showLowBuyStrategyMenu && (
+              <div className="absolute right-0 top-full mt-2 z-50 w-48 fin-panel border fin-divider rounded-lg shadow-xl p-1.5">
+                <button
+                  onClick={() => { setShowFundamental(true); setShowLowBuyStrategyMenu(false); }}
+                  className="w-full text-left px-3 py-2 rounded-md text-xs font-medium text-indigo-300 hover:bg-indigo-500/15 transition-colors"
+                >
+                  📊 基本面选股(价值/景气)
+                </button>
+                <div className="my-1 border-t fin-divider-soft" />
+                <button
+                  onClick={() => handleOpenLowBuyScanner('低吸选股策略1', 'V1.2 高胜率短线规则（全A · 回踩偏好 · Top3）')}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  低吸选股策略1
+                </button>
+                <button
+                  onClick={handleOpenLowBuyTailStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  低吸尾盘策略2
+                </button>
+                <button
+                  onClick={handleOpenLateDayStrengthStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  尾盘强势策略3
+                </button>
+                <button
+                  onClick={handleOpenLimitPullbackStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  涨停回调低吸4
+                </button>
+                <button
+                  onClick={handleOpenTripleVolumeStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  三倍量策略5
+                </button>
+                <button
+                  onClick={handleOpenTailBuyStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  尾盘买入策略6
+                </button>
+                <button
+                  onClick={handleOpenHotMoneyStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  游资突破策略7
+                </button>
+                <button
+                  onClick={handleOpenDipEntryStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  低吸入场策略8
+                </button>
+                <button
+                  onClick={handleOpenMonsterStrategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  捉妖策略9
+                </button>
+                <button
+                  onClick={handleOpenMonsterV10Strategy}
+                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
+                >
+                  捉妖策略10
+                </button>
+                {/* 草元标准4A / 草元抓庄4B 已暂停隐藏（用户停用） */}
+              </div>
+            )}
+          </div>
+          <button
+            onClick={() => setShowWaveScanner(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-amber-400/40`}
+            title="波段策略1.0（吃鱼身/异动点火 + 短线能量 + 五灯共振）"
+          >
+            <Activity className="h-3.5 w-3.5" />
+            <span>波段选股</span>
           </button>
           <button
             onClick={() => setShowLongHuBang(true)}
@@ -936,7 +1423,6 @@ const App: React.FC = () => {
           >
             <RefreshCw className="h-4 w-4" />
           </button>
-          <ThemeSwitcher />
           <button
             onClick={() => setShowSettings(true)}
             className={`p-2 rounded-lg fin-panel border fin-divider transition-colors ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-accent/40`}
@@ -954,6 +1440,7 @@ const App: React.FC = () => {
               {marketStatus?.statusText || '加载中...'}
             </div>
           </div>
+          <MarketRegimeBadge />
           {/* 窗口控制按钮 */}
           <div className="flex items-center ml-2 border-l fin-divider pl-3">
             <button
@@ -1003,44 +1490,83 @@ const App: React.FC = () => {
           {/* Stock Header - A股风格 */}
           <div className="px-6 py-2 shrink-0 border-b fin-divider-soft">
             <div className="grid grid-cols-[auto_1fr_auto] items-start gap-3">
-              <div className="flex min-w-0 flex-col gap-1.5">
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className={`text-lg font-bold ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>{selectedStock.name}</span>
-                  <span className={`text-sm font-mono ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>{selectedStock.symbol}</span>
+              <div
+                className={`relative min-w-[250px] max-w-[520px] h-[108px] rounded-lg border px-3 py-2.5 overflow-visible ${
+                  colors.isDark ? 'bg-slate-950/28 border-slate-700/70' : 'bg-slate-50/80 border-slate-200'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex items-baseline gap-2">
+                    <span className={`truncate font-black leading-none tracking-normal text-[clamp(18px,1.45vw,24px)] ${colors.isDark ? 'text-slate-50' : 'text-slate-900'}`}>
+                      {selectedStock.name}
+                    </span>
+                    <span className={`shrink-0 text-[clamp(12px,1vw,15px)] font-mono ${colors.isDark ? 'text-slate-500' : 'text-slate-500'}`}>
+                      {selectedStock.symbol}
+                    </span>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <span className={`rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${
+                      colors.isDark ? 'border-slate-600 bg-slate-800/45 text-slate-300' : 'border-slate-300 bg-white/70 text-slate-600'
+                    }`}>
+                      {stockIdentityState.boardLabel}
+                    </span>
+                    <span className={`rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${
+                      stockIdentityState.volatilityTone === 'hot'
+                        ? 'border-red-500/35 bg-red-500/10 text-red-300'
+                        : stockIdentityState.volatilityTone === 'warm'
+                          ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                          : 'border-slate-500/35 bg-slate-500/10 text-slate-300'
+                    }`}>
+                      {stockIdentityState.volatilityLabel}
+                    </span>
+                  </div>
+                </div>
+                <div className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-[12px] leading-5">
+                  <div className={colors.isDark ? 'text-slate-500' : 'text-slate-400'}>涨跌</div>
+                  <div className="flex min-w-0 items-center gap-3">
+                    <span className={`font-mono text-[clamp(14px,1.15vw,18px)] font-bold ${cc.getColorClass(selectedStock.change >= 0)}`}>
+                      {selectedStock.change >= 0 ? '+' : ''}{selectedStock.change.toFixed(2)}
+                    </span>
+                    <span className={`font-mono text-[clamp(14px,1.15vw,18px)] font-bold ${cc.getColorClass(selectedStock.change >= 0)}`}>
+                      {selectedStock.change >= 0 ? '+' : ''}{selectedStock.changePercent.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className={colors.isDark ? 'text-slate-500' : 'text-slate-400'}>持仓</div>
                   <button
                     onClick={() => setShowPosition(true)}
-                    className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${colors.isDark ? 'text-slate-400 hover:bg-slate-700/50' : 'text-slate-500 hover:bg-slate-200/50'} hover:text-accent-2`}
+                    className={`min-w-0 inline-flex items-center gap-1.5 rounded-md text-left leading-5 transition-colors ${
+                      colors.isDark ? 'text-slate-300 hover:text-accent-2' : 'text-slate-600 hover:text-slate-900'
+                    }`}
                     title="持仓设置"
                   >
-                    <Briefcase className="h-3.5 w-3.5" />
-                    {currentSession?.position && currentSession.position.shares > 0 ? (
-                      (() => {
-                        const pos = currentSession.position;
-                        const marketValue = pos.shares * selectedStock.price;
-                        const costAmount = pos.shares * pos.costPrice;
-                        const profitLoss = marketValue - costAmount;
-                        const profitPercent = costAmount > 0 ? (profitLoss / costAmount) * 100 : 0;
-                        const isProfit = profitLoss >= 0;
-                        return (
-                          <span className={isProfit ? cc.upClass : cc.downClass}>
-                            {pos.shares}股 {isProfit ? '+' : ''}{profitLoss.toFixed(0)} ({isProfit ? '+' : ''}{profitPercent.toFixed(2)}%)
-                          </span>
-                        );
-                      })()
+                    <Briefcase className="h-3 w-3 shrink-0" />
+                    {positionSummary ? (
+                      <>
+                        <span className={`shrink-0 font-mono text-[clamp(12px,0.95vw,14px)] font-semibold ${colors.isDark ? 'text-slate-200' : 'text-slate-700'}`}>
+                          {positionSummary.shares}股
+                        </span>
+                        <span className={`font-mono text-[clamp(12px,0.95vw,14px)] font-bold ${positionSummary.isProfit ? cc.upClass : cc.downClass}`}>
+                          {positionSummary.isProfit ? '+' : ''}{positionSummary.profitLoss.toFixed(0)}
+                        </span>
+                        <span className={`font-mono text-[clamp(12px,0.95vw,14px)] font-bold ${positionSummary.isProfit ? cc.upClass : cc.downClass}`}>
+                          {positionSummary.isProfit ? '+' : ''}{positionSummary.profitPercent.toFixed(2)}%
+                        </span>
+                      </>
                     ) : (
-                      <span>设置持仓</span>
+                      <span className="text-sm font-semibold">设置持仓</span>
                     )}
-                  </button>
-                </div>
-                <div className="flex items-center gap-4 text-sm">
-                  <span className={`font-mono ${cc.getColorClass(selectedStock.change >= 0)}`}>
-                    {selectedStock.change >= 0 ? '+' : ''}{selectedStock.change.toFixed(2)}
-                  </span>
-                  <span className={`font-mono ${cc.getColorClass(selectedStock.change >= 0)}`}>
-                    {selectedStock.change >= 0 ? '+' : ''}{selectedStock.changePercent.toFixed(2)}%
-                  </span>
-                </div>
-              </div>
+	                  </button>
+	                </div>
+	                <AddToGroupButton
+	                  stock={selectedStock}
+	                  source="manual"
+	                  inWatch={watchlist.some(stock => stock.symbol.toLowerCase() === selectedStock.symbol.toLowerCase())}
+		                  onAddToWatchlist={handleAddFromLongHuBang}
+		                  variant="tagIcon"
+		                  menuAlign="right"
+		                  className="absolute right-1.5 bottom-1.5 z-30"
+		                />
+	              </div>
 
               <div className="min-w-0 w-full max-w-[860px]">
                 <OrderBookComponent
@@ -1051,12 +1577,41 @@ const App: React.FC = () => {
                 />
               </div>
 
-              <div className="flex flex-col items-end gap-1.5">
-                <div className={`text-3xl font-mono font-bold text-right ${cc.getColorClass(selectedStock.change >= 0)}`}>
-                  {selectedStock.price.toFixed(2)}
-                </div>
-                <div className={`text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
-                  {new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              <div
+                className={`relative w-[206px] h-[108px] rounded-lg border px-3 pt-1.5 pb-5 overflow-hidden ${
+                  colors.isDark ? 'bg-[#1b120d]/80 border-amber-900/55' : 'bg-amber-50/80 border-amber-200'
+                }`}
+              >
+                <div className="flex h-full min-w-0 flex-col items-center text-center">
+                  <div className="min-w-0 overflow-hidden">
+                    <div className={`text-center text-[12px] font-semibold leading-4 ${colors.isDark ? 'text-slate-500' : 'text-slate-500'}`}>现价</div>
+                    <div className={`mt-0.5 max-w-full whitespace-nowrap text-center font-mono ${selectedPriceSizeClass} leading-none font-black tracking-normal ${cc.getColorClass(selectedStock.change >= 0)}`}>
+                      {selectedPriceText}
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center justify-center gap-1">
+                      <span className={`rounded-md border px-1.5 py-[1px] text-[11px] font-semibold leading-4 ${
+                        selectedStock.change >= 0
+                          ? 'border-red-500/35 bg-red-500/10 text-red-300'
+                          : 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300'
+                      }`}>
+                        {pricePanelState.trendLabel}
+                      </span>
+                      <span className={`rounded-md border px-1.5 py-[1px] text-[11px] font-semibold leading-4 ${
+                        pricePanelState.zoneTone === 'high'
+                          ? 'border-amber-500/45 bg-amber-500/10 text-amber-300'
+                          : pricePanelState.zoneTone === 'low'
+                            ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300'
+                            : 'border-slate-500/35 bg-slate-500/10 text-slate-300'
+                      }`}>
+                        {pricePanelState.zoneLabel}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="pointer-events-none absolute inset-x-0 bottom-1 flex justify-center">
+                    <div className={`font-mono text-[12px] font-bold leading-none ${colors.isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                      {liveClockTime}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1075,57 +1630,63 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          <SafeBoundary title="模型驾驶舱渲染异常" resetKey={`${selectedSymbol}:${timePeriod}`}>
-            <ModelRadarStrip
-              stock={selectedStock}
-              kLineData={safeKLineData}
-              period={timePeriod}
-              panelHeight={radarPanelHeight}
-              dayKLineData={multiCycleKLines.daily}
-              weekKLineData={multiCycleKLines.weekly}
-              monthKLineData={multiCycleKLines.monthly}
-              marketIndices={marketIndices}
-              f10Overview={f10Overview}
-              valuationSnapshot={valuationSnapshot}
-              marketMessage={marketMessage}
-              marketStatusText={marketStatus?.statusText}
-              marketStatusCode={marketStatus?.status}
-              onForceSync={forceSyncSelectedStock}
-              syncing={syncingRadar}
-            />
-          </SafeBoundary>
-
-          <ResizeHandle
-            direction="vertical"
-            onResize={handleRadarResize}
-            className="h-3"
-            showLine
-            lineClassName={colors.isDark ? 'bg-accent/45 group-hover:bg-accent/80' : 'bg-accent/40 group-hover:bg-accent/70'}
-          />
-
           <div className="px-4 py-1 border-b fin-divider-soft shrink-0">
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleShowTrend}
+                  className={`text-xs px-2.5 py-0.5 rounded border transition-colors ${
+                    !showF10
+                      ? 'border-accent text-accent-2 bg-accent/10'
+                      : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+                  }`}
+                >
+                  趋势图
+                </button>
+                <button
+                  type="button"
+                  onClick={handleShowF10}
+                  className={`text-xs px-2.5 py-0.5 rounded border transition-colors ${
+                    showF10
+                      ? 'border-accent text-accent-2 bg-accent/10'
+                      : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+                  }`}
+                >
+                  F10 全景
+                </button>
+                <select
+                  value={mainChartTemplate}
+                  onChange={(event) => handleMainChartTemplateChange(event.target.value as MainChartTemplate)}
+                  className={`h-[23px] rounded border px-2 text-xs font-semibold outline-none transition-colors ${
+                    colors.isDark
+                      ? 'border-slate-700 bg-slate-900/70 text-slate-200 hover:border-accent/60'
+                      : 'border-slate-300 bg-white/80 text-slate-700 hover:border-accent/60'
+                  }`}
+                  style={{ colorScheme: colors.isDark ? 'dark' : 'light' }}
+                  title="主图模板；开仓吃鱼会自动切到日K"
+                >
+                  <option value="standard">主图：标准</option>
+                  <option value="openEatFish">主图：开仓吃鱼</option>
+                </select>
+                {mainChartTemplate === 'openEatFish' && (
+                  <span className={`text-[11px] ${colors.isDark ? 'text-cyan-300' : 'text-cyan-700'}`}>
+                    日K主图生效
+                  </span>
+                )}
+              </div>
               <button
                 type="button"
-                onClick={handleShowTrend}
-                className={`text-xs px-2.5 py-0.5 rounded border transition-colors ${
-                  !showF10
-                    ? 'border-accent text-accent-2 bg-accent/10'
-                    : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+                onClick={handleOpenChartFullscreen}
+                className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-xs transition-colors ${
+                  colors.isDark
+                    ? 'border-slate-700 bg-slate-900/35 text-slate-300 hover:border-accent/60 hover:text-accent-2 hover:bg-accent/10'
+                    : 'border-slate-300 bg-white/60 text-slate-600 hover:border-accent/60 hover:text-accent-2 hover:bg-accent/10'
                 }`}
+                title="全屏查看趋势图"
               >
-                趋势图
-              </button>
-              <button
-                type="button"
-                onClick={handleShowF10}
-                className={`text-xs px-2.5 py-0.5 rounded border transition-colors ${
-                  showF10
-                    ? 'border-accent text-accent-2 bg-accent/10'
-                    : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
-                }`}
-              >
-                F10 全景
+                <Maximize2 className="h-3 w-3" />
+                全屏
               </button>
             </div>
           </div>
@@ -1142,6 +1703,8 @@ const App: React.FC = () => {
                       onPeriodChange={setTimePeriod}
                       stock={selectedStock}
                       dayKData={multiCycleKLines.daily}
+                      mainChartTemplate={mainChartTemplate}
+                      onMainChartTemplateChange={handleMainChartTemplateChange}
                     />
                   </SafeBoundary>
                 </div>
@@ -1170,11 +1733,43 @@ const App: React.FC = () => {
             kLineData={safeKLineData}
             session={currentSession}
             onSessionUpdate={setCurrentSession}
+            marketStatusCode={marketStatus?.status}
           />
         </div>
       </div>
 
-      <SettingsDialog isOpen={showSettings} onClose={() => setShowSettings(false)} />
+      {updateAvailable && (
+        <div className="fixed top-14 right-4 z-[9999] fin-panel border border-[var(--accent)]/50 rounded-lg shadow-lg px-4 py-3 flex items-center gap-3 animate-slide-in">
+          <RefreshCw className="h-4 w-4 text-[var(--accent)]" />
+          <span className="text-sm">发现新版本 v{updateAvailable}</span>
+          <button
+            onClick={() => {
+              setSettingsInitialTab('update');
+              setShowSettings(true);
+              setUpdateAvailable('');
+            }}
+            className="px-3 py-1 rounded-md text-sm text-white bg-gradient-to-br from-[var(--accent)] to-[var(--accent-2)]"
+          >
+            去更新
+          </button>
+          <button
+            onClick={() => setUpdateAvailable('')}
+            className="p-1 rounded hover:bg-white/10"
+            title="忽略"
+          >
+            <X className="h-4 w-4 opacity-60" />
+          </button>
+        </div>
+      )}
+
+      <SettingsDialog
+        isOpen={showSettings}
+        onClose={() => {
+          setShowSettings(false);
+          setSettingsInitialTab(undefined);
+        }}
+        initialTab={settingsInitialTab}
+      />
       <PositionDialog
         isOpen={showPosition}
         onClose={() => setShowPosition(false)}
@@ -1182,11 +1777,15 @@ const App: React.FC = () => {
         stockName={selectedStock.name}
         currentPrice={selectedStock.price}
         position={currentSession?.position}
-        onSave={async (shares, costPrice) => {
-          await updateStockPosition(selectedStock.symbol, shares, costPrice);
-          const session = await getOrCreateSession(selectedStock.symbol, selectedStock.name);
-          setCurrentSession(session);
-        }}
+	        onSave={async (shares, costPrice, buyDate) => {
+	          await updateStockPosition(selectedStock.symbol, shares, costPrice, buyDate);
+	          await handleTradeJournalChanged();
+	        }}
+	        onSell={async (sellPrice) => {
+	          const today = new Date().toISOString().slice(0, 10);
+	          await sellStockPosition(selectedStock.symbol, sellPrice, today);
+	          await handleTradeJournalChanged();
+	        }}
       />
       <HotTrendDialog isOpen={showHotTrend} onClose={() => setShowHotTrend(false)} />
       <LongHuBangDialog
@@ -1195,20 +1794,193 @@ const App: React.FC = () => {
         watchlistSymbols={watchlist.map(stock => stock.symbol)}
         onAddToWatchlist={handleAddFromLongHuBang}
       />
-      <MarketMovesDialog isOpen={showMarketMoves} onClose={() => setShowMarketMoves(false)} />
+      <MarketMovesDialog isOpen={showMarketMoves} onClose={() => setShowMarketMoves(false)} marketStatusCode={marketStatus?.status} />
       <LowBuyScannerDialog
         isOpen={showLowBuyScanner}
+        strategyMode={lowBuyStrategyMode}
+        title={lowBuyStrategyTitle}
+        subtitle={lowBuyStrategySubtitle}
         loading={scannerLoading}
         result={scannerResult}
         error={scannerError}
         onClose={() => setShowLowBuyScanner(false)}
         onScan={handleRunLowBuyScanner}
+        onReplay={handleRunTailLazyReplay}
         onCollectHistory={handleCollectDailyHistory}
         onGetHistoryAutoCollectStatus={handleGetHistoryAutoCollectStatus}
         onUpdateHistoryAutoCollect={handleUpdateHistoryAutoCollect}
         onAddToWatchlist={handleAddFromLongHuBang}
+        onOpenStock={handleOpenStockFromStrategy}
+        watchlistSymbols={watchlist.map(stock => stock.symbol)}
+        onOpenLateDayChase={() => setShowLateDayChaseScanner(true)}
+      />
+      <LateDayChaseScannerDialog
+        isOpen={showLateDayChaseScanner}
+        onClose={() => setShowLateDayChaseScanner(false)}
+        onAddToWatchlist={handleAddFromLongHuBang}
+        onOpenStock={handleOpenStockFromStrategy}
         watchlistSymbols={watchlist.map(stock => stock.symbol)}
       />
+	      <TradeJournalDialog
+	        isOpen={showJournal}
+	        onClose={() => setShowJournal(false)}
+	        onChanged={handleTradeJournalChanged}
+	      />
+      <PaperPortfolioDialog
+        isOpen={showPaper}
+        onClose={() => setShowPaper(false)}
+        onOpenStock={handleOpenStockFromStrategy}
+      />
+      <FundamentalScanDialog isOpen={showFundamental} onClose={() => setShowFundamental(false)} />
+      <WaveScannerDialog
+        isOpen={showWaveScanner}
+        onClose={() => setShowWaveScanner(false)}
+        onAddToWatchlist={handleAddFromLongHuBang}
+        onOpenStock={handleOpenStockFromStrategy}
+        watchlistSymbols={watchlist.map(stock => stock.symbol)}
+      />
+      {showChartFullscreen && selectedStock && (
+        <div
+          className="fixed inset-0 z-[70] flex flex-col bg-[#070b12]"
+          style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}
+        >
+          <div className="shrink-0 border-b border-slate-800/90 bg-slate-950/96 px-3 py-2 shadow-lg">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <Maximize2 className="h-4 w-4 shrink-0 text-accent-2" />
+                <span className="truncate text-sm font-semibold text-slate-100">
+                  {selectedStock.name} {selectedStock.symbol}
+                </span>
+                <span className="shrink-0 rounded border border-accent/30 bg-accent/10 px-2 py-0.5 text-[11px] font-medium text-accent-2">
+                  {chartFullscreenMode === 'strategy' ? '全屏四图K线' : '全屏趋势图'}
+                </span>
+                {chartFullscreenMode === 'strategy' && (
+                  <span className="hidden sm:inline shrink-0 rounded border border-cyan-400/20 bg-cyan-400/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
+                    日K · 近6个月 · 主图开仓吃鱼
+                  </span>
+                )}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowResearchReport(true)}
+                  className="inline-flex h-8 items-center gap-1.5 rounded border border-cyan-400/40 bg-cyan-400/10 px-3 text-xs font-semibold text-cyan-100 transition-colors hover:bg-cyan-400/20"
+                  title="机构级深度诊断报告V5.0(16章完整框架,生成约15-25分钟,可下载Word)"
+                >
+                  <FileText className="h-3.5 w-3.5" />
+                  <span>投研报告</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (chartFullscreenMode !== 'strategy') {
+                      setChartFullscreenMode('strategy');
+                      setMainChartTemplate('openEatFish');
+                      setTimePeriod('1d');
+                    }
+                    setShowBoardReport(true);
+                  }}
+                  className="inline-flex h-8 items-center gap-1.5 rounded border border-amber-400/40 bg-amber-400/10 px-3 text-xs font-semibold text-amber-100 transition-colors hover:bg-amber-400/20"
+                  title={chartFullscreenMode === 'strategy' ? '根据四图生成看板报告' : '切到四图K线并生成看板报告'}
+                >
+                  <FileText className="h-3.5 w-3.5" />
+                  <span>看板报告</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowBoardReport(false);
+                    setShowChartFullscreen(false);
+                  }}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-700 text-slate-400 transition-colors hover:border-red-400/50 hover:bg-red-500/10 hover:text-red-200"
+                  title="关闭全屏"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="min-h-0 flex-1 p-2">
+            <SafeBoundary title="全屏图表渲染异常" resetKey={`fullscreen:${chartFullscreenMode}:${selectedSymbol}:${timePeriod}`}>
+              <StockChartLW
+                data={safeKLineData}
+                updateMode={kLineUpdateMode}
+                period={timePeriod}
+                onPeriodChange={setTimePeriod}
+                stock={selectedStock}
+                dayKData={multiCycleKLines.daily}
+                mainChartTemplate={mainChartTemplate}
+                onMainChartTemplateChange={handleMainChartTemplateChange}
+                initialGridMode={chartFullscreenMode === 'strategy' ? true : undefined}
+                initialSubChartType={chartFullscreenMode === 'strategy' ? 'vipAnomaly' : undefined}
+                initialSubType2={chartFullscreenMode === 'strategy' ? 'vipShortEnergy' : undefined}
+                initialSubType3={chartFullscreenMode === 'strategy' ? 'vipFiveDragon' : undefined}
+                visibleRangeBars={chartFullscreenMode === 'strategy' ? 126 : undefined}
+              />
+            </SafeBoundary>
+          </div>
+          <BoardReportDialog
+            isOpen={showBoardReport}
+            onClose={() => setShowBoardReport(false)}
+            stock={selectedStock}
+            data={safeKLineData}
+            period={timePeriod}
+          />
+          <ResearchReportDialog
+            isOpen={showResearchReport}
+            onClose={() => setShowResearchReport(false)}
+            stock={selectedStock}
+          />
+        </div>
+      )}
+      {showWaveModel && selectedStock && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}>
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setShowWaveModel(false)} />
+          <div className={`relative w-[1120px] max-w-[94vw] max-h-[88vh] overflow-auto rounded-xl border fin-divider shadow-2xl ${colors.isDark ? 'bg-[#0f1722]' : 'bg-white'}`}>
+            <div className="flex items-center justify-between px-4 py-3 border-b fin-divider sticky top-0 z-10 fin-panel-strong">
+              <div className="flex items-center gap-2">
+                <Gauge className="h-4 w-4 text-amber-400" />
+                <span className={`font-semibold ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>波段模型驾驶舱</span>
+                <span className={`text-sm font-mono ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>{selectedStock.name} {selectedStock.symbol}</span>
+              </div>
+              <button
+                onClick={() => setShowWaveModel(false)}
+                className={`p-1 rounded transition-colors ${colors.isDark ? 'hover:bg-slate-700 text-slate-400 hover:text-white' : 'hover:bg-slate-200 text-slate-500 hover:text-slate-700'}`}
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="p-3">
+              <SafeBoundary title="模型驾驶舱渲染异常" resetKey={`${selectedSymbol}:${timePeriod}`}>
+                <ModelRadarStrip
+                  stock={selectedStock}
+                  kLineData={safeKLineData}
+                  period={timePeriod}
+                  panelHeight={Math.max(radarPanelHeight, 480)}
+                  dayKLineData={multiCycleKLines.daily}
+                  weekKLineData={multiCycleKLines.weekly}
+                  monthKLineData={multiCycleKLines.monthly}
+                  marketIndices={marketIndices}
+                  f10Overview={f10Overview}
+                  valuationSnapshot={valuationSnapshot}
+                  marketMessage={marketMessage}
+                  marketStatusText={marketStatus?.statusText}
+                  marketStatusCode={marketStatus?.status}
+                  onForceSync={forceSyncSelectedStock}
+                  syncing={syncingRadar}
+                />
+              </SafeBoundary>
+              <ResizeHandle
+                direction="vertical"
+                onResize={handleRadarResize}
+                className="h-3"
+                showLine
+                lineClassName={colors.isDark ? 'bg-accent/45 group-hover:bg-accent/80' : 'bg-accent/40 group-hover:bg-accent/70'}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

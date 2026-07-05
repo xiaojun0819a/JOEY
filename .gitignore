@@ -15,3 +15,7 @@ docs
 .flowforge
 .workflow
 flowforge
+*.bak
+*.log
+deploy_remote_access.sh
+tmp

@@ -1,13 +1,15 @@
 package services
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
 	"github.com/run-bigpig/jcp/internal/pkg/proxy"
 )
 
@@ -48,16 +50,14 @@ func (s *NewsService) GetTelegraphList() ([]Telegraph, error) {
 	}
 	s.mu.RUnlock()
 
-	// 请求财联社快讯页面
-	req, err := http.NewRequest("GET", "https://www.cls.cn/telegraph", nil)
+	// 东财 7x24 快讯 JSON 接口。cls.cn 已改成 JS SPA，静态 HTML 里没有快讯条目(goquery 爬到 0 条)，
+	// 改用东财返回 JSONP(var ajaxResult={...LivesList:[...]})的稳定接口。
+	req, err := http.NewRequest("GET", "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html", nil)
 	if err != nil {
 		return nil, err
 	}
-
-	// 设置请求头，模拟浏览器
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Referer", "https://kuaixun.eastmoney.com/")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -70,45 +70,52 @@ func (s *NewsService) GetTelegraphList() ([]Telegraph, error) {
 		return nil, err
 	}
 
-	// 解析 HTML
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
-	if err != nil {
+	// 剥掉 JSONP 包裹：var ajaxResult={...};
+	raw := string(body)
+	if idx := strings.Index(raw, "{"); idx >= 0 {
+		raw = raw[idx:]
+	}
+	raw = strings.TrimRight(strings.TrimSpace(raw), ";")
+
+	var parsed struct {
+		LivesList []struct {
+			Digest   string `json:"digest"`
+			Title    string `json:"title"`
+			ShowTime string `json:"showtime"`
+			URLW     string `json:"url_w"`
+		} `json:"LivesList"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return nil, err
 	}
 
-	telegraphs := make([]Telegraph, 0, 20)
-
-	// 解析快讯内容 - 查找包含 telegraph-content-box 的父级元素
-	// 父级元素同时包含内容和 subject-bottom-box（含详情链接）
-	doc.Find("div.telegraph-content-box").Each(func(i int, sel *goquery.Selection) {
-		if i >= 20 {
-			return
+	telegraphs := make([]Telegraph, 0, len(parsed.LivesList))
+	for i, item := range parsed.LivesList {
+		if i >= 30 {
+			break
 		}
-
-		// 获取时间
-		timeStr := sel.Find("span.telegraph-time-box").Text()
-		timeStr = strings.TrimSpace(timeStr)
-
-		// 获取内容 - 内容在 span > div 结构中
-		content := sel.Find("span > div").Text()
-		content = strings.TrimSpace(content)
-		content = cleanContent(content)
-
-		// 获取详情链接 - 链接在父级的兄弟元素 subject-bottom-box 中
-		url := ""
-		parent := sel.Parent()
-		if href, exists := parent.Find("div.subject-bottom-box a[href^='/detail/']").Attr("href"); exists {
-			url = "https://www.cls.cn" + href
+		content := cleanContent(strings.TrimSpace(item.Digest))
+		if content == "" {
+			content = cleanContent(strings.TrimSpace(item.Title))
 		}
-
-		if content != "" {
-			telegraphs = append(telegraphs, Telegraph{
-				Time:    timeStr,
-				Content: content,
-				URL:     url,
-			})
+		if content == "" {
+			continue
 		}
-	})
+		// showtime "2026-07-02 00:42:15" → "00:42"
+		t := item.ShowTime
+		if len(t) >= 16 {
+			t = t[11:16]
+		}
+		telegraphs = append(telegraphs, Telegraph{
+			Time:    t,
+			Content: content,
+			URL:     item.URLW,
+		})
+	}
+
+	// 在财联社快讯前，注入 AI 卡口选股线索（来自同 NAS 的 aicardmap 情报雷达）。
+	// 环境变量 JCP_SIGNALS_URL 未配置或抓取失败时静默跳过，不影响原快讯。
+	telegraphs = append(s.fetchCardMapSignals(), telegraphs...)
 
 	// 更新缓存
 	s.mu.Lock()
@@ -117,6 +124,85 @@ func (s *NewsService) GetTelegraphList() ([]Telegraph, error) {
 	s.mu.Unlock()
 
 	return telegraphs, nil
+}
+
+// cardMapSignal 对应 aicardmap /api/jcp-signals 返回的单条信号。
+type cardMapSignal struct {
+	NodeName string `json:"nodeName"`
+	Category string `json:"category"`
+	Direction string `json:"direction"`
+	Tighten  int    `json:"tighten"`
+	Loosen   int    `json:"loosen"`
+	Count    int    `json:"count"`
+	Stocks   []struct {
+		Name   string `json:"name"`
+		Ticker string `json:"ticker"`
+		Role   string `json:"role"`
+	} `json:"stocks"`
+	Headline string `json:"headline"`
+	URL      string `json:"url"`
+	Date     string `json:"date"`
+}
+
+// fetchCardMapSignals 从 aicardmap 拉取「卡口→A股」选股线索，转成快讯条目。
+// 只注入前若干条，Time 用「AI」前缀标识区别于真实快讯；任何异常都返回空切片。
+func (s *NewsService) fetchCardMapSignals() []Telegraph {
+	url := strings.TrimSpace(os.Getenv("JCP_SIGNALS_URL"))
+	if url == "" {
+		return nil
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil
+	}
+	// 走本机直连（127.0.0.1），不经代理
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+	var parsed struct {
+		OK      bool            `json:"ok"`
+		Signals []cardMapSignal `json:"signals"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || !parsed.OK {
+		return nil
+	}
+
+	dirLabel := map[string]string{"tighten": "趋紧", "loosen": "趋松", "neutral": "中性"}
+	out := make([]Telegraph, 0, len(parsed.Signals))
+	for i, sig := range parsed.Signals {
+		if i >= 6 { // 最多注入 6 条，避免淹没真实快讯
+			break
+		}
+		if len(sig.Stocks) == 0 {
+			continue
+		}
+		names := make([]string, 0, len(sig.Stocks))
+		for _, st := range sig.Stocks {
+			names = append(names, st.Name)
+		}
+		content := fmt.Sprintf("【AI卡口·%s】%s（%s）近期%d条情报%s · A股关联：%s",
+			dirLabel[sig.Direction], sig.NodeName, sig.Category, sig.Count,
+			dirLabel[sig.Direction], strings.Join(names, "、"))
+		if sig.Headline != "" {
+			content += " ｜ " + sig.Headline
+		}
+		out = append(out, Telegraph{
+			Time:    "AI卡口",
+			Content: cleanContent(content),
+			URL:     sig.URL,
+		})
+	}
+	return out
 }
 
 // GetLatestTelegraph 获取最新一条快讯

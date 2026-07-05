@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { X, Cpu, ChevronLeft, Plug, Plus, Trash2, Wrench, Check, Loader2, Brain, RefreshCw, Download, RotateCcw, Globe, Layers, Sliders, Star, MessageSquare, Copy, Sparkles } from 'lucide-react';
+import { X, Cpu, ChevronLeft, Plug, Plus, Trash2, Wrench, Check, Loader2, Brain, RefreshCw, Download, RotateCcw, Globe, Layers, Sliders, Star, MessageSquare, Copy, Sparkles, Bell, Send, Palette, Moon, Sun } from 'lucide-react';
 import { getConfig, updateConfig, getAvailableTools, ToolInfo, testAIConnection } from '../services/configService';
+import { testPush, runPositionMonitorOnce } from '../services/pushService';
 import { getAgentConfigs } from '../services/strategyService';
 import { getMCPServers, MCPServerConfig, MCPServerStatus, testMCPConnection, getMCPServerTools, MCPToolInfo } from '../services/mcpService';
 import { checkForUpdate, doUpdate, restartApp, getCurrentVersion, onUpdateProgress, UpdateInfo, UpdateProgress } from '../services/updateService';
 import { getStrategies, getActiveStrategyID, setActiveStrategy, deleteStrategy, generateStrategy, updateStrategy, enhancePrompt, Strategy, StrategyAgent } from '../services/strategyService';
-import { useTheme } from '../contexts/ThemeContext';
+import { useTheme, themes, ThemeType } from '../contexts/ThemeContext';
 import { useCandleColor, CandleColorMode } from '../contexts/CandleColorContext';
 import { useIndicator, IndicatorConfig, IndicatorType, DEFAULT_INDICATORS } from '../contexts/IndicatorContext';
 
@@ -55,12 +56,41 @@ interface OpenClawConfig {
   apiKey: string;
 }
 
-type TabType = 'provider' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'chart' | 'proxy' | 'openclaw' | 'update';
+type TabType = 'provider' | 'appearance' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'chart' | 'proxy' | 'openclaw' | 'push' | 'update';
+
+// 推送配置类型（与后端 models.PushConfig 对应）
+interface PushBarkChannel { enabled: boolean; url: string; }
+interface PushTelegramChannel { enabled: boolean; botToken: string; chatId: string; }
+interface PushWebhookChannel { enabled: boolean; webhook: string; }
+interface PushMonitorConfig { enabled: boolean; intervalMinutes: number; afterMarketCheck: boolean; }
+interface PushConfig {
+  enabled: boolean;
+  dedupHours: number;
+  pushProxyUrl: string;
+  bark: PushBarkChannel;
+  telegram: PushTelegramChannel;
+  feishu: PushWebhookChannel;
+  weWork: PushWebhookChannel;
+  monitor: PushMonitorConfig;
+}
+
+const DEFAULT_PUSH_CONFIG: PushConfig = {
+  enabled: false,
+  dedupHours: 24,
+  pushProxyUrl: '',
+  bark: { enabled: false, url: '' },
+  telegram: { enabled: false, botToken: '', chatId: '' },
+  feishu: { enabled: false, webhook: '' },
+  weWork: { enabled: false, webhook: '' },
+  monitor: { enabled: false, intervalMinutes: 15, afterMarketCheck: true },
+};
 type AgentSelectionStyle = 'balanced' | 'conservative' | 'aggressive';
 
 interface SettingsDialogProps {
   isOpen: boolean;
   onClose: () => void;
+  /** 打开时定位到指定选项卡(如更新提醒直达"软件更新") */
+  initialTab?: TabType;
 }
 
 // Toast 通知 hook
@@ -98,9 +128,13 @@ const normalizeTokenParamMode = (value?: string): TokenParamMode => {
   return 'auto';
 };
 
-export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose }) => {
+export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose, initialTab }) => {
   const { colors } = useTheme();
   const [activeTab, setActiveTab] = useState<TabType>('provider');
+
+  useEffect(() => {
+    if (isOpen && initialTab) setActiveTab(initialTab);
+  }, [isOpen, initialTab]);
   const [aiConfigs, setAiConfigs] = useState<AIConfig[]>([]);
   const [mcpServers, setMcpServers] = useState<MCPServerConfig[]>([]);
   const [mcpStatus, setMcpStatus] = useState<Record<string, MCPServerStatus>>({});
@@ -123,6 +157,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     port: 51888,
     apiKey: '',
   });
+  const [pushConfig, setPushConfig] = useState<PushConfig>(DEFAULT_PUSH_CONFIG);
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [activeStrategyId, setActiveStrategyId] = useState<string>('');
   const [moderatorAiId, setModeratorAiId] = useState<string>('');
@@ -158,6 +193,23 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
         enabled: config.openClaw.enabled || false,
         port: config.openClaw.port || 8080,
         apiKey: config.openClaw.apiKey || '',
+      });
+    }
+    if ((config as any).push) {
+      const p = (config as any).push;
+      setPushConfig({
+        enabled: !!p.enabled,
+        dedupHours: typeof p.dedupHours === 'number' && p.dedupHours > 0 ? p.dedupHours : 24,
+        pushProxyUrl: p.pushProxyUrl || '',
+        bark: { enabled: !!p.bark?.enabled, url: p.bark?.url || '' },
+        telegram: { enabled: !!p.telegram?.enabled, botToken: p.telegram?.botToken || '', chatId: p.telegram?.chatId || '' },
+        feishu: { enabled: !!p.feishu?.enabled, webhook: p.feishu?.webhook || '' },
+        weWork: { enabled: !!p.weWork?.enabled, webhook: p.weWork?.webhook || '' },
+        monitor: {
+          enabled: !!p.monitor?.enabled,
+          intervalMinutes: typeof p.monitor?.intervalMinutes === 'number' && p.monitor.intervalMinutes > 0 ? p.monitor.intervalMinutes : 15,
+          afterMarketCheck: p.monitor?.afterMarketCheck !== false,
+        },
       });
     }
     if (typeof (config as any).aiRetryCount === 'number') setAiRetryCount((config as any).aiRetryCount);
@@ -205,6 +257,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     agentSelectionStyle: AgentSelectionStyle;
     enableSecondReview: boolean;
     indicators: any;
+    push: PushConfig;
   }>>({});
 
   // 实际执行保存的函数
@@ -244,6 +297,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     enableSecondReview: boolean;
     candleColorMode: string;
     indicators: any;
+    push: PushConfig;
   }>) => {
     // 合并待保存的更新
     pendingUpdatesRef.current = { ...pendingUpdatesRef.current, ...updates };
@@ -274,6 +328,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
 
   const tabs: { id: TabType; label: string; icon: React.ReactNode }[] = [
     { id: 'provider', label: '模型基座', icon: <Cpu className="h-4 w-4" /> },
+    { id: 'appearance', label: '外观主题', icon: <Palette className="h-4 w-4" /> },
     { id: 'intent', label: '意图配置', icon: <MessageSquare className="h-4 w-4" /> },
     { id: 'strategy', label: '策略管理', icon: <Layers className="h-4 w-4" /> },
     { id: 'mcp', label: 'MCP服务', icon: <Plug className="h-4 w-4" /> },
@@ -281,6 +336,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     { id: 'chart', label: '图表设置', icon: <Sliders className="h-4 w-4" /> },
     { id: 'proxy', label: '网络代理', icon: <Globe className="h-4 w-4" /> },
     { id: 'openclaw', label: 'OpenClaw', icon: <Plug className="h-4 w-4" /> },
+    { id: 'push', label: '信号推送', icon: <Bell className="h-4 w-4" /> },
     { id: 'update', label: '软件更新', icon: <RefreshCw className="h-4 w-4" /> },
   ];
 
@@ -290,7 +346,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
         <Header onClose={onClose} />
         <div className="flex h-[500px]">
           {/* 左侧选项卡 */}
-          <div className="w-44 fin-panel-strong border-r fin-divider p-2">
+          <div className="w-44 fin-panel-strong border-r fin-divider p-2 overflow-y-auto fin-scrollbar">
             {tabs.map(tab => (
               <button
                 key={tab.id}
@@ -330,6 +386,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
                   saveConfig({ verboseAgentIO: enabled });
                 }}
               />
+            )}
+            {activeTab === 'appearance' && (
+              <AppearanceSettings />
             )}
             {activeTab === 'intent' && (
               <IntentSettings
@@ -423,6 +482,17 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
                 }}
               />
             )}
+            {activeTab === 'push' && (
+              <PushSettings
+                config={pushConfig}
+                onChange={(config) => {
+                  setPushConfig(config);
+                  saveConfig({ push: config });
+                }}
+                flushSave={doSave}
+                showToast={showToast}
+              />
+            )}
             {activeTab === 'update' && (
               <UpdateSettings />
             )}
@@ -457,6 +527,74 @@ const Header: React.FC<{ onClose: () => void }> = ({ onClose }) => {
       <button onClick={onClose} className={`transition-colors p-1 rounded ${colors.isDark ? 'text-slate-500 hover:text-white hover:bg-slate-800/60' : 'text-slate-400 hover:text-slate-700 hover:bg-slate-200/60'}`}>
         <X className="h-5 w-5" />
       </button>
+    </div>
+  );
+};
+
+// ========== 外观主题设置选项卡 ==========
+const AppearanceSettings: React.FC = () => {
+  const { theme, setTheme, colors } = useTheme();
+  const darkThemes: ThemeType[] = ['military', 'ocean', 'purple', 'orange', 'dark'];
+  const lightThemes: ThemeType[] = ['light', 'light-blue', 'light-green', 'light-rose'];
+
+  const renderThemeButton = (themeId: ThemeType) => {
+    const item = themes[themeId];
+    const selected = theme === themeId;
+    return (
+      <button
+        key={themeId}
+        onClick={() => setTheme(themeId)}
+        className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-colors text-left ${
+          selected
+            ? 'border-[var(--accent)] bg-[var(--accent)]/12'
+            : colors.isDark
+              ? 'border-slate-700 bg-slate-800/35 hover:border-slate-600'
+              : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+        }`}
+      >
+        <span
+          className="h-4 w-4 rounded-full border border-black/10 shadow-sm"
+          style={{ backgroundColor: item.accent }}
+        />
+        <span className="min-w-0 flex-1">
+          <span className={`block text-sm font-medium ${colors.isDark ? 'text-slate-100' : 'text-slate-800'}`}>{item.name}</span>
+          <span className={`block text-[11px] ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+            {item.isDark ? '深色' : '浅色'}
+          </span>
+        </span>
+        {selected && <Check className="h-4 w-4 text-[var(--accent-2)]" />}
+      </button>
+    );
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h3 className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>外观主题</h3>
+        <p className={`text-sm mt-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+          选择应用配色，切换后会自动保存。
+        </p>
+      </div>
+
+      <div>
+        <div className={`flex items-center gap-2 mb-2 text-xs ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+          <Moon className="h-3.5 w-3.5" />
+          <span>深色主题</span>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {darkThemes.map(renderThemeButton)}
+        </div>
+      </div>
+
+      <div>
+        <div className={`flex items-center gap-2 mb-2 text-xs ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+          <Sun className="h-3.5 w-3.5" />
+          <span>浅色主题</span>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {lightThemes.map(renderThemeButton)}
+        </div>
+      </div>
     </div>
   );
 };
@@ -2092,6 +2230,250 @@ const OpenClawSettings: React.FC<OpenClawSettingsProps> = ({ config, onChange })
   );
 };
 
+// ========== 信号推送选项卡 ==========
+interface PushSettingsProps {
+  config: PushConfig;
+  onChange: (config: PushConfig) => void;
+  flushSave: () => Promise<void> | void;
+  showToast: (type: 'success' | 'error' | 'loading', message: string) => void;
+}
+
+const PushSettings: React.FC<PushSettingsProps> = ({ config, onChange, flushSave, showToast }) => {
+  const { colors } = useTheme();
+  const [testing, setTesting] = useState(false);
+
+  const Toggle: React.FC<{ checked: boolean; onClick: () => void }> = ({ checked, onClick }) => (
+    <button
+      onClick={onClick}
+      className={`relative w-11 h-6 rounded-full transition-colors ${
+        checked ? 'bg-[var(--accent)]' : (colors.isDark ? 'bg-slate-600' : 'bg-slate-300')
+      }`}
+    >
+      <div className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-6' : 'translate-x-1'}`} />
+    </button>
+  );
+
+  const inputCls = `w-full fin-input rounded-lg px-3 py-2 text-sm ${colors.isDark ? 'text-white' : 'text-slate-800'}`;
+  const labelCls = `block text-xs mb-1.5 ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`;
+
+  const handleTest = async () => {
+    setTesting(true);
+    showToast('loading', '保存并测试推送...');
+    try {
+      await flushSave();
+      const res = await testPush();
+      const parts = Object.entries(res.channels || {}).map(([k, v]) => `${k}:${v === 'ok' ? '成功' : v}`);
+      if (res.sent) {
+        showToast('success', parts.length ? `测试完成 ${parts.join('，')}` : '测试完成');
+      } else {
+        showToast('error', res.message || (parts.length ? parts.join('，') : '没有可用渠道'));
+      }
+    } catch (e) {
+      showToast('error', '测试失败：' + String(e));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  // 渠道外框
+  const ChannelCard: React.FC<{ title: string; desc: string; enabled: boolean; onToggle: () => void; children?: React.ReactNode }> = ({ title, desc, enabled, onToggle, children }) => (
+    <div className={`rounded-lg border p-3 ${colors.isDark ? 'border-slate-700' : 'border-slate-300'}`}>
+      <div className="flex items-center justify-between">
+        <div>
+          <div className={`text-sm font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>{title}</div>
+          <div className={`text-xs mt-0.5 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>{desc}</div>
+        </div>
+        <Toggle checked={enabled} onClick={onToggle} />
+      </div>
+      {enabled && <div className="mt-3 space-y-3">{children}</div>}
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h3 className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>信号推送</h3>
+        <p className={`text-sm mt-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+          买卖点/止损等信号实时推送到手机。同股同信号在防重时间内只推一次。
+        </p>
+      </div>
+
+      {/* 总开关 + 防重 */}
+      <div className={`flex items-center justify-between p-3 rounded-lg border ${colors.isDark ? 'border-slate-700' : 'border-slate-300'}`}>
+        <div>
+          <div className={`text-sm font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>启用推送</div>
+          <div className={`text-xs mt-0.5 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>总开关，关闭后所有渠道不推送</div>
+        </div>
+        <Toggle checked={config.enabled} onClick={() => onChange({ ...config, enabled: !config.enabled })} />
+      </div>
+
+      {config.enabled && (
+        <>
+          <div className="flex items-center gap-3">
+            <label className={`text-sm ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>防重时长(小时)</label>
+            <input
+              type="number"
+              min={1}
+              value={config.dedupHours}
+              onChange={(e) => onChange({ ...config, dedupHours: parseInt(e.target.value) || 24 })}
+              className={`w-24 fin-input rounded-lg px-3 py-2 text-sm ${colors.isDark ? 'text-white' : 'text-slate-800'}`}
+            />
+          </div>
+
+          {/* 推送代理 */}
+          <div>
+            <label className={labelCls}>推送代理（仅 Telegram / Bark 走此代理，留空用全局代理）</label>
+            <input
+              type="text"
+              value={config.pushProxyUrl}
+              onChange={(e) => onChange({ ...config, pushProxyUrl: e.target.value })}
+              placeholder="http://127.0.0.1:7890"
+              className={inputCls}
+            />
+            <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+              国外渠道走代理，国内行情/飞书/企业微信保持直连，互不影响。
+            </p>
+          </div>
+
+          {/* Bark */}
+          <ChannelCard
+            title="Bark"
+            desc="iOS 推送，填完整地址含 key"
+            enabled={config.bark.enabled}
+            onToggle={() => onChange({ ...config, bark: { ...config.bark, enabled: !config.bark.enabled } })}
+          >
+            <div>
+              <label className={labelCls}>Bark 地址</label>
+              <input
+                type="text"
+                value={config.bark.url}
+                onChange={(e) => onChange({ ...config, bark: { ...config.bark, url: e.target.value } })}
+                placeholder="https://api.day.app/你的key"
+                className={inputCls}
+              />
+            </div>
+          </ChannelCard>
+
+          {/* Telegram */}
+          <ChannelCard
+            title="Telegram"
+            desc="Bot 推送，国内需开启网络代理"
+            enabled={config.telegram.enabled}
+            onToggle={() => onChange({ ...config, telegram: { ...config.telegram, enabled: !config.telegram.enabled } })}
+          >
+            <div>
+              <label className={labelCls}>Bot Token</label>
+              <input
+                type="text"
+                value={config.telegram.botToken}
+                onChange={(e) => onChange({ ...config, telegram: { ...config.telegram, botToken: e.target.value } })}
+                placeholder="123456:ABC-DEF..."
+                className={inputCls}
+              />
+            </div>
+            <div>
+              <label className={labelCls}>Chat ID</label>
+              <input
+                type="text"
+                value={config.telegram.chatId}
+                onChange={(e) => onChange({ ...config, telegram: { ...config.telegram, chatId: e.target.value } })}
+                placeholder="目标对话 id"
+                className={inputCls}
+              />
+            </div>
+          </ChannelCard>
+
+          {/* 飞书 */}
+          <ChannelCard
+            title="飞书"
+            desc="自定义机器人 Webhook"
+            enabled={config.feishu.enabled}
+            onToggle={() => onChange({ ...config, feishu: { ...config.feishu, enabled: !config.feishu.enabled } })}
+          >
+            <div>
+              <label className={labelCls}>Webhook 地址</label>
+              <input
+                type="text"
+                value={config.feishu.webhook}
+                onChange={(e) => onChange({ ...config, feishu: { ...config.feishu, webhook: e.target.value } })}
+                placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                className={inputCls}
+              />
+            </div>
+          </ChannelCard>
+
+          {/* 企业微信 */}
+          <ChannelCard
+            title="企业微信"
+            desc="群机器人 Webhook"
+            enabled={config.weWork.enabled}
+            onToggle={() => onChange({ ...config, weWork: { ...config.weWork, enabled: !config.weWork.enabled } })}
+          >
+            <div>
+              <label className={labelCls}>Webhook 地址</label>
+              <input
+                type="text"
+                value={config.weWork.webhook}
+                onChange={(e) => onChange({ ...config, weWork: { ...config.weWork, webhook: e.target.value } })}
+                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+                className={inputCls}
+              />
+            </div>
+          </ChannelCard>
+
+          {/* 盘中持仓监控 */}
+          <ChannelCard
+            title="盘中持仓监控"
+            desc="贴收盘调度：-5%硬止损每N分钟，14:00扫买点，14:30/14:55体检(MA10/+15%/换手)，17:00时间止损"
+            enabled={config.monitor.enabled}
+            onToggle={() => onChange({ ...config, monitor: { ...config.monitor, enabled: !config.monitor.enabled } })}
+          >
+            <div className="flex items-center gap-3">
+              <label className={`text-sm ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>硬止损检查间隔(分钟)</label>
+              <input
+                type="number"
+                min={5}
+                value={config.monitor.intervalMinutes}
+                onChange={(e) => onChange({ ...config, monitor: { ...config.monitor, intervalMinutes: parseInt(e.target.value) || 15 } })}
+                className={`w-24 fin-input rounded-lg px-3 py-2 text-sm ${colors.isDark ? 'text-white' : 'text-slate-800'}`}
+              />
+            </div>
+            <label className={`flex items-center gap-2 text-sm cursor-pointer ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>
+              <input
+                type="checkbox"
+                checked={config.monitor.afterMarketCheck}
+                onChange={(e) => onChange({ ...config, monitor: { ...config.monitor, afterMarketCheck: e.target.checked } })}
+              />
+              盘后 17:00 跑时间止损检查（需持仓填买入日期）
+            </label>
+            <button
+              onClick={async () => {
+                await flushSave();
+                const n = await runPositionMonitorOnce();
+                showToast(n > 0 ? 'success' : 'success', n > 0 ? `已检查，触发 ${n} 条信号` : '已检查，当前无触发');
+              }}
+              className={`text-sm px-3 py-1.5 rounded-lg ${colors.isDark ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'}`}
+            >
+              立即检查持仓
+            </button>
+          </ChannelCard>
+
+          <div className="flex justify-end pt-1">
+            <button
+              onClick={handleTest}
+              disabled={testing}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm text-white bg-gradient-to-br from-[var(--accent)] to-[var(--accent-2)] disabled:opacity-50"
+            >
+              {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              {testing ? '测试中...' : '测试推送'}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
 // ========== 更新设置选项卡 ==========
 const UpdateSettings: React.FC = () => {
   const { colors } = useTheme();
@@ -2102,9 +2484,14 @@ const UpdateSettings: React.FC = () => {
   const [progress, setProgress] = useState<UpdateProgress | null>(null);
 
   useEffect(() => {
-    getCurrentVersion().then(setCurrentVersion);
+    getCurrentVersion().then(v => {
+      setCurrentVersion(v);
+      // 正式发布版本(如 0.3.5)打开即自动检查;dev/nas 等本地构建不查,避免弹解析错误
+      if (/^v?\d/.test(v)) handleCheckUpdate();
+    });
     const cleanup = onUpdateProgress(setProgress);
     return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleCheckUpdate = async () => {

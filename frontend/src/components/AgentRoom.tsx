@@ -1,10 +1,14 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Stock, KLineData } from '../types';
 import { getAgentConfigs, AgentConfig } from '../services/strategyService';
 import { StockSession, ChatMessage, sendMeetingMessage, MeetingMessageRequest, getSessionMessages, retryAgent, retryAgentAndContinue, cancelInterruptedMeeting } from '../services/sessionService';
-import { MessageSquare, Loader2, Send, User, Users, X, Reply, Trash2, Wrench, CheckCircle2, AlertCircle, Copy, Check, RotateCcw, Pencil, Square, Zap } from 'lucide-react';
+import { MessageSquare, Loader2, Send, User, Users, X, Reply, Trash2, Wrench, CheckCircle2, AlertCircle, Copy, Check, RotateCcw, Pencil, Square, Zap, Landmark, BarChart3, Swords } from 'lucide-react';
 import { clearSessionMessages } from '../services/sessionService';
 import { NodeRenderer } from 'markstream-react';
+import { ExpertScorecard } from './ExpertScorecard';
+import { parseExpertCard } from '../utils/expertCard';
+import { DiagnosisSummaryBar } from './DiagnosisSummaryBar';
+import { summarizeDiagnosis } from '../utils/diagnosisSummary';
 import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime';
 import { useMentionPicker } from '../hooks/useMentionPicker';
 import { useTheme } from '../contexts/ThemeContext';
@@ -13,17 +17,20 @@ import { ResizeHandle } from './ResizeHandle';
 import { isWailsBridgeReady, isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
 import 'markstream-react/index.css';
 
-const BATTLE_AGENT_ID_PRIORITY = ['fundamental', 'technical', 'capital', 'risk', 'quant'];
-const BATTLE_AGENT_NAME_PRIORITY = ['老陈', 'K线王', '钱姐', '风控李', '数据老李'];
+const BATTLE_AGENT_ID_PRIORITY = ['fundamental', 'technical', 'capital', 'policy', 'risk', 'hottrend', 'quant'];
+const BATTLE_AGENT_NAME_PRIORITY = ['老陈', 'K线王', '钱姐', '政策通', '风控李', '舆情师', '数据老李'];
 const BATTLE_PROMPT = `针对当前股票做多空Battle。每位被@专家都必须按统一格式回复：
-【立场】看多/中性/看空（置信度0-100）
+【立场】看多/中性/看空（置信度0-100，只能三选一，不要写中性偏多/中性偏空）
 【核心证据】1) 2) 3)
 【买点】触发条件或价格区间
 【止损】明确价格或条件
 【卖点】第一止盈 / 第二止盈
 【仓位】建议仓位（%）
 【时效】该判断有效到何时
-要求：可执行、少空话、150字内。`;
+【反证】什么价格/资金/消息会推翻你的判断
+【失效信号】哪条线、哪类资金、哪种情绪变化说明观点失效
+【数据来源】写清数据口径和时间窗
+要求：可执行、少空话、150字内，不要复述别人的观点。`;
 
 // 进度事件类型
 interface ProgressEvent {
@@ -47,9 +54,10 @@ interface AgentRoomProps {
   kLineData: KLineData[];
   session: StockSession | null;
   onSessionUpdate: (session: StockSession) => void;
+  marketStatusCode?: string;
 }
 
-export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }) => {
+export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate, marketStatusCode }) => {
   const { colors } = useTheme();
   const COMPOSER_MIN_WIDTH = 260;
   const COMPOSER_BUTTON_SPACE = 56;
@@ -278,7 +286,8 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
   const handleSendMessage = async (
     query: string,
     mentions: string[],
-    replyTo: ChatMessage | null
+    replyTo: ChatMessage | null,
+    battle = false
   ) => {
     if (!session || !query.trim()) return;
 
@@ -309,7 +318,8 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
         content: query,
         mentionIds: mentions,
         replyToId: replyTo?.id || '',
-        replyContent: replyTo?.content || ''
+        replyContent: replyTo?.content || '',
+        battle
       };
 
       // 统一模式：无论智能模式还是直接@模式，消息都通过事件实时推送
@@ -513,8 +523,54 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
     clearMentions();
     setReplyToMessage(null);
     closePicker();
-    handleSendMessage(BATTLE_PROMPT, mentionIds, null);
+    handleSendMessage(BATTLE_PROMPT, mentionIds, null, true);
   }, [session, isSimulating, allAgents, clearMentions, closePicker, handleSendMessage]);
+
+  // 上次诊断摘要（综合立场/三方分歧/置信/一句话结论）
+  const diagnosisSummary = useMemo(() => summarizeDiagnosis(messages), [messages]);
+
+  // 空状态推荐问题：一点即发，省去打字 + 记角色名
+  const stockLabel = session?.stockName || '这只票';
+  const findAgentId = (id: string) => allAgents.find(a => a.id === id)?.id;
+  const policyId = findAgentId('policy');
+  const quantId = findAgentId('quant');
+  const quickAsks: Array<{
+    key: string;
+    title: string;
+    sub: string;
+    icon: React.ElementType;
+    color: string;
+    disabled?: boolean;
+    run: () => void;
+  }> = [
+    {
+      key: 'policy',
+      title: '看政策面',
+      sub: `@政策通 · 催化与 price-in`,
+      icon: Landmark,
+      color: 'text-amber-400',
+      disabled: !policyId,
+      run: () => policyId && handleSendMessage(`${stockLabel}的政策面与催化逻辑怎么看？是否已被price-in？`, [policyId], null),
+    },
+    {
+      key: 'quant',
+      title: '量化体检',
+      sub: `@数据老李 · 分位/动量/回撤`,
+      icon: BarChart3,
+      color: 'text-cyan-400',
+      disabled: !quantId,
+      run: () => quantId && handleSendMessage(`给${stockLabel}做个量化体检：52周分位、近20日动量、最大回撤、性价比分数。`, [quantId], null),
+    },
+    {
+      key: 'battle',
+      title: '多空Battle',
+      sub: '三方专家比分对决 + 裁决',
+      icon: Swords,
+      color: 'text-rose-400',
+      disabled: allAgents.length === 0,
+      run: handleOneClickBattle,
+    },
+  ];
 
   // 确认清空消息
   const confirmClearMessages = async () => {
@@ -537,7 +593,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
         <div className="flex items-center justify-between">
           <h2 className={`text-lg font-bold flex items-center gap-2 ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>
             <Users style={{ color: 'var(--accent)' }} />
-            韭菜讨论中心
+            AI 圆桌诊股
           </h2>
           <button
             onClick={handleClearMessages}
@@ -548,16 +604,36 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
             <Trash2 size={16} />
           </button>
         </div>
-        <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>@韭菜提问，引用观点深入讨论</p>
+        <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>@角色名 提问，多个角色会从不同视角讨论</p>
       </div>
 
       {/* Chat Area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4 fin-scrollbar" ref={scrollRef}>
+        {!isSimulating && diagnosisSummary && (
+          <DiagnosisSummaryBar summary={diagnosisSummary} marketStatusCode={marketStatusCode} />
+        )}
         {messages.length === 0 && (
-          <div className={`h-full flex flex-col items-center justify-center text-sm p-8 text-center opacity-60 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
-            <MessageSquare size={32} className="mb-2" />
-            <p>直接提问或 @ 选择韭菜专家</p>
-            <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-600' : 'text-slate-400'}`}>不@任何人时，老板娘会自动安排专家三轮讨论</p>
+          <div className="h-full flex flex-col items-center justify-center p-6">
+            <MessageSquare size={28} className={`mb-2 opacity-50 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`} />
+            <p className={`text-sm mb-1 ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>想从哪个角度看这只票？</p>
+            <p className={`text-xs mb-4 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>点一下直接发问，或 @ 角色名提问</p>
+            <div className="w-full max-w-[300px] space-y-2">
+              {quickAsks.map((qa) => (
+                <button
+                  key={qa.key}
+                  onClick={qa.run}
+                  disabled={isSimulating || !session || qa.disabled}
+                  className={`w-full flex items-start gap-2.5 px-3 py-2.5 rounded-xl border text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${colors.isDark ? 'bg-slate-800/40 border-slate-700/50 hover:border-accent/40 hover:bg-slate-800/70' : 'bg-slate-50 border-slate-200 hover:border-accent/40 hover:bg-white'}`}
+                >
+                  <qa.icon size={16} className={`mt-0.5 shrink-0 ${qa.color}`} />
+                  <div className="min-w-0">
+                    <div className={`text-sm font-medium ${colors.isDark ? 'text-slate-200' : 'text-slate-700'}`}>{qa.title}</div>
+                    <div className={`text-xs truncate ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>{qa.sub}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+            <p className={`text-[11px] mt-4 ${colors.isDark ? 'text-slate-600' : 'text-slate-400'}`}>不 @ 任何人时，老板娘自动安排专家三轮讨论</p>
           </div>
         )}
         
@@ -656,7 +732,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
                         ? (colors.isDark ? 'bg-gradient-to-br from-amber-900/40 to-orange-900/30 border border-amber-500/30 text-amber-100' : 'bg-gradient-to-br from-amber-100 to-orange-100 border border-amber-400/30 text-amber-900')
                         : (colors.isDark ? 'bg-slate-800/70 border border-amber-500/20 text-slate-200' : 'bg-slate-100 border border-amber-400/20 text-slate-700')
                     }`}>
-                      <NodeRenderer content={msg.content} />
+                      <NodeRenderer content={msg.content} final />
                     </div>
                     {/* 复制按钮 */}
                     <button
@@ -674,11 +750,19 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
 
           return (
             <div key={msg.id} className={`flex gap-3 animate-in fade-in slide-in-from-bottom-2 duration-300 group`}>
-              <div
-                className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 text-white shadow-md ring-2 ring-slate-900"
-                style={{ backgroundColor: msg.error ? '#ef4444' : (agent?.color || '#475569') }}
-              >
-                {msg.error ? <AlertCircle size={14} /> : (agent?.avatar || msg.agentName?.charAt(0))}
+              <div className="relative shrink-0">
+                <div
+                  className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-md ring-2 ring-slate-900"
+                  style={{ backgroundColor: msg.error ? '#ef4444' : (agent?.color || '#475569') }}
+                >
+                  {msg.error ? <AlertCircle size={14} /> : (agent?.avatar || msg.agentName?.charAt(0))}
+                </div>
+                {/* 状态点：当前发言中=思考(琥珀脉冲)，否则在线(绿) */}
+                {!msg.error && (
+                  progress.currentAgent === msg.agentId
+                    ? <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-amber-400 ring-2 ring-slate-900 animate-pulse" title="思考中" />
+                    : <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-green-500 ring-2 ring-slate-900" title="在线" />
+                )}
               </div>
               <div className="flex-1 max-w-[85%]">
                 <div className="flex items-baseline gap-2 mb-1">
@@ -723,7 +807,10 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
                   ) : (
                     <>
                       <div className={`text-sm p-3 rounded-2xl rounded-tl-none leading-relaxed shadow-sm agent-message-content ${colors.isDark ? 'text-slate-200 bg-slate-800/70 border border-slate-700/40' : 'text-slate-700 bg-white border border-slate-200'}`}>
-                        <NodeRenderer content={msg.content} />
+                        {(() => {
+                          const card = parseExpertCard(msg.content);
+                          return card ? <ExpertScorecard card={card} /> : <NodeRenderer content={msg.content} final />;
+                        })()}
                       </div>
                       {/* 操作按钮组 */}
                       <div className="absolute -right-2 top-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -877,7 +964,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
                  onChange={handleInputChange}
                  onKeyDown={handleKeyDown}
                  disabled={isSimulating}
-                 placeholder="直接提问或输入 @ 选择韭菜专家..."
+                 placeholder="例：@政策通 工业富联受新一轮算力补贴影响多大？"
                  className="w-full fin-input rounded-lg px-4 py-2 text-sm placeholder-slate-500 border fin-divider"
               />
             </div>

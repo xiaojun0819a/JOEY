@@ -17,6 +17,52 @@ type Stock struct {
 	PreClose      float64 `json:"preClose"`
 }
 
+// StockGroup 自选分组定义（用户可自定义增删改名）
+type StockGroup struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// MarketRegime 大盘牛熊环境（基于涨停/跌停/成交额，按近半年分布校准）
+type MarketRegime struct {
+	Regime    string  `json:"regime"` // bull / bear / neutral
+	Emoji     string  `json:"emoji"`  // 🐂 / 🐻 / ⚖️
+	Label     string  `json:"label"`  // 偏牛/偏熊/震荡 (+结构市)
+	LimitUp   int     `json:"limitUp"`
+	LimitDown int     `json:"limitDown"`
+	AmountYi  float64 `json:"amountYi"` // 两市成交额(亿)
+	ShPrice   float64 `json:"shPrice"`
+	ShMA20    float64 `json:"shMA20"`
+	AboveMA20 bool    `json:"aboveMA20"`
+	AsOf      string  `json:"asOf"`
+	Available bool    `json:"available"` // 数据是否可用
+}
+
+// MarketStyleItem 市场风格单项
+type MarketStyleItem struct {
+	Key           string  `json:"key"`           // large/mid/small/micro
+	Name          string  `json:"name"`          // 大盘股/中盘股/小盘股/微盘股
+	IndexName     string  `json:"indexName"`     // 沪深300/中证500/中证1000/微盘股
+	Code          string  `json:"code"`          // 指数代码或代理口径
+	ChangePercent float64 `json:"changePercent"` // 涨跌幅(%)
+	Source        string  `json:"source"`        // 数据源说明
+}
+
+// MarketStylePreference 市场风格偏好
+type MarketStylePreference struct {
+	Label          string            `json:"label"`       // 微盘股更强
+	SubLabel       string            `json:"subLabel"`    // 大盘股弱势
+	Scenario       string            `json:"scenario"`    // 规则场景
+	StrengthGap    float64           `json:"strengthGap"` // 强弱差(%)
+	StrongKey      string            `json:"strongKey"`
+	WeakKey        string            `json:"weakKey"`
+	Items          []MarketStyleItem `json:"items"`
+	AsOf           string            `json:"asOf"`
+	Available      bool              `json:"available"`
+	DataNote       string            `json:"dataNote,omitempty"`
+	RegimeFallback *MarketRegime     `json:"regimeFallback,omitempty"`
+}
+
 // KLineData K线数据
 type KLineData struct {
 	Time   string  `json:"time"`

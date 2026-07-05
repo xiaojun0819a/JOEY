@@ -50,6 +50,40 @@ const buildWatchStockFromLongHu = (item: models.LongHuBangItem): Stock => {
   };
 };
 
+const mergeReasonText = (current: string, next: string): string => {
+  const parts = [current, next]
+    .flatMap(text => String(text || '').split(/[；;]/))
+    .map(text => text.trim())
+    .filter(Boolean);
+  return Array.from(new Set(parts)).join('；');
+};
+
+const mergeLongHuItems = (items: models.LongHuBangItem[]): models.LongHuBangItem[] => {
+  const byStock = new Map<string, models.LongHuBangItem>();
+
+  items.forEach((item) => {
+    const key = `${item.tradeDate || ''}-${item.code || ''}`;
+    const existing = byStock.get(key);
+    if (!existing) {
+      byStock.set(key, { ...item });
+      return;
+    }
+
+    const existingAbs = Math.abs(Number(existing.netBuyAmt || 0));
+    const itemAbs = Math.abs(Number(item.netBuyAmt || 0));
+    const keep = itemAbs > existingAbs ? { ...item } : { ...existing };
+    keep.reason = mergeReasonText(existing.reason, item.reason);
+    keep.reasonDetail = mergeReasonText(existing.reasonDetail, item.reasonDetail);
+    keep.buyAmt = Math.max(Number(existing.buyAmt || 0), Number(item.buyAmt || 0));
+    keep.sellAmt = Math.max(Number(existing.sellAmt || 0), Number(item.sellAmt || 0));
+    keep.totalAmt = Math.max(Number(existing.totalAmt || 0), Number(item.totalAmt || 0));
+    keep.accumAmount = Math.max(Number(existing.accumAmount || 0), Number(item.accumAmount || 0));
+    byStock.set(key, keep);
+  });
+
+  return Array.from(byStock.values()).sort((a, b) => Math.abs(Number(b.netBuyAmt || 0)) - Math.abs(Number(a.netBuyAmt || 0)));
+};
+
 const AddToWatchlistButton: React.FC<{
   item: models.LongHuBangItem;
   watchlistSet: Set<string>;
@@ -126,9 +160,9 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
     try {
       const result = await GetLongHuBangList(pageSize, page, date);
       if (result) {
-        const newItems = result.items || [];
+        const newItems = mergeLongHuItems(result.items || []);
         if (append) {
-          setItems(prev => [...prev, ...newItems]);
+          setItems(prev => mergeLongHuItems([...prev, ...newItems]));
         } else {
           setItems(newItems);
         }
@@ -143,33 +177,43 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
     }
   };
 
+  const syncLatestTradeDate = async () => {
+    if (!isWailsGoReady()) {
+      warnWailsUnavailable('龙虎榜', 'go');
+      setItems([]);
+      setTradeDates([]);
+      setTradeDate('');
+      setHasMore(false);
+      return;
+    }
+
+    const dates = await GetTradeDates(60);
+    if (!dates || dates.length === 0) {
+      setTradeDates([]);
+      setTradeDate('');
+      setItems([]);
+      setHasMore(false);
+      return;
+    }
+
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const filtered = now.getHours() < 16
+      ? dates.filter(d => d !== todayStr)
+      : dates;
+    if (filtered.length === 0) return;
+
+    const latestDate = filtered[0];
+    setTradeDates(filtered);
+    setTradeDate(latestDate);
+    setPageNumber(1);
+    setHasMore(true);
+    await loadList(1, latestDate, false);
+  };
+
   useEffect(() => {
     if (isOpen) {
-      if (!isWailsGoReady()) {
-        warnWailsUnavailable('龙虎榜', 'go');
-        setItems([]);
-        setTradeDates([]);
-        setTradeDate('');
-        return;
-      }
-      // 先获取交易日列表
-      GetTradeDates(60).then((dates) => {
-        if (dates && dates.length > 0) {
-          // 使用北京时间判断，16点前从列表中排除今天
-          const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
-          const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-          const filtered = now.getHours() < 16
-            ? dates.filter(d => d !== todayStr)
-            : dates;
-          if (filtered.length === 0) return;
-          setTradeDates(filtered);
-          const defaultDate = filtered[0];
-          setTradeDate(defaultDate);
-          setPageNumber(1);
-          setHasMore(true);
-          loadList(1, defaultDate, false);
-        }
-      });
+      syncLatestTradeDate();
       setSelectedItem(null);
       setDetails([]);
       setAddFeedback({});
@@ -217,7 +261,7 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
       <div className="relative w-[950px] h-[700px] fin-panel border fin-divider rounded-xl shadow-2xl flex flex-col overflow-hidden">
         <DialogHeader
           onClose={onClose}
-          onRefresh={() => loadList(1, tradeDate, false)}
+          onRefresh={syncLatestTradeDate}
           loading={loading}
           tradeDate={tradeDate}
           tradeDates={tradeDates}
@@ -597,7 +641,7 @@ const StockHeader: React.FC<{
     </div>
     <div className="mt-3 px-3 py-2 rounded-lg bg-slate-500/5">
       <span className="text-xs fin-text-tertiary">上榜原因: </span>
-      <span className="text-xs fin-text-secondary">{item.reason}</span>
+      <span className="text-xs fin-text-secondary leading-relaxed">{item.reason}</span>
     </div>
   </div>
 );

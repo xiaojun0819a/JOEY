@@ -5,8 +5,12 @@ import (
 	"path/filepath"
 )
 
-// GetDataDir 获取应用数据目录
+// GetDataDir 获取应用数据目录。
+// 优先读环境变量 JCP_DATA_DIR(headless/NAS 部署用它把数据落到 /volume1)。
 func GetDataDir() string {
+	if d := os.Getenv("JCP_DATA_DIR"); d != "" {
+		return d
+	}
 	userConfigDir, err := os.UserConfigDir()
 	if err != nil || userConfigDir == "" {
 		return filepath.Join(".", "data")

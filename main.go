@@ -1,3 +1,5 @@
+//go:build !headless
+
 package main
 
 import (
@@ -14,9 +16,6 @@ import (
 
 //go:embed all:frontend/dist
 var assets embed.FS
-
-// Version 版本号，通过 ldflags 注入
-var Version = "dev"
 
 func main() {
 	// 捕获 panic 并写入日志文件

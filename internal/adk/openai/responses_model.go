@@ -35,11 +35,12 @@ type ResponsesModel struct {
 	baseURL      string
 	apiKey       string
 	modelName    string
+	fallback     model.LLM
 	NoSystemRole bool // 不支持 system role 时需要降级处理
 }
 
 // NewResponsesModel 创建 Responses API 模型
-func NewResponsesModel(modelName, apiKey, baseURL string, httpClient HTTPDoer, noSystemRole bool) *ResponsesModel {
+func NewResponsesModel(modelName, apiKey, baseURL string, httpClient HTTPDoer, fallback model.LLM, noSystemRole bool) *ResponsesModel {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -48,6 +49,7 @@ func NewResponsesModel(modelName, apiKey, baseURL string, httpClient HTTPDoer, n
 		baseURL:      strings.TrimRight(baseURL, "/"),
 		apiKey:       apiKey,
 		modelName:    modelName,
+		fallback:     fallback,
 		NoSystemRole: noSystemRole,
 	}
 }
@@ -112,6 +114,9 @@ func (r *ResponsesModel) generate(ctx context.Context, req *model.LLMRequest) it
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 			respBody, _ := io.ReadAll(resp.Body)
+			if r.tryFallback(ctx, req, false, resp.StatusCode, respBody, yield) {
+				return
+			}
 			yield(nil, fmt.Errorf("Responses API 错误 (HTTP %d): %s", resp.StatusCode, string(respBody)))
 			return
 		}
@@ -156,12 +161,59 @@ func (r *ResponsesModel) generateStream(ctx context.Context, req *model.LLMReque
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 			respBody, _ := io.ReadAll(resp.Body)
+			if r.tryFallback(ctx, req, true, resp.StatusCode, respBody, yield) {
+				return
+			}
 			yield(nil, fmt.Errorf("Responses API 流式错误 (HTTP %d): %s", resp.StatusCode, string(respBody)))
 			return
 		}
 
 		r.processResponsesStream(resp.Body, yield)
 	}
+}
+
+func (r *ResponsesModel) tryFallback(
+	ctx context.Context,
+	req *model.LLMRequest,
+	stream bool,
+	statusCode int,
+	respBody []byte,
+	yield func(*model.LLMResponse, error) bool,
+) bool {
+	if r.fallback == nil || !isResponsesFallbackable(statusCode, respBody) {
+		return false
+	}
+
+	respLog.Warn("Responses API 不可用，自动回退到 Chat Completions (HTTP %d): %s", statusCode, compactErrorBody(respBody))
+	for resp, err := range r.fallback.GenerateContent(ctx, req, stream) {
+		if !yield(resp, err) {
+			return true
+		}
+	}
+	return true
+}
+
+func isResponsesFallbackable(statusCode int, respBody []byte) bool {
+	switch statusCode {
+	case http.StatusForbidden:
+		body := bytes.ToLower(respBody)
+		return bytes.Contains(body, []byte("channel_not_configured")) ||
+			bytes.Contains(body, []byte("channel not configured")) ||
+			bytes.Contains(body, []byte("不支持当前参数组合")) ||
+			bytes.Contains(body, []byte("当前均不可用"))
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
+		return true
+	default:
+		return false
+	}
+}
+
+func compactErrorBody(respBody []byte) string {
+	body := strings.TrimSpace(string(respBody))
+	if len(body) <= 240 {
+		return body
+	}
+	return body[:240] + "..."
 }
 
 // processResponsesStream 处理 Responses API 的 SSE 流

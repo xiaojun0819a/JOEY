@@ -54,6 +54,13 @@ func (ms *MarketService) fetchStockDataWithFallback(codes ...string) ([]StockWit
 }
 
 func (ms *MarketService) fetchKLineDataWithFallback(code string, period string, days int) ([]models.KLineData, error) {
+	// 日线优先腾讯（又快又稳，~0.4s），避免主源(通达信)超时后硬走慢新浪(~10s/只)
+	if period == "1d" {
+		if data, err := ms.fetchKLineDataFromTencent(code, period, days); err == nil && len(data) > 0 {
+			return data, nil
+		}
+	}
+
 	if ms.primaryProvider != nil {
 		data, err := ms.primaryProvider.FetchKLineData(code, period, days)
 		if err == nil && len(data) > 0 {

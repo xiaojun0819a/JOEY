@@ -233,3 +233,38 @@ export function calculateKDJ(
 
   return { k: kResult, d: dResult, j: jResult };
 }
+
+/** CCI 顺势指标：(TP - SMA(TP,n)) / (0.015 * 平均绝对偏差) */
+export function calculateCCI(data: KLineData[], period = 14): LineData[] {
+  const result: LineData[] = [];
+  if (data.length < period) return result;
+  const tp = data.map(d => (d.high + d.low + d.close) / 3);
+  for (let i = period - 1; i < data.length; i++) {
+    let sum = 0;
+    for (let j = i - period + 1; j <= i; j++) sum += tp[j];
+    const ma = sum / period;
+    let mad = 0;
+    for (let j = i - period + 1; j <= i; j++) mad += Math.abs(tp[j] - ma);
+    mad /= period;
+    const cci = mad === 0 ? 0 : (tp[i] - ma) / (0.015 * mad);
+    result.push({ time: parseTime(data[i].time), value: cci });
+  }
+  return result;
+}
+
+/** WR 威廉指标(%R)：(HHV - C) / (HHV - LLV) * -100，范围 -100~0 */
+export function calculateWR(data: KLineData[], period = 14): LineData[] {
+  const result: LineData[] = [];
+  if (data.length < period) return result;
+  for (let i = period - 1; i < data.length; i++) {
+    let hh = -Infinity;
+    let ll = Infinity;
+    for (let j = i - period + 1; j <= i; j++) {
+      if (data[j].high > hh) hh = data[j].high;
+      if (data[j].low < ll) ll = data[j].low;
+    }
+    const wr = hh === ll ? 0 : ((hh - data[i].close) / (hh - ll)) * -100;
+    result.push({ time: parseTime(data[i].time), value: wr });
+  }
+  return result;
+}

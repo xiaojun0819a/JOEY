@@ -353,7 +353,8 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
     : expandedPanelHeight;
 
   const computed = useMemo(() => {
-    const signals = period === '1m'
+    const isMinuteTrendPeriod = period === '1m' || period === '5d';
+    const signals = isMinuteTrendPeriod
       ? calculateIntradayTradingSignals(kLineData, stock.preClose || 0)
       : calculateTradingSignals(kLineData);
     const latestSignal = getLatestTradingSignal(signals);
@@ -414,8 +415,7 @@ const ModelRadarStrip: React.FC<ModelRadarStripProps> = ({
 
     const klineTs = parseLocalDateTime(latestBarTime);
     const klineMins = minutesAgo(klineTs);
-    const isIntraday = period === '1m';
-    const klineFresh = klineFreshnessLabel(klineMins, isIntraday, marketStatusCode);
+    const klineFresh = klineFreshnessLabel(klineMins, isMinuteTrendPeriod, marketStatusCode);
 
     const quoteFresh = stock.price > 0 && stock.volume > 0;
 

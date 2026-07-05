@@ -252,6 +252,15 @@ func (o *OpenAIModel) processStream(stream *openai.ChatCompletionStream, yield f
 		return
 	}
 
+	// 网关中途断流在客户端表现为 io.EOF，与正常结束无法区分——但正规结束一定先收到 finish_reason。
+	// 没收到 finish_reason 就 EOF，说明流被网关掐断、内容是截断的，必须报错让上层重试，
+	// 否则半截报告会被当成功返回(实测 lk888 偶发在 2 分钟左右断流，报告拦腰截断)。
+	if finishReason == "" {
+		modelLog.Warn("模型 [%s] 流在未收到 finish_reason 时结束，判定为网关断流(已收 %d 字)，报错触发重试", o.ModelName, len(textContent))
+		yield(nil, fmt.Errorf("流式响应被中途截断(未收到 finish_reason，已收 %d 字符)", len(textContent)))
+		return
+	}
+
 	finalResp := &model.LLMResponse{
 		Content:       aggregatedContent,
 		UsageMetadata: usageMetadata,

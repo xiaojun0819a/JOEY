@@ -10,7 +10,7 @@ import (
 	"github.com/run-bigpig/jcp/internal/logger"
 	"github.com/run-bigpig/jcp/internal/models"
 
-	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/run-bigpig/jcp/internal/rt"
 )
 
 var pusherLog = logger.New("pusher")
@@ -48,7 +48,7 @@ func safeCall(fn func()) {
 // KLineSubscription K线订阅信息
 type KLineSubscription struct {
 	Code   string // 股票代码
-	Period string // K线周期: 1m, 1d, 1w, 1mo
+	Period string // K线周期: 1m, 5d, 1d, 1w, 1mo
 }
 
 // MarketDataPusher 市场数据推送服务
@@ -134,15 +134,15 @@ func (p *MarketDataPusher) Stop() {
 	p.stopped = true
 	close(p.stopChan)
 	// 清理事件监听
-	runtime.EventsOff(p.ctx, EventMarketSubscribe)
-	runtime.EventsOff(p.ctx, EventOrderBookSubscribe)
-	runtime.EventsOff(p.ctx, EventKLineSubscribe)
+	rt.Off(EventMarketSubscribe)
+	rt.Off(EventOrderBookSubscribe)
+	rt.Off(EventKLineSubscribe)
 }
 
 // setupEventListeners 设置事件监听
 func (p *MarketDataPusher) setupEventListeners() {
 	// 监听订阅请求
-	runtime.EventsOn(p.ctx, EventMarketSubscribe, func(data ...any) {
+	rt.On(EventMarketSubscribe, func(data ...any) {
 		if len(data) > 0 {
 			if codes, ok := data[0].([]any); ok {
 				p.updateSubscriptions(codes)
@@ -151,7 +151,7 @@ func (p *MarketDataPusher) setupEventListeners() {
 	})
 
 	// 监听盘口订阅请求
-	runtime.EventsOn(p.ctx, EventOrderBookSubscribe, func(data ...any) {
+	rt.On(EventOrderBookSubscribe, func(data ...any) {
 		if len(data) > 0 {
 			if code, ok := data[0].(string); ok {
 				p.mu.Lock()
@@ -162,7 +162,7 @@ func (p *MarketDataPusher) setupEventListeners() {
 	})
 
 	// 监听K线订阅请求
-	runtime.EventsOn(p.ctx, EventKLineSubscribe, func(data ...any) {
+	rt.On(EventKLineSubscribe, func(data ...any) {
 		if len(data) >= 2 {
 			code, _ := data[0].(string)
 			period, _ := data[1].(string)
@@ -342,7 +342,7 @@ func (p *MarketDataPusher) pushStockData() {
 	}
 
 	// 推送到前端
-	runtime.EventsEmit(p.ctx, EventStockUpdate, stocks)
+	rt.Emit(EventStockUpdate, stocks)
 }
 
 // pushOrderBookData 推送盘口数据（带diff检测）
@@ -371,7 +371,7 @@ func (p *MarketDataPusher) pushOrderBookData() {
 	p.lastOrderBookHash = hash
 	p.mu.Unlock()
 
-	runtime.EventsEmit(p.ctx, EventOrderBookUpdate, orderBook)
+	rt.Emit(EventOrderBookUpdate, orderBook)
 }
 
 // pushTelegraphData 推送快讯数据
@@ -398,7 +398,7 @@ func (p *MarketDataPusher) pushTelegraphData() {
 	p.mu.Unlock()
 
 	// 推送到前端
-	runtime.EventsEmit(p.ctx, EventTelegraphUpdate, latest)
+	rt.Emit(EventTelegraphUpdate, latest)
 }
 
 // pushMarketIndices 推送大盘指数
@@ -407,7 +407,7 @@ func (p *MarketDataPusher) pushMarketIndices() {
 	if err != nil {
 		return
 	}
-	runtime.EventsEmit(p.ctx, EventMarketIndicesUpdate, indices)
+	rt.Emit(EventMarketIndicesUpdate, indices)
 }
 
 // pushKLineData 推送K线数据（初始化时调用）
@@ -420,16 +420,27 @@ func (p *MarketDataPusher) pushKLineData() {
 		return
 	}
 
-	klines, err := p.marketService.GetKLineData(sub.Code, sub.Period, 240)
+	klines, err := p.marketService.GetKLineData(sub.Code, sub.Period, klinePushRequestLength(sub.Period))
 	if err != nil {
 		return
 	}
 
-	runtime.EventsEmit(p.ctx, EventKLineUpdate, map[string]any{
+	rt.Emit(EventKLineUpdate, map[string]any{
 		"code":   sub.Code,
 		"period": sub.Period,
 		"data":   klines,
 	})
+}
+
+func klinePushRequestLength(period string) int {
+	switch period {
+	case "5d":
+		return 1250
+	case "1m":
+		return 250
+	default:
+		return 240
+	}
 }
 
 // pushKLineMinute 推送分时K线（增量模式，仅推送最新1根）
@@ -459,7 +470,7 @@ func (p *MarketDataPusher) pushKLineMinute() {
 
 	// 首次或时间变化才推送
 	if lastTime == 0 || latestTime != lastTime {
-		runtime.EventsEmit(p.ctx, EventKLineUpdate, map[string]any{
+		rt.Emit(EventKLineUpdate, map[string]any{
 			"code":        sub.Code,
 			"period":      "1m",
 			"data":        []models.KLineData{latest},
@@ -488,14 +499,14 @@ func orderBookHash(ob models.OrderBook) string {
 	return fmt.Sprintf("%.2f:%.0f:%.2f:%.0f", b1Price, b1Size, a1Price, a1Size)
 }
 
-// pushKLineDay 推送日/周/月K线（5分钟间隔，仅当订阅周期非1m时推送）
+// pushKLineDay 推送日/周/月K线（5分钟间隔，仅当订阅周期非分钟走势时推送）
 func (p *MarketDataPusher) pushKLineDay() {
 	p.klineSubMu.RLock()
 	sub := p.klineSub
 	p.klineSubMu.RUnlock()
 
 	// 仅推送日K/周K/月K
-	if sub.Code == "" || sub.Period == "1m" {
+	if sub.Code == "" || sub.Period == "1m" || sub.Period == "5d" {
 		return
 	}
 
@@ -504,7 +515,7 @@ func (p *MarketDataPusher) pushKLineDay() {
 		return
 	}
 
-	runtime.EventsEmit(p.ctx, EventKLineUpdate, map[string]any{
+	rt.Emit(EventKLineUpdate, map[string]any{
 		"code":   sub.Code,
 		"period": sub.Period,
 		"data":   klines,

@@ -37,33 +37,33 @@ export const OrderBook: React.FC<OrderBookProps> = ({
   if (compact) {
     return (
       <div className={`h-full w-full fin-panel-soft border fin-divider rounded-md overflow-hidden text-[10px] font-mono select-none ${className}`}>
-        <div className="h-full grid grid-cols-[1fr_auto_1fr]">
-          <div className="px-1.5 py-1 border-r fin-divider">
-            <div className={`text-[9px] mb-0.5 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>买盘</div>
+        <div className="h-full grid grid-cols-[minmax(116px,1fr)_64px_minmax(116px,1fr)]">
+          <div className="px-2 py-1 border-r fin-divider">
+            <div className={`mb-0.5 text-center text-[9px] leading-3 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>买盘</div>
             {bids.slice(0, levelCount).map((bid, i) => (
-              <div key={`compact-bid-${i}`} className="flex items-center justify-between leading-4">
-                <span className={colors.isDark ? 'text-slate-500' : 'text-slate-400'}>{`买${i + 1}`}</span>
-                <span className={cc.downClass}>{bid.price.toFixed(2)}</span>
-                <span className={colors.isDark ? 'text-slate-300' : 'text-slate-600'}>{bid.size}</span>
+              <div key={`compact-bid-${i}`} className="grid grid-cols-[22px_56px_1fr] items-center gap-0.5 leading-4">
+                <span className={`text-left ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>{`买${i + 1}`}</span>
+                <span className={`text-center tabular-nums ${cc.downClass}`}>{bid.price.toFixed(2)}</span>
+                <span className={`text-right tabular-nums ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>{bid.size}</span>
               </div>
             ))}
           </div>
 
-          <div className="w-16 px-1 py-1 border-r fin-divider fin-panel-strong flex flex-col items-center justify-center leading-4">
-            <span className={colors.isDark ? 'text-slate-500' : 'text-slate-400'}>委比</span>
-            <span className={`font-bold ${parseFloat(weibi) >= 0 ? cc.upClass : cc.downClass}`}>{weibi}%</span>
-            <span className={colors.isDark ? 'text-slate-500' : 'text-slate-400'}>
+          <div className={`px-1 py-1 border-r fin-divider fin-panel-strong flex flex-col items-center justify-center leading-4 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+            <span>委比</span>
+            <span className={`font-bold tabular-nums ${parseFloat(weibi) >= 0 ? cc.upClass : cc.downClass}`}>{weibi}%</span>
+            <span className="whitespace-nowrap tabular-nums">
               <span className={cc.upClass}>{weibiBuy}</span>/<span className={cc.downClass}>{weibiSell}</span>
             </span>
           </div>
 
-          <div className="px-1.5 py-1">
-            <div className={`text-[9px] mb-0.5 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>卖盘</div>
+          <div className="px-2 py-1">
+            <div className={`mb-0.5 text-center text-[9px] leading-3 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>卖盘</div>
             {asks.slice(0, levelCount).map((ask, i) => (
-              <div key={`compact-ask-${i}`} className="flex items-center justify-between leading-4">
-                <span className={colors.isDark ? 'text-slate-500' : 'text-slate-400'}>{`卖${i + 1}`}</span>
-                <span className={cc.upClass}>{ask.price.toFixed(2)}</span>
-                <span className={colors.isDark ? 'text-slate-300' : 'text-slate-600'}>{ask.size}</span>
+              <div key={`compact-ask-${i}`} className="grid grid-cols-[22px_56px_1fr] items-center gap-0.5 leading-4">
+                <span className={`text-left ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>{`卖${i + 1}`}</span>
+                <span className={`text-center tabular-nums ${cc.upClass}`}>{ask.price.toFixed(2)}</span>
+                <span className={`text-right tabular-nums ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>{ask.size}</span>
               </div>
             ))}
           </div>

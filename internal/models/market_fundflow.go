@@ -27,6 +27,48 @@ type BoardFundFlowList struct {
 	UpdateTime string              `json:"updateTime,omitempty"`
 }
 
+// BoardFundFlowOverview 板块主力净流入概览（流入/流出双榜）
+type BoardFundFlowOverview struct {
+	Category         string              `json:"category"`
+	NetMainInflow    float64             `json:"netMainInflow"`
+	StrongestInflow  *BoardFundFlowItem  `json:"strongestInflow,omitempty"`
+	StrongestOutflow *BoardFundFlowItem  `json:"strongestOutflow,omitempty"`
+	Inflow           []BoardFundFlowItem `json:"inflow"`
+	Outflow          []BoardFundFlowItem `json:"outflow"`
+	UpdateTime       string              `json:"updateTime,omitempty"`
+}
+
+// BoardFundFlowTrackItem 板块主力资金实时追踪曲线条目
+type BoardFundFlowTrackItem struct {
+	Rank                int             `json:"rank"`
+	Code                string          `json:"code"`
+	Name                string          `json:"name"`
+	Category            string          `json:"category"`
+	Side                string          `json:"side"` // inflow/outflow
+	ChangePercent       float64         `json:"changePercent"`
+	MainNetInflow       float64         `json:"mainNetInflow"`
+	LatestMainNetInflow float64         `json:"latestMainNetInflow"`
+	KLines              []FundFlowKLine `json:"klines"`
+	UpdateTime          string          `json:"updateTime,omitempty"`
+}
+
+// BoardFundFlowTracking 板块主力资金实时追踪结果
+type BoardFundFlowTracking struct {
+	Category       string                   `json:"category"`
+	Source         string                   `json:"source,omitempty"`
+	TradeDate      string                   `json:"tradeDate,omitempty"`
+	TradeTime      string                   `json:"tradeTime,omitempty"`
+	UpdateTime     string                   `json:"updateTime,omitempty"`
+	TotalAmount    float64                  `json:"totalAmount,omitempty"`
+	UpCount        int                      `json:"upCount,omitempty"`
+	DownCount      int                      `json:"downCount,omitempty"`
+	LimitUpCount   int                      `json:"limitUpCount,omitempty"`
+	LimitDownCount int                      `json:"limitDownCount,omitempty"`
+	Inflow         []BoardFundFlowTrackItem `json:"inflow"`
+	Outflow        []BoardFundFlowTrackItem `json:"outflow"`
+	Warning        string                   `json:"warning,omitempty"`
+}
+
 // BoardLeaderItem 板块龙头候选
 type BoardLeaderItem struct {
 	Rank               int     `json:"rank"`
@@ -74,6 +116,29 @@ type StockMoveList struct {
 	Items      []StockMoveItem `json:"items"`
 	Total      int64           `json:"total,omitempty"`
 	UpdateTime string          `json:"updateTime,omitempty"`
+}
+
+// MarketChangeBin 全A涨跌分布分桶
+type MarketChangeBin struct {
+	Key    string  `json:"key"`
+	Label  string  `json:"label"`
+	Side   string  `json:"side"` // up/down/flat
+	Count  int     `json:"count"`
+	MinPct float64 `json:"minPct,omitempty"`
+	MaxPct float64 `json:"maxPct,omitempty"`
+}
+
+// MarketChangeDistribution 全A涨跌分布
+type MarketChangeDistribution struct {
+	Total          int               `json:"total"`
+	UpCount        int               `json:"upCount"`
+	DownCount      int               `json:"downCount"`
+	FlatCount      int               `json:"flatCount"`
+	LimitUpCount   int               `json:"limitUpCount"`
+	LimitDownCount int               `json:"limitDownCount"`
+	Bins           []MarketChangeBin `json:"bins"`
+	UpdateTime     string            `json:"updateTime,omitempty"`
+	Source         string            `json:"source,omitempty"`
 }
 
 // FundFlowKLine 资金流曲线单点

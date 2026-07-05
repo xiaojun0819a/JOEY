@@ -135,7 +135,7 @@ func (p *tdxMarketProvider) FetchKLineData(code string, period string, days int)
 
 	var resp *protocol.KlineResp
 	switch period {
-	case "1m":
+	case "1m", "5d":
 		resp, err = cli.GetKlineMinuteAll(code)
 	case "1d":
 		resp, err = cli.GetKlineDayAll(code)
@@ -160,7 +160,7 @@ func (p *tdxMarketProvider) FetchKLineData(code string, period string, days int)
 	klines := make([]models.KLineData, 0, len(resp.List))
 	for _, item := range resp.List {
 		timeValue := item.Time.Format("2006-01-02")
-		if period == "1m" {
+		if period == "1m" || period == "5d" {
 			timeValue = item.Time.Format("2006-01-02 15:04:05")
 		}
 		klines = append(klines, models.KLineData{
@@ -178,6 +178,12 @@ func (p *tdxMarketProvider) FetchKLineData(code string, period string, days int)
 		klines = filterTodayKLines(klines)
 		klines = trimKLines(klines, days)
 		klines = calculateAvgLineByLotVolume(klines)
+		return klines, nil
+	}
+	if period == "5d" {
+		klines = filterRecentTradingDayKLines(klines, 5)
+		klines = trimKLines(klines, days)
+		klines = calculateAvgLineByLotVolumePerDay(klines)
 		return klines, nil
 	}
 
@@ -459,6 +465,37 @@ func calculateAvgLineByLotVolume(klines []models.KLineData) []models.KLineData {
 	var totalVolume int64
 
 	for i := range klines {
+		totalAmount += klines[i].Amount
+		totalVolume += klines[i].Volume
+		if totalVolume > 0 {
+			// TDX 分时成交量单位是“手”，换算成股后再计算均价。
+			klines[i].Avg = totalAmount / float64(totalVolume*100)
+		}
+	}
+
+	return klines
+}
+
+func calculateAvgLineByLotVolumePerDay(klines []models.KLineData) []models.KLineData {
+	if len(klines) == 0 {
+		return klines
+	}
+
+	var totalAmount float64
+	var totalVolume int64
+	currentDate := ""
+
+	for i := range klines {
+		date := klines[i].Time
+		if len(date) >= 10 {
+			date = date[:10]
+		}
+		if date != currentDate {
+			currentDate = date
+			totalAmount = 0
+			totalVolume = 0
+		}
+
 		totalAmount += klines[i].Amount
 		totalVolume += klines[i].Volume
 		if totalVolume > 0 {

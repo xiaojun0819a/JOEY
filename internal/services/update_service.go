@@ -12,7 +12,7 @@ import (
 	"github.com/blang/semver"
 	"github.com/run-bigpig/go-github-selfupdate/selfupdate"
 	"github.com/run-bigpig/jcp/internal/logger"
-	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/run-bigpig/jcp/internal/rt"
 )
 
 var updateLog = logger.New("update")
@@ -126,7 +126,7 @@ func (u *UpdateService) emitProgress(status, message string, percent int) {
 		Message: message,
 		Percent: percent,
 	}
-	wailsruntime.EventsEmit(u.ctx, "update:progress", progress)
+	rt.Emit("update:progress", progress)
 }
 
 // Update 执行更新（下载并替换当前可执行文件）

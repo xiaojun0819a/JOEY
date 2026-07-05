@@ -67,7 +67,7 @@ func (r *Registry) registerAllTools() {
 	r.registerTool("get_board_leaders", "获取板块龙头候选（综合涨跌幅与主力资金评分）", r.createBoardLeadersTool)
 
 	// 注册K线数据工具
-	r.registerTool("get_kline_data", "获取股票K线数据，支持5分钟线、日线、周线、月线", r.createKLineTool)
+	r.registerTool("get_kline_data", "获取股票K线数据，支持分时、5日走势、日线、周线、月线", r.createKLineTool)
 
 	// 注册盘口数据工具
 	r.registerTool("get_orderbook", "获取股票五档盘口数据，包括买卖五档价格和数量", r.createOrderBookTool)
@@ -117,6 +117,9 @@ func (r *Registry) registerAllTools() {
 
 	// 注册龙虎榜营业部明细工具
 	r.registerTool("get_longhubang_detail", "获取个股龙虎榜营业部买卖明细，需要提供股票代码和交易日期", r.createLongHuBangDetailTool)
+
+	// 注册筹码分布工具（由K线估算：平均成本/套牢比例/集中度）
+	r.registerTool("get_chip_distribution", "估算个股筹码分布（平均成本/获利套牢比例/成本区间集中度/主要套牢区）", r.createChipDistTool)
 }
 
 // registerTool 注册单个工具并保存信息

@@ -169,6 +169,10 @@ func (b *ExpertAgentBuilder) buildInstructionWithContext(config *models.AgentCon
 你的分析任务: %s
 
 请结合以上引用的观点，发表你的专业看法。可以赞同、补充或反驳。回复控制在150字以内。`, replyContent, query)
+	} else if isFullReportTask(query) {
+		prompt += fmt.Sprintf(`你的分析任务: %s
+
+请按任务要求输出完整报告，不要压缩，不受150字限制；关键数字必须具体，数据不可得就明确写“数据不可得”。`, query)
 	} else {
 		prompt += fmt.Sprintf(`你的分析任务: %s
 
@@ -176,6 +180,18 @@ func (b *ExpertAgentBuilder) buildInstructionWithContext(config *models.AgentCon
 	}
 
 	return prompt
+}
+
+func isFullReportTask(query string) bool {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return false
+	}
+	return strings.Contains(q, "完整版看板报告") ||
+		strings.Contains(q, "完整报告") ||
+		strings.Contains(q, "不受150字限制") ||
+		strings.Contains(q, "不要压缩") ||
+		strings.Contains(q, "完整框架输出")
 }
 
 // buildToolsDescription 构建可用工具说明

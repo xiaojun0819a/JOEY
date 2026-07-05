@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -211,7 +212,7 @@ func (ss *SessionService) ClearMessages(stockCode string) error {
 }
 
 // UpdatePosition 更新持仓信息
-func (ss *SessionService) UpdatePosition(stockCode string, shares int64, costPrice float64) error {
+func (ss *SessionService) UpdatePosition(stockCode string, shares int64, costPrice float64, buyDate string) error {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
@@ -229,9 +230,51 @@ func (ss *SessionService) UpdatePosition(stockCode string, shares int64, costPri
 	session.Position = &models.StockPosition{
 		Shares:    shares,
 		CostPrice: costPrice,
+		BuyDate:   strings.TrimSpace(buyDate),
 	}
 	session.UpdatedAt = time.Now().UnixMilli()
 	return ss.saveSession(session)
+}
+
+// ListPositions 列出所有持仓（Shares>0）的股票，扫描 sessions 目录。
+func (ss *SessionService) ListPositions() []models.HeldPosition {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	entries, err := os.ReadDir(ss.sessionsDir)
+	if err != nil {
+		return nil
+	}
+	out := make([]models.HeldPosition, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		code := strings.TrimSuffix(e.Name(), ".json")
+		session, ok := ss.sessions[code]
+		if !ok {
+			loaded, err := ss.loadSession(code)
+			if err != nil {
+				continue
+			}
+			ss.sessions[code] = loaded
+			session = loaded
+		}
+		if session == nil || session.Position == nil || session.Position.Shares <= 0 {
+			continue
+		}
+		if _, dup := seen[code]; dup {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, models.HeldPosition{
+			StockCode: session.StockCode,
+			StockName: session.StockName,
+			Position:  *session.Position,
+		})
+	}
+	return out
 }
 
 // GetPosition 获取持仓信息

@@ -18,6 +18,7 @@ export interface Stock {
 export interface StockPosition {
   shares: number;    // 持仓数量
   costPrice: number; // 成本价
+  buyDate?: string;  // 买入日期 YYYY-MM-DD
 }
 
 export interface KLineData {
@@ -79,7 +80,7 @@ export interface ChatMessage {
 // 消息类型
 export type MsgType = 'opening' | 'opinion' | 'summary';
 
-export type TimePeriod = '1m' | '1d' | '1w' | '1mo';
+export type TimePeriod = '1m' | '5d' | '1d' | '1w' | '1mo';
 
 // 快讯数据结构
 export interface Telegraph {

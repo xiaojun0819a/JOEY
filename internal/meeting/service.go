@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -220,6 +222,9 @@ type ChatRequest struct {
 	CoreContext  string                `json:"coreContext"`
 	AllAgents    []models.AgentConfig  `json:"allAgents"` // 所有可用专家（智能模式用）
 	Position     *models.StockPosition `json:"position"`  // 用户持仓信息
+	Battle       bool                  `json:"battle"`    // 一键Battle：并行结束后追加比分裁决
+	AgentTimeout time.Duration         `json:"-"`         // 内部用途：单个专家超时，默认使用 AgentTimeout
+	Progress     ProgressCallback      `json:"-"`         // 内部用途：非 nil 时启用流式(SSE)。长输出必须流式——AI网关对非流式响应有约5分钟硬超时
 }
 
 // 会议模式常量
@@ -598,7 +603,66 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 	var roundOneHistory []DiscussionEntry
 	var roundTwoHistory []DiscussionEntry
 
-	// ---------- R1: 独立陈述 ----------
+	// ---------- R1: 独立陈述（并行，互不影响，wall-time 取最慢者而非累加） ----------
+	roundCoreContext := req.CoreContext
+	if memoryContext != "" {
+		roundCoreContext = strings.TrimSpace(memoryContext + "\n\n" + roundCoreContext)
+	}
+
+	type r1Out struct {
+		content string
+		err     error
+	}
+	r1Outs := make([]r1Out, len(selectedAgents))
+
+	emitProgress(progressCallback, ProgressEvent{
+		Type: "agent_start", AgentID: "round1", AgentName: "第一轮",
+		Detail: fmt.Sprintf("%d 位专家并行独立陈述中…", len(selectedAgents)),
+	})
+
+	var r1wg sync.WaitGroup
+	for i, agentCfg := range selectedAgents {
+		r1wg.Add(1)
+		go func(i int, agentCfg models.AgentConfig) {
+			defer r1wg.Done()
+			select {
+			case <-meetingCtx.Done():
+				r1Outs[i] = r1Out{err: meetingCtx.Err()}
+				return
+			default:
+			}
+			agentAIConfig := s.resolveAgentAIConfig(&agentCfg, aiConfig)
+			agentLLM, cErr := s.modelFactory.CreateModel(meetingCtx, agentAIConfig)
+			if cErr != nil {
+				r1Outs[i] = r1Out{err: fmt.Errorf("create agent LLM error: %w", cErr)}
+				return
+			}
+			builder := s.createBuilder(agentLLM, agentAIConfig)
+
+			agentQuery := req.Query
+			if decision.Tasks != nil {
+				if task, ok := decision.Tasks[agentCfg.ID]; ok && task != "" {
+					agentQuery = task
+				}
+			}
+			roundPrompt := buildRoundOnePrompt(agentQuery)
+
+			// 并行阶段不透传细粒度进度回调，避免多专家流式/工具事件相互串扰
+			content, rErr := retryRun(meetingCtx, s.retryCount, func() (string, error) {
+				agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
+				defer agentCancel()
+				return s.runSingleAgent(agentCtx, builder, &agentCfg, &req.Stock, roundPrompt, "", roundCoreContext, nil, req.Position)
+			})
+			r1Outs[i] = r1Out{content: content, err: rErr}
+		}(i, agentCfg)
+	}
+	r1wg.Wait()
+
+	emitProgress(progressCallback, ProgressEvent{
+		Type: "agent_done", AgentID: "round1", AgentName: "第一轮",
+	})
+
+	// 顺序处理并行结果：保留失败缓存/中断恢复语义不变
 	for i, agentCfg := range selectedAgents {
 		select {
 		case <-meetingCtx.Done():
@@ -607,37 +671,7 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 		default:
 		}
 
-		log.Debug("round1 agent %d/%d: %s starting", i+1, len(selectedAgents), agentCfg.Name)
-		agentAIConfig := s.resolveAgentAIConfig(&agentCfg, aiConfig)
-		agentLLM, err := s.modelFactory.CreateModel(meetingCtx, agentAIConfig)
-		if err != nil {
-			log.Error("create agent LLM error: %v", err)
-			continue
-		}
-		builder := s.createBuilder(agentLLM, agentAIConfig)
-
-		emitProgress(progressCallback, ProgressEvent{
-			Type: "agent_start", AgentID: agentCfg.ID, AgentName: agentCfg.Name, Detail: "第一轮·独立陈述",
-		})
-
-		agentQuery := req.Query
-		if decision.Tasks != nil {
-			if task, ok := decision.Tasks[agentCfg.ID]; ok && task != "" {
-				agentQuery = task
-			}
-		}
-		roundPrompt := buildRoundOnePrompt(agentQuery)
-
-		roundCoreContext := req.CoreContext
-		if memoryContext != "" {
-			roundCoreContext = strings.TrimSpace(memoryContext + "\n\n" + roundCoreContext)
-		}
-
-		content, err := retryRun(meetingCtx, s.retryCount, func() (string, error) {
-			agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
-			defer agentCancel()
-			return s.runSingleAgent(agentCtx, builder, &agentCfg, &req.Stock, roundPrompt, "", roundCoreContext, progressCallback, req.Position)
-		})
+		content, err := r1Outs[i].content, r1Outs[i].err
 
 		if err != nil {
 			emitProgress(progressCallback, ProgressEvent{
@@ -959,9 +993,18 @@ func (s *Service) runAgentsParallel(ctx context.Context, defaultLLM model.LLM, d
 		mu        sync.Mutex
 		responses []ChatResponse
 	)
+	agentTimeout := req.AgentTimeout
+	if agentTimeout <= 0 {
+		agentTimeout = AgentTimeout
+	}
 
-	// 设置整体超时
-	parallelCtx, cancel := context.WithTimeout(ctx, MeetingTimeout)
+	// 设置整体超时；调用方指定了更长的单专家超时(如看板完整报告15分钟)时，总闸也要跟着放大，
+	// 否则 MeetingTimeout(10分钟) 会先掐掉长任务
+	overall := MeetingTimeout
+	if agentTimeout+2*time.Minute > overall {
+		overall = agentTimeout + 2*time.Minute
+	}
+	parallelCtx, cancel := context.WithTimeout(ctx, overall)
 	defer cancel()
 
 	log.Debug("running %d agents in parallel", len(req.Agents))
@@ -990,9 +1033,9 @@ func (s *Service) runAgentsParallel(ctx context.Context, defaultLLM model.LLM, d
 
 			// 单个 Agent 带指数退避重试
 			content, err := retryRun(parallelCtx, s.retryCount, func() (string, error) {
-				agentCtx, agentCancel := context.WithTimeout(parallelCtx, AgentTimeout)
+				agentCtx, agentCancel := context.WithTimeout(parallelCtx, agentTimeout)
 				defer agentCancel()
-				return s.runSingleAgent(agentCtx, builder, &cfg, &req.Stock, req.Query, req.ReplyContent, req.CoreContext, nil, req.Position)
+				return s.runSingleAgent(agentCtx, builder, &cfg, &req.Stock, req.Query, req.ReplyContent, req.CoreContext, req.Progress, req.Position)
 			})
 			if err != nil {
 				log.Error("agent %s failed after retries: %v", cfg.ID, err)
@@ -1190,20 +1233,37 @@ func buildRoundOnePrompt(baseQuery string) string {
 }
 
 func buildChallengePrompt(challenge DebateChallenge, baseQuery string, roundOneHistory []DiscussionEntry) string {
+	// 取出被质疑方(自己)的第一轮结论，逼真正针对其具体论点交锋
+	var ownView string
+	var others []DiscussionEntry
+	for _, entry := range roundOneHistory {
+		if entry.AgentID == challenge.TargetID {
+			ownView = entry.Content
+		} else {
+			others = append(others, entry)
+		}
+	}
+
 	var sb strings.Builder
 	sb.WriteString("【第二轮：交叉质疑（强制交锋）】\n")
-	sb.WriteString("你不是原发言人，请站在你的专业视角回应下面这条质疑。\n")
-	sb.WriteString("要求：先回答质疑，再给出你认可/不认可的理由，最后给可执行修正建议。\n")
-	sb.WriteString("若不同意，必须给可证伪条件；若同意，必须给新增约束。\n\n")
+	sb.WriteString(fmt.Sprintf("你是%s。现在有专家针对你第一轮的结论提出质疑，请正面应战。\n", challenge.TargetName))
+	sb.WriteString("要求：① 先直接回答质疑命中的要害；② 明确表态——坚持/部分修正/推翻原结论；")
+	sb.WriteString("③ 坚持则给可证伪条件，修正则给新增约束与新的买卖/止损位。\n")
+	sb.WriteString("禁止打太极、禁止重复第一轮原话。\n\n")
 	sb.WriteString(fmt.Sprintf("用户原问题：%s\n\n", baseQuery))
-	sb.WriteString("【原始观点摘要】\n")
-	for _, entry := range roundOneHistory {
-		fmt.Fprintf(&sb, "- %s：%s\n", entry.AgentName, entry.Content)
+	if strings.TrimSpace(ownView) != "" {
+		sb.WriteString("【你第一轮的结论（被质疑对象）】\n")
+		sb.WriteString(strings.TrimSpace(ownView) + "\n\n")
 	}
-	sb.WriteString("\n")
-	sb.WriteString("【当前质疑】\n")
-	sb.WriteString(fmt.Sprintf("%s -> %s：%s\n", challenge.ChallengerName, challenge.TargetName, challenge.Question))
-	sb.WriteString("\n请在180字内完成回应。")
+	sb.WriteString(fmt.Sprintf("【%s 对你的质疑】\n%s\n\n", challenge.ChallengerName, challenge.Question))
+	if len(others) > 0 {
+		sb.WriteString("【其他专家第一轮观点（参考）】\n")
+		for _, entry := range others {
+			fmt.Fprintf(&sb, "- %s：%s\n", entry.AgentName, truncateString(entry.Content, 120))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("请在180字内完成回应。")
 	return sb.String()
 }
 
@@ -1222,6 +1282,181 @@ func buildFinalRevisionPrompt(baseQuery string, roundOneHistory []DiscussionEntr
 	sb.WriteString(buildRoundContext("第二轮交叉质疑回应", roundTwoResponses))
 	sb.WriteString("请在180字内回答。")
 	return sb.String()
+}
+
+// ===== 一键Battle：比分统计 + 主持人裁决 =====
+
+type battleStance struct {
+	name       string
+	role       string
+	side       string // 多/空/中
+	confidence int
+}
+
+var reBattleStanceLabel = regexp.MustCompile(`【[^】]*立场[^】]*】`)
+var reConfidence = regexp.MustCompile(`(\d{1,3})`)
+
+func battleStanceLine(content string) string {
+	if loc := reBattleStanceLabel.FindStringIndex(content); loc != nil {
+		seg := content[loc[1]:]
+		if nl := strings.IndexAny(seg, "\n\r"); nl >= 0 {
+			seg = seg[:nl]
+		}
+		if next := strings.Index(seg, "【"); next >= 0 {
+			seg = seg[:next]
+		}
+		return strings.TrimSpace(seg)
+	}
+	for _, raw := range strings.Split(content, "\n") {
+		if strings.Contains(raw, "立场") {
+			return strings.TrimSpace(raw)
+		}
+	}
+	return strings.TrimSpace(content)
+}
+
+// parseBattleStance 从单条 Battle 回复中解析【立场】与置信度。
+func parseBattleStance(content string) (side string, confidence int) {
+	side = "中"
+	line := battleStanceLine(content)
+	switch {
+	case strings.Contains(line, "看多") || strings.Contains(line, "偏多"):
+		side = "多"
+	case strings.Contains(line, "看空") || strings.Contains(line, "偏空"):
+		side = "空"
+	case strings.Contains(line, "中性"):
+		side = "中"
+	}
+	if m := reConfidence.FindString(line); m != "" {
+		if v, err := strconv.Atoi(m); err == nil && v >= 0 && v <= 100 {
+			confidence = v
+		}
+	}
+	return side, confidence
+}
+
+// BattleVerdict 统计多空比分并请主持人给出一句话裁决，返回一条主持人消息。
+func (s *Service) BattleVerdict(ctx context.Context, aiConfig *models.AIConfig, stock *models.Stock, query string, responses []ChatResponse) (ChatResponse, bool) {
+	var stances []battleStance
+	bull, bear, neutral := 0, 0, 0
+	for _, r := range responses {
+		if r.Error != "" || strings.TrimSpace(r.Content) == "" || r.AgentID == ModeratorAgentID {
+			continue
+		}
+		side, conf := parseBattleStance(r.Content)
+		switch side {
+		case "多":
+			bull++
+		case "空":
+			bear++
+		default:
+			neutral++
+		}
+		stances = append(stances, battleStance{name: r.AgentName, role: r.Role, side: side, confidence: conf})
+	}
+	if len(stances) == 0 {
+		return ChatResponse{}, false
+	}
+
+	// 比分头(确定性，不让LLM数错)
+	var bulls, bears, neus []string
+	for _, st := range stances {
+		tag := st.name
+		if st.confidence > 0 {
+			tag = fmt.Sprintf("%s(%d)", st.name, st.confidence)
+		}
+		switch st.side {
+		case "多":
+			bulls = append(bulls, tag)
+		case "空":
+			bears = append(bears, tag)
+		default:
+			neus = append(neus, tag)
+		}
+	}
+	var head strings.Builder
+	fmt.Fprintf(&head, "📊 Battle 比分　看多 %d ｜ 中性 %d ｜ 看空 %d\n", bull, neutral, bear)
+	if len(bulls) > 0 {
+		fmt.Fprintf(&head, "🟥 多头：%s\n", strings.Join(bulls, "、"))
+	}
+	if len(bears) > 0 {
+		fmt.Fprintf(&head, "🟩 空头：%s\n", strings.Join(bears, "、"))
+	}
+	if len(neus) > 0 {
+		fmt.Fprintf(&head, "⬜ 中性：%s\n", strings.Join(neus, "、"))
+	}
+
+	// 主持人一句话裁决(带比分作为事实基准)
+	verdict := s.battleVerdictText(ctx, aiConfig, stock, query, stances, bull, neutral, bear)
+
+	content := head.String()
+	if strings.TrimSpace(verdict) != "" {
+		content += "\n" + strings.TrimSpace(verdict)
+	}
+	return ChatResponse{
+		AgentID:     ModeratorAgentID,
+		AgentName:   ModeratorName,
+		Role:        ModeratorRole,
+		Content:     content,
+		MsgType:     "summary",
+		MeetingMode: MeetingModeDirect,
+	}, true
+}
+
+func (s *Service) battleVerdictText(ctx context.Context, aiConfig *models.AIConfig, stock *models.Stock, query string, stances []battleStance, bull, neutral, bear int) string {
+	llm, err := s.modelFactory.CreateModel(ctx, aiConfig)
+	if err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("你是多空Battle的主持人「老板娘」，请基于以下专家结论给出最终裁决。\n\n")
+	fmt.Fprintf(&sb, "标的：%s(%s) 现价%.2f 涨跌%.2f%%\n", stock.Name, stock.Symbol, stock.Price, stock.ChangePercent)
+	fmt.Fprintf(&sb, "问题：%s\n", query)
+	fmt.Fprintf(&sb, "比分(事实基准，禁止改动)：看多%d / 中性%d / 看空%d\n\n", bull, neutral, bear)
+	sb.WriteString("各方立场：\n")
+	for _, st := range stances {
+		fmt.Fprintf(&sb, "- %s(%s)：%s，置信%d\n", st.name, st.role, sideText(st.side), st.confidence)
+	}
+	sb.WriteString("\n请只输出以下三行，合计80字内，直接、可执行：\n")
+	sb.WriteString("【裁决】偏多/偏空/分歧大 + 一句关键理由(指向最强证据或最致命风险)\n")
+	sb.WriteString("【操作】方向 + 仓位% + 止损或失效条件\n")
+	sb.WriteString("【一票否决】若有不可忽视的致命风险写出，否则写“无”\n")
+
+	genCtx, cancel := context.WithTimeout(ctx, ModeratorTimeout)
+	defer cancel()
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{genai.NewPartFromText(sb.String())}},
+		},
+	}
+	var result strings.Builder
+	for resp, gErr := range llm.GenerateContent(genCtx, req, false) {
+		if gErr != nil {
+			return ""
+		}
+		if resp != nil && resp.Content != nil {
+			for _, part := range resp.Content.Parts {
+				if part.Thought {
+					continue
+				}
+				if part.Text != "" {
+					result.WriteString(part.Text)
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(openai.FilterVendorToolCallMarkers(result.String()))
+}
+
+func sideText(side string) string {
+	switch side {
+	case "多":
+		return "看多"
+	case "空":
+		return "看空"
+	default:
+		return "中性"
+	}
 }
 
 func pickDebateTarget(self models.AgentConfig, selectedAgents []models.AgentConfig) models.AgentConfig {

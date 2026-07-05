@@ -6,6 +6,7 @@ import SafeBoundary from './components/SafeBoundary'
 import { ThemeProvider } from './contexts/ThemeContext'
 import { CandleColorProvider } from './contexts/CandleColorContext'
 import { IndicatorProvider } from './contexts/IndicatorContext'
+import { resolveBackendMode, installRemoteBridge, showOfflineBanner } from './services/remoteBridge'
 
 const hideWailsSpinner = () => {
     const spinner = document.getElementById('wails-spinner')
@@ -47,24 +48,48 @@ if (!container) {
     throw new Error('Root container missing')
 }
 
-try {
-    const root = createRoot(container)
-    root.render(
-        <React.StrictMode>
-            <ThemeProvider>
-                <CandleColorProvider>
-                    <IndicatorProvider>
-                        <SafeBoundary title="页面渲染异常">
-                            <App/>
-                        </SafeBoundary>
-                    </IndicatorProvider>
-                </CandleColorProvider>
-            </ThemeProvider>
-        </React.StrictMode>
-    )
-} catch (error: any) {
-    const text = error?.message || '未知前端启动错误'
-    showFatalBootError(text)
+const renderApp = () => {
+    try {
+        const root = createRoot(container)
+        root.render(
+            <React.StrictMode>
+                <ThemeProvider>
+                    <CandleColorProvider>
+                        <IndicatorProvider>
+                            <SafeBoundary title="页面渲染异常">
+                                <App/>
+                            </SafeBoundary>
+                        </IndicatorProvider>
+                    </CandleColorProvider>
+                </ThemeProvider>
+            </React.StrictMode>
+        )
+    } catch (error: any) {
+        const text = error?.message || '未知前端启动错误'
+        showFatalBootError(text)
+    }
 }
+
+// 启动前先决定后端模式：探到 NAS 可达则装远程桥接(RPC/WS 改道 NAS)，否则用内置绑定。
+// 无论如何都要渲染，探测失败/超时一律回落本地。
+;(async () => {
+    try {
+        const backend = await resolveBackendMode()
+        if (backend.mode === 'remote' && backend.url) {
+            installRemoteBridge(backend.url, backend.token)
+            console.info('[boot] 后端模式: remote →', backend.url)
+        } else if (backend.mode === 'fallback') {
+            // 配了 NAS 但没连上：用本地旧数据，挂横幅提示改动不会同步
+            console.warn('[boot] 后端模式: fallback(NAS 未连接) →', backend.url)
+            showOfflineBanner(backend.url || '')
+        } else {
+            console.info('[boot] 后端模式: local')
+        }
+    } catch (e) {
+        console.warn('[boot] 后端探测异常，回落本地', e)
+    } finally {
+        renderApp()
+    }
+})()
 
 setTimeout(hideWailsSpinner, 200)

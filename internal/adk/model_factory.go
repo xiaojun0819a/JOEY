@@ -173,7 +173,13 @@ func (f *ModelFactory) createOpenAIResponsesModel(config *models.AIConfig) (mode
 	httpClient := &http.Client{
 		Transport: &uaTransport{base: proxy.GetManager().GetTransport()},
 	}
-	return openai.NewResponsesModel(config.ModelName, config.APIKey, baseURL, httpClient, config.NoSystemRole), nil
+	fallbackCfg := go_openai.DefaultConfig(config.APIKey)
+	fallbackCfg.BaseURL = baseURL
+	fallbackCfg.HTTPClient = &http.Client{
+		Transport: &uaTransport{base: proxy.GetManager().GetTransport()},
+	}
+	fallback := openai.NewOpenAIModel(config.ModelName, fallbackCfg, config.NoSystemRole, string(config.TokenParamMode))
+	return openai.NewResponsesModel(config.ModelName, config.APIKey, baseURL, httpClient, fallback, config.NoSystemRole), nil
 }
 
 // TestConnection 测试 AI 配置的连通性

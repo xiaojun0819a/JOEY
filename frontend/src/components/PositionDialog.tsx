@@ -11,7 +11,8 @@ interface PositionDialogProps {
   stockName: string;
   currentPrice: number;
   position?: StockPosition;
-  onSave: (shares: number, costPrice: number) => void;
+  onSave: (shares: number, costPrice: number, buyDate: string) => void;
+  onSell?: (sellPrice: number) => void;
 }
 
 export const PositionDialog: React.FC<PositionDialogProps> = ({
@@ -22,19 +23,24 @@ export const PositionDialog: React.FC<PositionDialogProps> = ({
   currentPrice,
   position,
   onSave,
+  onSell,
 }) => {
   const { colors } = useTheme();
   const cc = useCandleColor();
   const [shares, setShares] = useState<string>('');
   const [costPrice, setCostPrice] = useState<string>('');
+  const [buyDate, setBuyDate] = useState<string>('');
+  const [sellPrice, setSellPrice] = useState<string>('');
 
   useEffect(() => {
     if (isOpen && position) {
       setShares(position.shares > 0 ? position.shares.toString() : '');
       setCostPrice(position.costPrice > 0 ? position.costPrice.toString() : '');
+      setBuyDate(position.buyDate || '');
     } else if (isOpen) {
       setShares('');
       setCostPrice('');
+      setBuyDate('');
     }
   }, [isOpen, position]);
 
@@ -48,12 +54,19 @@ export const PositionDialog: React.FC<PositionDialogProps> = ({
   const profitLossPercent = costAmount > 0 ? (profitLoss / costAmount) * 100 : 0;
 
   const handleSave = () => {
-    onSave(sharesNum, costPriceNum);
+    onSave(sharesNum, costPriceNum, buyDate);
     onClose();
   };
 
   const handleClear = () => {
-    onSave(0, 0);
+    onSave(0, 0, '');
+    onClose();
+  };
+
+  const handleSell = () => {
+    const sp = parseFloat(sellPrice) || currentPrice;
+    if (onSell) onSell(sp);
+    else onSave(0, 0, '');
     onClose();
   };
 
@@ -112,6 +125,15 @@ export const PositionDialog: React.FC<PositionDialogProps> = ({
               step="0.01"
             />
           </div>
+          <div>
+            <label className={`block text-sm mb-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>买入日期（用于持仓天数/时间止损，可选）</label>
+            <input
+              type="date"
+              value={buyDate}
+              onChange={(e) => setBuyDate(e.target.value)}
+              className="w-full fin-input rounded-lg px-3 py-2 text-sm"
+            />
+          </div>
 
           {/* Calculated Info */}
           {sharesNum > 0 && costPriceNum > 0 && (
@@ -134,14 +156,39 @@ export const PositionDialog: React.FC<PositionDialogProps> = ({
           )}
         </div>
 
+        {/* 卖出区（持仓时显示，记入交易台账） */}
+        {position && position.shares > 0 && (
+          <div className={`mx-4 mb-2 p-3 rounded-lg border ${colors.isDark ? 'border-slate-700 bg-slate-800/30' : 'border-slate-200 bg-slate-50'}`}>
+            <div className="flex items-center gap-2">
+              <span className={`text-sm ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>卖出价</span>
+              <input
+                type="number"
+                value={sellPrice}
+                onChange={(e) => setSellPrice(e.target.value)}
+                placeholder={`默认现价 ${currentPrice.toFixed(2)}`}
+                className="flex-1 fin-input rounded-lg px-3 py-1.5 text-sm"
+                step="0.01"
+              />
+              <button
+                onClick={handleSell}
+                className="px-4 py-1.5 rounded-lg text-sm text-white bg-red-500/80 hover:bg-red-500 transition-colors whitespace-nowrap"
+              >
+                卖出清仓
+              </button>
+            </div>
+            <div className={`text-xs mt-1 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>卖出后自动记入交易台账，留空按现价</div>
+          </div>
+        )}
+
         {/* Footer */}
         <div className="flex gap-2 p-4 border-t fin-divider">
           {position && position.shares > 0 && (
             <button
               onClick={handleClear}
-              className="px-4 py-2 rounded-lg text-sm text-red-400 hover:bg-red-500/10 transition-colors"
+              className="px-4 py-2 rounded-lg text-sm text-slate-400 hover:bg-slate-500/10 transition-colors"
+              title="只清空持仓，不记台账"
             >
-              清空持仓
+              仅清空
             </button>
           )}
           <div className="flex-1" />

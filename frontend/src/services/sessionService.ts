@@ -1,6 +1,23 @@
-import { GetOrCreateSession, GetSessionMessages, ClearSessionMessages, SendMeetingMessage, UpdateStockPosition, RetryAgent, RetryAgentAndContinue, CancelInterruptedMeeting } from '../../wailsjs/go/main/App';
+import { GetOrCreateSession, GetSessionMessages, ClearSessionMessages, SendMeetingMessage, UpdateStockPosition, RetryAgent, RetryAgentAndContinue, CancelInterruptedMeeting, GetHeldPositions } from '../../wailsjs/go/main/App';
 import type { StockPosition } from '../types';
 import { isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
+
+export interface HeldPosition {
+  stockCode: string;
+  stockName: string;
+  position: StockPosition;
+}
+
+// getHeldPositions 只读获取所有持仓(Shares>0)，不创建新 session。
+export const getHeldPositions = async (): Promise<HeldPosition[]> => {
+  if (!isWailsGoReady()) return [];
+  try {
+    const list = await GetHeldPositions();
+    return Array.isArray(list) ? (list as HeldPosition[]) : [];
+  } catch {
+    return [];
+  }
+};
 
 export interface StockSession {
   id: string;
@@ -34,6 +51,7 @@ export interface MeetingMessageRequest {
   mentionIds: string[];
   replyToId: string;
   replyContent: string;
+  battle?: boolean; // 一键Battle：并行结束后追加比分裁决
 }
 
 // 获取或创建Session
@@ -76,16 +94,16 @@ export const sendMeetingMessage = async (req: MeetingMessageRequest): Promise<Ch
     warnWailsUnavailable('发起讨论', 'go');
     return [];
   }
-  return await SendMeetingMessage(req);
+  return await SendMeetingMessage({ ...req, battle: req.battle ?? false });
 };
 
 // 更新股票持仓信息
-export const updateStockPosition = async (stockCode: string, shares: number, costPrice: number): Promise<string> => {
+export const updateStockPosition = async (stockCode: string, shares: number, costPrice: number, buyDate: string = ''): Promise<string> => {
   if (!isWailsGoReady()) {
     warnWailsUnavailable('更新持仓', 'go');
     return 'browser-mode:no-op';
   }
-  return await UpdateStockPosition(stockCode, shares, costPrice);
+  return await UpdateStockPosition(stockCode, shares, costPrice, buyDate);
 };
 
 // 重试单个失败的专家

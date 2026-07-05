@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/run-bigpig/jcp/internal/embed"
@@ -52,6 +53,13 @@ var defaultIndexCodes = []string{
 	"s_sh000001", // 上证指数
 	"s_sz399001", // 深证成指
 	"s_sz399006", // 创业板指
+}
+
+// 市场风格对比指数：大盘/中盘/小盘
+var styleIndexCodes = []string{
+	"s_sh000300", // 沪深300
+	"s_sh000905", // 中证500
+	"s_sh000852", // 中证1000
 }
 
 // StockWithOrderBook 包含盘口数据的股票信息
@@ -111,6 +119,9 @@ type MarketService struct {
 	klineCache    map[string]*klineCache
 	klineCacheMu  sync.RWMutex
 	klineCacheTTL time.Duration
+
+	// 东财 push2 主节点最近失败时间(UnixNano)，失败后短时内直接走延迟节点，避免每页重试拖慢
+	emPush2DeadUnix int64
 }
 
 // NewMarketService 创建市场数据服务
@@ -161,7 +172,7 @@ func (ms *MarketService) cleanExpiredCache() {
 // getKLineCacheTTL 返回不同周期的缓存策略
 func (ms *MarketService) getKLineCacheTTL(period string) time.Duration {
 	// 分时需要高时效，避免增量推送读取到过旧缓存
-	if period == "1m" {
+	if period == "1m" || period == "5d" {
 		return klineCacheTTLIntraday
 	}
 	return ms.klineCacheTTL
@@ -457,16 +468,103 @@ func (ms *MarketService) fetchKLineDataFromSina(code string, period string, days
 	if period == "1m" {
 		klines = filterTodayKLines(klines)
 		klines = calculateAvgLine(klines)
+	} else if period == "5d" {
+		klines = filterRecentTradingDayKLines(klines, 5)
+		klines = calculateAvgLineByDay(klines)
 	}
 
 	return klines, nil
 }
 
+const tencentKLineURL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq"
+
+// fetchKLineDataFromTencent 腾讯日线（又快又稳，作日线首选兜底）。仅日线。
+func (ms *MarketService) fetchKLineDataFromTencent(code string, period string, days int) ([]models.KLineData, error) {
+	if period != "1d" {
+		return nil, fmt.Errorf("腾讯K线仅支持日线")
+	}
+	if days <= 0 {
+		days = 60
+	}
+	resp, err := ms.client.Get(fmt.Sprintf(tencentKLineURL, code, days))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Data map[string]struct {
+			Day    [][]interface{} `json:"day"`
+			QfqDay [][]interface{} `json:"qfqday"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, err
+	}
+	node, ok := r.Data[code]
+	if !ok {
+		return nil, fmt.Errorf("腾讯K线无数据: %s", code)
+	}
+	rows := node.QfqDay
+	if len(rows) == 0 {
+		rows = node.Day
+	}
+	klines := make([]models.KLineData, 0, len(rows))
+	for _, row := range rows { // [日期,开,收,高,低,量]
+		if len(row) < 6 {
+			continue
+		}
+		k := models.KLineData{
+			Time: tencentStr(row[0]), Open: tencentF(row[1]), Close: tencentF(row[2]),
+			High: tencentF(row[3]), Low: tencentF(row[4]), Volume: int64(tencentF(row[5])),
+		}
+		if k.Close > 0 {
+			klines = append(klines, k)
+		}
+	}
+	for i := range klines {
+		klines[i].MA5 = klineSMA(klines, i, 5)
+		klines[i].MA10 = klineSMA(klines, i, 10)
+		klines[i].MA20 = klineSMA(klines, i, 20)
+	}
+	return klines, nil
+}
+
+func tencentStr(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+func tencentF(v interface{}) float64 {
+	switch x := v.(type) {
+	case string:
+		f, _ := strconv.ParseFloat(x, 64)
+		return f
+	case float64:
+		return x
+	}
+	return 0
+}
+func klineSMA(ks []models.KLineData, i, n int) float64 {
+	if i+1 < n {
+		return 0
+	}
+	sum := 0.0
+	for j := i - n + 1; j <= i; j++ {
+		sum += ks[j].Close
+	}
+	return math.Round(sum/float64(n)*100) / 100
+}
+
 // periodToScale 周期转换为新浪API的scale参数
 func (ms *MarketService) periodToScale(period string) string {
 	switch period {
-	case "1m":
-		return "1" // 1分钟线（分时图）
+	case "1m", "5d":
+		return "1" // 1分钟线（分时图 / 5日走势）
 	case "1d":
 		return "240" // 日线
 	case "1w":
@@ -507,6 +605,46 @@ func filterTodayKLines(klines []models.KLineData) []models.KLineData {
 	return result
 }
 
+// filterRecentTradingDayKLines 过滤返回最近 N 个有分钟线数据的交易日
+func filterRecentTradingDayKLines(klines []models.KLineData, dayCount int) []models.KLineData {
+	if len(klines) == 0 || dayCount <= 0 {
+		return klines
+	}
+
+	dates := make([]string, 0, dayCount)
+	seen := make(map[string]bool)
+	for _, k := range klines {
+		if len(k.Time) < 10 {
+			continue
+		}
+		date := k.Time[:10]
+		if !seen[date] {
+			seen[date] = true
+			dates = append(dates, date)
+		}
+	}
+	if len(dates) == 0 {
+		return klines
+	}
+
+	start := len(dates) - dayCount
+	if start < 0 {
+		start = 0
+	}
+	allowed := make(map[string]bool, len(dates)-start)
+	for _, date := range dates[start:] {
+		allowed[date] = true
+	}
+
+	result := make([]models.KLineData, 0, len(klines))
+	for _, k := range klines {
+		if len(k.Time) >= 10 && allowed[k.Time[:10]] {
+			result = append(result, k)
+		}
+	}
+	return result
+}
+
 // calculateAvgLine 计算分时均价线 (VWAP = 累计成交额 / 累计成交量)
 func calculateAvgLine(klines []models.KLineData) []models.KLineData {
 	if len(klines) == 0 {
@@ -517,6 +655,38 @@ func calculateAvgLine(klines []models.KLineData) []models.KLineData {
 	var totalVolume int64
 
 	for i := range klines {
+		totalAmount += klines[i].Amount
+		totalVolume += klines[i].Volume
+
+		if totalVolume > 0 {
+			klines[i].Avg = totalAmount / float64(totalVolume)
+		}
+	}
+
+	return klines
+}
+
+// calculateAvgLineByDay 按交易日重置累计成交额/成交量计算分时均价线
+func calculateAvgLineByDay(klines []models.KLineData) []models.KLineData {
+	if len(klines) == 0 {
+		return klines
+	}
+
+	var totalAmount float64
+	var totalVolume int64
+	currentDate := ""
+
+	for i := range klines {
+		date := klines[i].Time
+		if len(date) >= 10 {
+			date = date[:10]
+		}
+		if date != currentDate {
+			currentDate = date
+			totalAmount = 0
+			totalVolume = 0
+		}
+
 		totalAmount += klines[i].Amount
 		totalVolume += klines[i].Volume
 
@@ -681,6 +851,12 @@ func (ms *MarketService) GetTradingSchedule() TradingSchedule {
 }
 
 // isTradeDay 判断指定日期是否为交易日
+// IsTradingDay A股交易日判定的公开封装（供历史采集算缺口用）。
+func (ms *MarketService) IsTradingDay(date time.Time) bool {
+	ok, _ := ms.isTradeDay(date)
+	return ok
+}
+
 // A股交易日判定：非周末 且 非节假日（调休上班也不算交易日）
 func (ms *MarketService) isTradeDay(date time.Time) (bool, string) {
 
@@ -855,15 +1031,35 @@ func getTradeDatesCacheFile() string {
 	return filepath.Join(paths.EnsureCacheDir(""), "trade_dates.json")
 }
 
+func aShareNow() time.Time {
+	return time.Now().In(time.FixedZone("CST", 8*60*60))
+}
+
+func (ms *MarketService) expectedLatestTradeDate(now time.Time) string {
+	for i := 0; i < 14; i++ {
+		date := now.AddDate(0, 0, -i)
+		if ms.isTradeDate(date) {
+			return date.Format("2006-01-02")
+		}
+	}
+	return ""
+}
+
 // GetTradeDates 获取指定天数内的交易日列表（从今天往前推）
 func (ms *MarketService) GetTradeDates(days int) ([]string, error) {
+	expectedLatest := ms.expectedLatestTradeDate(aShareNow())
+
 	// 先尝试从文件缓存加载
 	cached, err := ms.loadTradeDatesCache()
 	if err == nil && len(cached.TradeDates) > 0 {
 		// 检查缓存是否过期（每天更新一次）
-		if time.Since(cached.UpdatedAt) < 24*time.Hour {
+		cacheHasLatest := expectedLatest == "" || cached.TradeDates[0] == expectedLatest
+		if time.Since(cached.UpdatedAt) < 24*time.Hour && cacheHasLatest {
 			log.Debug("使用交易日缓存，共 %d 天", len(cached.TradeDates))
 			return ms.filterTradeDates(cached.TradeDates, days), nil
+		}
+		if !cacheHasLatest {
+			log.Info("交易日缓存缺少最新交易日(%s)，重新获取", expectedLatest)
 		}
 	}
 
@@ -924,7 +1120,7 @@ func (ms *MarketService) saveTradeDatesCache(dates []string) error {
 // fetchTradeDates 获取交易日列表
 func (ms *MarketService) fetchTradeDates(days int) ([]string, error) {
 	var tradeDates []string
-	today := time.Now()
+	today := aShareNow()
 
 	// 预加载需要的年份节假日数据
 	yearsNeeded := make(map[int]bool)
@@ -955,6 +1151,15 @@ func (ms *MarketService) GetMarketIndices() ([]models.MarketIndex, error) {
 	return ms.fetchMarketIndicesWithFallback()
 }
 
+// GetMarketStyleIndices 获取市场风格对比指数：沪深300/中证500/中证1000
+func (ms *MarketService) GetMarketStyleIndices() ([]models.MarketIndex, error) {
+	indices, err := ms.fetchMarketIndicesByCodesFromSina(styleIndexCodes)
+	if err == nil && len(indices) > 0 {
+		return indices, nil
+	}
+	return nil, err
+}
+
 // SearchStocks 搜索股票
 func (ms *MarketService) SearchStocks(keyword string, limit int) []StockSearchResult {
 	return ms.searchStocksWithFallback(keyword, limit)
@@ -968,6 +1173,7 @@ type ScanSnapshotRow struct {
 	ChangePercent      float64
 	Amount             float64
 	TurnoverRate       float64
+	VolumeRatio        float64
 	TotalMarketCap     float64
 	FloatMarketCap     float64
 	Industry           string
@@ -1017,10 +1223,10 @@ func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) 
 	}
 
 	page := 1
-	pageSize := 200
-	maxPages := 30
+	pageSize := 100 // 东财延迟节点(push2delay)单页硬上限为100，用200会被截断成100并误判为最后一页
+	maxPages := 70  // 全A约5500只 / 100 ≈ 55 页，留足余量
 	total := int64(0)
-	items := make([]ScanSnapshotRow, 0, 4000)
+	items := make([]ScanSnapshotRow, 0, 6000)
 
 	for page <= maxPages {
 		params := url.Values{}
@@ -1032,7 +1238,7 @@ func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) 
 		params.Set("pn", strconv.Itoa(page))
 		params.Set("pz", strconv.Itoa(pageSize))
 		params.Set("fs", fs)
-		params.Set("fields", "f12,f14,f2,f3,f6,f8,f20,f21,f62,f184,f124,f13")
+		params.Set("fields", "f12,f14,f2,f3,f6,f8,f10,f20,f21,f62,f184,f124,f13")
 		params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
 
 		raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
@@ -1075,6 +1281,7 @@ func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) 
 				ChangePercent:      toFloat64Any(row["f3"]),
 				Amount:             toFloat64Any(row["f6"]),
 				TurnoverRate:       toFloat64Any(row["f8"]),
+				VolumeRatio:        toFloat64Any(row["f10"]),
 				TotalMarketCap:     toFloat64Any(row["f20"]),
 				FloatMarketCap:     toFloat64Any(row["f21"]),
 				Industry:           "",
@@ -1174,8 +1381,8 @@ func (ms *MarketService) getAllAStockSnapshotFromTencent(includeBeijing bool) ([
 				continue
 			}
 			fields := strings.Split(payload, "~")
-			// 关键字段按公开索引：3现价, 32涨跌幅, 37成交额(万), 38换手率, 44/45市值
-			if len(fields) < 46 {
+			// 关键字段按公开索引：3现价, 32涨跌幅, 37成交额(万), 38换手率, 44/45市值, 49量比
+			if len(fields) < 50 {
 				continue
 			}
 
@@ -1185,6 +1392,7 @@ func (ms *MarketService) getAllAStockSnapshotFromTencent(includeBeijing bool) ([
 			turnover := parseFloat64Safe(fields[38])
 			mcap44 := parseFloat64Safe(fields[44])
 			mcap45 := parseFloat64Safe(fields[45])
+			volumeRatio := parseFloat64Safe(fields[49])
 
 			// 兼容索引口径差异：总市值一般 >= 流通市值
 			totalCapYi := math.Max(mcap44, mcap45)
@@ -1218,6 +1426,7 @@ func (ms *MarketService) getAllAStockSnapshotFromTencent(includeBeijing bool) ([
 				ChangePercent:      changePct,
 				Amount:             amountWan * 10000, // 万元 -> 元
 				TurnoverRate:       turnover,
+				VolumeRatio:        volumeRatio,
 				TotalMarketCap:     totalCapYi * 1e8, // 亿 -> 元
 				FloatMarketCap:     floatCapYi * 1e8, // 亿 -> 元
 				Industry:           m.Industry,
@@ -1417,8 +1626,8 @@ func (ms *MarketService) fetchQQHistoryFundFlow(symbol string, days int) ([]Main
 	if days <= 0 {
 		days = 5
 	}
-	if days > 120 {
-		days = 120
+	if days > 50 {
+		days = 50 // 腾讯该接口 klineNeedDay >50 会返回 400
 	}
 
 	params := url.Values{}
@@ -1485,6 +1694,59 @@ func (ms *MarketService) fetchQQHistoryFundFlow(symbol string, days int) ([]Main
 	if len(points) > days {
 		points = points[len(points)-days:]
 	}
+	return points, nil
+}
+
+// fetchSinaHistoryFundFlow 新浪资金流历史（单次可取数百日），返回主力净流入序列。
+// netamount 为新浪口径净流入(元)，作为主力净流入近似；可拉到约 2 年。
+func (ms *MarketService) fetchSinaHistoryFundFlow(symbol string, days int) ([]MainFlowHistoryPoint, error) {
+	code := strings.ToLower(strings.TrimSpace(symbol))
+	if len(code) < 8 || (!strings.HasPrefix(code, "sh") && !strings.HasPrefix(code, "sz")) {
+		return nil, fmt.Errorf("sina fundflow unsupported symbol: %s", symbol)
+	}
+	if days <= 0 {
+		days = 60
+	}
+	if days > 500 {
+		days = 500
+	}
+	api := fmt.Sprintf("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=%d&sort=opendate&asc=0&daima=%s", days, code)
+	req, err := http.NewRequest("GET", api, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://finance.sina.com.cn/")
+
+	resp, err := ms.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return nil, fmt.Errorf("sina fundflow parse: %v", err)
+	}
+	points := make([]MainFlowHistoryPoint, 0, len(rows))
+	for _, row := range rows {
+		date := strings.TrimSpace(toStringLocal(row["opendate"]))
+		if date == "" {
+			continue
+		}
+		points = append(points, MainFlowHistoryPoint{
+			Date:          date,
+			MainNetInflow: parseFloat64Safe(toStringLocal(row["netamount"])),
+			Price:         parseFloat64Safe(toStringLocal(row["trade"])),
+		})
+	}
+	if len(points) == 0 {
+		return nil, fmt.Errorf("sina fundflow empty")
+	}
+	sort.SliceStable(points, func(i, j int) bool { return points[i].Date < points[j].Date })
 	return points, nil
 }
 
@@ -1612,8 +1874,8 @@ func (ms *MarketService) BuildScanMarketSnapshot() (ScanMarketSnapshot, error) {
 
 	// 涨停/跌停计数 + 两市成交额（分页聚合，避免单次大包返回空）
 	page := 1
-	pageSize := 200
-	maxPages := 30
+	pageSize := 100 // 东财延迟节点(push2delay)单页硬上限100，用200会被截断成100并误判为最后一页
+	maxPages := 70
 	total := int64(0)
 	processed := 0
 
@@ -1710,7 +1972,11 @@ func extractIndexSnapshot(klines []models.KLineData) (ma20 float64, closePrice f
 }
 
 func (ms *MarketService) fetchMarketIndicesFromSina() ([]models.MarketIndex, error) {
-	codeList := strings.Join(defaultIndexCodes, ",")
+	return ms.fetchMarketIndicesByCodesFromSina(defaultIndexCodes)
+}
+
+func (ms *MarketService) fetchMarketIndicesByCodesFromSina(codes []string) ([]models.MarketIndex, error) {
+	codeList := strings.Join(codes, ",")
 	url := fmt.Sprintf(sinaStockURL, time.Now().UnixNano(), codeList)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -1771,6 +2037,10 @@ func (ms *MarketService) parseMarketIndices(data string) ([]models.MarketIndex, 
 
 // GetBoardFundFlowList 获取板块资金流列表（行业/概念/地域）
 func (ms *MarketService) GetBoardFundFlowList(category string, page int, size int) (models.BoardFundFlowList, error) {
+	return ms.fetchBoardFundFlowList(category, page, size, "1")
+}
+
+func (ms *MarketService) fetchBoardFundFlowList(category string, page int, size int, po string) (models.BoardFundFlowList, error) {
 	if page <= 0 {
 		page = 1
 	}
@@ -1787,7 +2057,7 @@ func (ms *MarketService) GetBoardFundFlowList(category string, page int, size in
 	params.Set("np", "1")
 	params.Set("fltt", "2")
 	params.Set("invt", "2")
-	params.Set("po", "1")
+	params.Set("po", po)
 	params.Set("fid", "f62")
 	params.Set("stat", "1")
 	params.Set("fields", "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124")
@@ -1844,6 +2114,304 @@ func (ms *MarketService) GetBoardFundFlowList(category string, page int, size in
 		Total:      toInt64Any(data["total"]),
 		UpdateTime: updateTime,
 	}, nil
+}
+
+// GetBoardFundFlowOverview 获取板块主力净流入概览（流入/流出双榜）
+func (ms *MarketService) GetBoardFundFlowOverview(category string, limit int) (models.BoardFundFlowOverview, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 20 {
+		limit = 20
+	}
+
+	inflowList, err := ms.fetchBoardFundFlowList(category, 1, 80, "1")
+	if err != nil {
+		return models.BoardFundFlowOverview{}, err
+	}
+	outflowList, outErr := ms.fetchBoardFundFlowList(category, 1, 80, "0")
+	if outErr != nil {
+		return models.BoardFundFlowOverview{}, outErr
+	}
+
+	overview := models.BoardFundFlowOverview{
+		Category:   normalizeBoardCategory(category),
+		Inflow:     make([]models.BoardFundFlowItem, 0, limit),
+		Outflow:    make([]models.BoardFundFlowItem, 0, limit),
+		UpdateTime: inflowList.UpdateTime,
+	}
+	if overview.UpdateTime == "" {
+		overview.UpdateTime = outflowList.UpdateTime
+	}
+
+	seen := map[string]struct{}{}
+	for _, item := range inflowList.Items {
+		if item.Code == "" {
+			continue
+		}
+		overview.NetMainInflow += item.MainNetInflow
+		if item.MainNetInflow > 0 && len(overview.Inflow) < limit {
+			overview.Inflow = append(overview.Inflow, item)
+			if overview.StrongestInflow == nil {
+				copyItem := item
+				overview.StrongestInflow = &copyItem
+			}
+		}
+		seen[item.Code] = struct{}{}
+	}
+	for _, item := range outflowList.Items {
+		if item.Code == "" {
+			continue
+		}
+		if _, ok := seen[item.Code]; !ok {
+			overview.NetMainInflow += item.MainNetInflow
+		}
+		if item.MainNetInflow < 0 && len(overview.Outflow) < limit {
+			overview.Outflow = append(overview.Outflow, item)
+			if overview.StrongestOutflow == nil {
+				copyItem := item
+				overview.StrongestOutflow = &copyItem
+			}
+		}
+	}
+
+	return overview, nil
+}
+
+// GetBoardFundFlowTracking 获取板块主力资金分钟级实时追踪曲线。
+func (ms *MarketService) GetBoardFundFlowTracking(category string, limit int, interval string) (models.BoardFundFlowTracking, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 28 {
+		limit = 28
+	}
+
+	normalizedCategory := normalizeBoardCategory(category)
+	inflowList, err := ms.fetchBoardFundFlowList(normalizedCategory, 1, 80, "1")
+	if err != nil {
+		return models.BoardFundFlowTracking{}, err
+	}
+	outflowList, outErr := ms.fetchBoardFundFlowList(normalizedCategory, 1, 80, "0")
+	if outErr != nil {
+		return models.BoardFundFlowTracking{}, outErr
+	}
+
+	result := models.BoardFundFlowTracking{
+		Category:   normalizedCategory,
+		Source:     "eastmoney board fflow/kline",
+		UpdateTime: inflowList.UpdateTime,
+		Inflow:     make([]models.BoardFundFlowTrackItem, 0, limit/4+1),
+		Outflow:    make([]models.BoardFundFlowTrackItem, 0, limit),
+	}
+	if result.UpdateTime == "" {
+		result.UpdateTime = outflowList.UpdateTime
+	}
+
+	if rows, statErr := ms.GetAllAStockSnapshot(false); statErr == nil {
+		for _, row := range rows {
+			if row.Price <= 0 || !isFiniteFloat(row.ChangePercent) {
+				continue
+			}
+			result.TotalAmount += row.Amount
+			switch {
+			case row.ChangePercent > 0:
+				result.UpCount++
+			case row.ChangePercent < 0:
+				result.DownCount++
+			}
+			if row.ChangePercent >= 9.8 {
+				result.LimitUpCount++
+			}
+			if row.ChangePercent <= -9.8 {
+				result.LimitDownCount++
+			}
+		}
+	} else if snap, snapErr := ms.BuildScanMarketSnapshot(); snapErr == nil {
+		result.TotalAmount = snap.TotalAmount
+		result.LimitUpCount = snap.LimitUpCount
+		result.LimitDownCount = snap.LimitDownCount
+		result.Warning = appendBoardTrackWarning(result.Warning, fmt.Sprintf("全A涨跌家数快照失败，仅补齐成交额/涨跌停：%v", statErr))
+	} else {
+		result.Warning = appendBoardTrackWarning(result.Warning, fmt.Sprintf("全A市场快照失败：%v", statErr))
+	}
+
+	inflowLimit := limit / 4
+	if inflowLimit < 4 {
+		inflowLimit = 4
+	}
+	if inflowLimit > 6 {
+		inflowLimit = 6
+	}
+	outflowLimit := limit - inflowLimit
+	if outflowLimit < 8 {
+		outflowLimit = 8
+	}
+
+	result.Inflow, result.Warning = ms.buildBoardFundFlowTrackItems(normalizedCategory, "inflow", inflowList.Items, inflowLimit, interval, result.Warning)
+	result.Outflow, result.Warning = ms.buildBoardFundFlowTrackItems(normalizedCategory, "outflow", outflowList.Items, outflowLimit, interval, result.Warning)
+
+	if len(result.Inflow) == 0 && len(result.Outflow) == 0 {
+		return result, fmt.Errorf("东财板块分钟资金流暂未返回可用曲线")
+	}
+
+	for _, item := range append(append([]models.BoardFundFlowTrackItem{}, result.Inflow...), result.Outflow...) {
+		if len(item.KLines) == 0 {
+			continue
+		}
+		last := item.KLines[len(item.KLines)-1]
+		if result.TradeDate == "" && len(last.Time) >= 10 {
+			result.TradeDate = last.Time[:10]
+		}
+		if result.TradeTime == "" && len(last.Time) >= 16 {
+			result.TradeTime = last.Time[11:16]
+		}
+		if result.UpdateTime == "" {
+			result.UpdateTime = last.Time
+		}
+		break
+	}
+	if result.UpdateTime == "" {
+		result.UpdateTime = time.Now().Format("2006-01-02 15:04:05")
+	}
+	return result, nil
+}
+
+func (ms *MarketService) buildBoardFundFlowTrackItems(category, side string, rows []models.BoardFundFlowItem, limit int, interval string, warning string) ([]models.BoardFundFlowTrackItem, string) {
+	items := make([]models.BoardFundFlowTrackItem, 0, limit)
+	seen := map[string]struct{}{}
+	for _, row := range rows {
+		if len(items) >= limit {
+			break
+		}
+		code := normalizeBoardCode(row.Code)
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		if side == "inflow" && row.MainNetInflow <= 0 {
+			continue
+		}
+		if side == "outflow" && row.MainNetInflow >= 0 {
+			continue
+		}
+
+		series, err := ms.GetBoardFundFlowSeries(code, interval, 0)
+		if err != nil || len(series.KLines) == 0 {
+			if err != nil {
+				warning = appendBoardTrackWarning(warning, fmt.Sprintf("%s%s分钟资金流缺失：%v", row.Name, code, err))
+			} else {
+				warning = appendBoardTrackWarning(warning, fmt.Sprintf("%s%s分钟资金流为空", row.Name, code))
+			}
+			continue
+		}
+
+		latest := series.KLines[len(series.KLines)-1]
+		items = append(items, models.BoardFundFlowTrackItem{
+			Rank:                len(items) + 1,
+			Code:                code,
+			Name:                firstNonEmptyString(series.Name, row.Name),
+			Category:            category,
+			Side:                side,
+			ChangePercent:       row.ChangePercent,
+			MainNetInflow:       row.MainNetInflow,
+			LatestMainNetInflow: latest.MainNetInflow,
+			KLines:              series.KLines,
+			UpdateTime:          latest.Time,
+		})
+	}
+	return items, warning
+}
+
+// GetBoardFundFlowSeries 获取单个板块的主力资金分钟/日级曲线。
+func (ms *MarketService) GetBoardFundFlowSeries(code string, interval string, limit int) (models.FundFlowKLineSeries, error) {
+	normalized := normalizeBoardCode(code)
+	if normalized == "" {
+		return models.FundFlowKLineSeries{}, fmt.Errorf("无效板块代码")
+	}
+	return ms.fetchFundFlowSeriesBySecID(normalized, "90."+normalized, interval, limit)
+}
+
+// GetMarketChangeDistribution 获取全A涨跌分布（基于当前全A快照）
+func (ms *MarketService) GetMarketChangeDistribution(includeBeijing bool) (models.MarketChangeDistribution, error) {
+	rows, err := ms.GetAllAStockSnapshot(includeBeijing)
+	if err != nil {
+		return models.MarketChangeDistribution{}, err
+	}
+
+	bins := []models.MarketChangeBin{
+		{Key: "limit_up", Label: "涨停", Side: "up", MinPct: 9.8},
+		{Key: "up_gt7", Label: ">7%", Side: "up", MinPct: 7, MaxPct: 9.8},
+		{Key: "up_5_7", Label: "5-7%", Side: "up", MinPct: 5, MaxPct: 7},
+		{Key: "up_3_5", Label: "3-5%", Side: "up", MinPct: 3, MaxPct: 5},
+		{Key: "up_0_3", Label: "0-3%", Side: "up", MinPct: 0, MaxPct: 3},
+		{Key: "flat", Label: "平", Side: "flat"},
+		{Key: "down_0_3", Label: "0-3%", Side: "down", MinPct: -3, MaxPct: 0},
+		{Key: "down_3_5", Label: "3-5%", Side: "down", MinPct: -5, MaxPct: -3},
+		{Key: "down_5_7", Label: "5-7%", Side: "down", MinPct: -7, MaxPct: -5},
+		{Key: "down_gt7", Label: "7%<", Side: "down", MinPct: -9.8, MaxPct: -7},
+		{Key: "limit_down", Label: "跌停", Side: "down", MaxPct: -9.8},
+	}
+
+	result := models.MarketChangeDistribution{
+		Bins:   bins,
+		Source: "eastmoney/tencent snapshot",
+	}
+	for _, row := range rows {
+		if row.Price <= 0 || !isFiniteFloat(row.ChangePercent) {
+			continue
+		}
+		pct := row.ChangePercent
+		result.Total++
+		if row.UpdateTime != "" && result.UpdateTime == "" {
+			result.UpdateTime = row.UpdateTime
+		}
+
+		switch {
+		case pct >= 9.8:
+			result.LimitUpCount++
+			result.UpCount++
+			result.Bins[0].Count++
+		case pct >= 7:
+			result.UpCount++
+			result.Bins[1].Count++
+		case pct >= 5:
+			result.UpCount++
+			result.Bins[2].Count++
+		case pct >= 3:
+			result.UpCount++
+			result.Bins[3].Count++
+		case pct > 0:
+			result.UpCount++
+			result.Bins[4].Count++
+		case pct == 0:
+			result.FlatCount++
+			result.Bins[5].Count++
+		case pct > -3:
+			result.DownCount++
+			result.Bins[6].Count++
+		case pct > -5:
+			result.DownCount++
+			result.Bins[7].Count++
+		case pct > -7:
+			result.DownCount++
+			result.Bins[8].Count++
+		case pct > -9.8:
+			result.DownCount++
+			result.Bins[9].Count++
+		default:
+			result.LimitDownCount++
+			result.DownCount++
+			result.Bins[10].Count++
+		}
+	}
+	if result.UpdateTime == "" {
+		result.UpdateTime = time.Now().Format("2006-01-02 15:04:05")
+	}
+	return result, nil
 }
 
 // GetStockMovesList 获取盘口异动列表
@@ -2025,8 +2593,15 @@ func (ms *MarketService) GetIndexFundFlowSeries(code string, interval string, li
 	if strings.TrimSpace(code) == "" {
 		return models.FundFlowKLineSeries{}, fmt.Errorf("未提供指数代码")
 	}
+	return ms.fetchFundFlowSeriesBySecID(code, indexSecID(code), interval, limit)
+}
+
+func (ms *MarketService) fetchFundFlowSeriesBySecID(code string, secID string, interval string, limit int) (models.FundFlowKLineSeries, error) {
 	if limit < 0 {
 		limit = 0
+	}
+	if strings.TrimSpace(secID) == "" {
+		return models.FundFlowKLineSeries{}, fmt.Errorf("未提供资金流secid")
 	}
 
 	params := url.Values{}
@@ -2035,7 +2610,7 @@ func (ms *MarketService) GetIndexFundFlowSeries(code string, interval string, li
 	params.Set("fields1", "f1,f2,f3,f7")
 	params.Set("fields2", "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65")
 	params.Set("ut", "b2884a393a59ad64002292a3e90d46a5")
-	params.Set("secid", indexSecID(code))
+	params.Set("secid", secID)
 
 	raw, err := ms.fetchMarketJSON(emFundFlowKLineURL+"?"+params.Encode(), map[string]string{
 		"Referer":    "https://quote.eastmoney.com/",
@@ -2051,7 +2626,7 @@ func (ms *MarketService) GetIndexFundFlowSeries(code string, interval string, li
 	}
 
 	series := models.FundFlowKLineSeries{
-		Code:   toStringLocal(data["code"]),
+		Code:   firstNonEmptyString(toStringLocal(data["code"]), strings.TrimSpace(code)),
 		Name:   toStringLocal(data["name"]),
 		Market: int(toInt64Any(data["market"])),
 	}
@@ -2496,16 +3071,75 @@ func toInt64Any(value any) int64 {
 }
 
 func (ms *MarketService) fetchMarketJSON(urlStr string, headers map[string]string) (map[string]any, error) {
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		result, err := ms.fetchMarketJSONOnce(urlStr, headers)
-		if err == nil {
-			return result, nil
+	// 部分网络环境下 push2.eastmoney.com 无法直连(connection reset)，
+	// 但延迟行情节点 push2delay.eastmoney.com 可用且数据一致(盘后/资金流无影响)。
+	// 因此为东财 push2 域名准备一个回退 URL，主节点失败时自动切换。
+	alt := eastmoneyDelayFallbackURL(urlStr)
+	urls := []string{urlStr}
+	if alt != "" {
+		// push2 主节点近 2 分钟内失败过 → 直接走延迟节点，跳过无谓重试(全A快照55页时省下大量时间)
+		dead := atomic.LoadInt64(&ms.emPush2DeadUnix)
+		if dead > 0 && time.Since(time.Unix(0, dead)) < 2*time.Minute {
+			urls = []string{alt}
+		} else {
+			urls = []string{urlStr, alt}
 		}
-		lastErr = err
-		time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
+	}
+	var lastErr error
+	for _, u := range urls {
+		for attempt := 0; attempt < 2; attempt++ {
+			result, err := ms.fetchMarketJSONOnce(u, headers)
+			if err == nil {
+				return result, nil
+			}
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 150 * time.Millisecond)
+		}
+		// 主节点(push2)失败 → 记下死亡时间，后续请求直接走延迟节点
+		if alt != "" && u == urlStr {
+			atomic.StoreInt64(&ms.emPush2DeadUnix, time.Now().UnixNano())
+		}
 	}
 	return nil, lastErr
+}
+
+// eastmoneyDelayFallbackURL 把东财实时行情节点换成延迟节点作为回退。
+// push2.eastmoney.com -> push2delay.eastmoney.com，其它返回空串(无回退)。
+func eastmoneyDelayFallbackURL(urlStr string) string {
+	if strings.Contains(urlStr, "://push2.eastmoney.com/") {
+		return strings.Replace(urlStr, "://push2.eastmoney.com/", "://push2delay.eastmoney.com/", 1)
+	}
+	return ""
+}
+
+func isFiniteFloat(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func appendBoardTrackWarning(current string, message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return current
+	}
+	if current == "" {
+		return message
+	}
+	if strings.Count(current, "；") >= 3 {
+		return current
+	}
+	if strings.Contains(current, message) {
+		return current
+	}
+	return current + "；" + message
 }
 
 func (ms *MarketService) fetchMarketJSONOnce(urlStr string, headers map[string]string) (map[string]any, error) {

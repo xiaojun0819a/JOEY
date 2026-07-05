@@ -1208,6 +1208,11 @@ func (s *F10Service) GetFundFlow(code normalizedCode) (models.FundFlowSeries, er
 		"Referer": "https://quote.eastmoney.com/",
 	})
 	if err != nil {
+		// 东财 push2his 在部分网络无法直连：回退到新浪资金流（约2年历史，含主力/超大/大单口径）。
+		if sinaSeries, sErr := s.fetchSinaFundFlowSeries(code.Lower, 30); sErr == nil && len(sinaSeries.Lines) > 0 {
+			s.setCache(cacheKey, sinaSeries)
+			return sinaSeries, nil
+		}
 		if ok {
 			if cached, ok := entry.value.(models.FundFlowSeries); ok {
 				return cached, fmt.Errorf("使用缓存数据（%s），上游错误: %v", entry.timestamp.Format("2006-01-02 15:04:05"), err)
@@ -1265,6 +1270,92 @@ func (s *F10Service) GetFundFlow(code normalizedCode) (models.FundFlowSeries, er
 	}
 	result.Latest = buildFundFlowLatest(result.Fields, result.Lines, result.Labels)
 	s.setCache(cacheKey, result)
+	return result, nil
+}
+
+// fundFlowFieldsLabels 资金流序列的字段与中文映射（与东财口径一致，供新浪兜底复用）。
+func fundFlowFieldsLabels() ([]string, map[string]string) {
+	return []string{
+			"f51", "f52", "f53", "f54", "f55", "f56", "f57", "f58", "f59", "f60", "f61", "f62", "f63", "f64", "f65",
+		}, map[string]string{
+			"f51": "date", "f52": "mainNet", "f53": "superNet", "f54": "largeNet",
+			"f55": "mediumNet", "f56": "smallNet", "f57": "mainRatio", "f58": "superRatio",
+			"f59": "largeRatio", "f60": "mediumRatio", "f61": "smallRatio", "f62": "close",
+			"f63": "changePercent", "f64": "reserved1", "f65": "reserved2",
+		}
+}
+
+// fetchSinaFundFlowSeries 用新浪资金流构造与东财同结构的 FundFlowSeries。
+// 新浪提供：主力净额(netamount)、主力净占比(ratioamount)、超大单净额(r0_net)、超大单净占比(r0_ratio)、
+// 收盘(trade)、涨跌幅(changeratio)；大单口径用"主力−超大"反推；中/小单新浪不单列，留空。
+func (s *F10Service) fetchSinaFundFlowSeries(symbol string, lmt int) (models.FundFlowSeries, error) {
+	code := strings.ToLower(strings.TrimSpace(symbol))
+	if len(code) < 8 || (!strings.HasPrefix(code, "sh") && !strings.HasPrefix(code, "sz")) {
+		return models.FundFlowSeries{}, fmt.Errorf("sina fundflow unsupported symbol: %s", symbol)
+	}
+	if lmt <= 0 {
+		lmt = 30
+	}
+	api := fmt.Sprintf("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=%d&sort=opendate&asc=0&daima=%s", lmt, code)
+	req, err := http.NewRequest("GET", api, nil)
+	if err != nil {
+		return models.FundFlowSeries{}, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://finance.sina.com.cn/")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return models.FundFlowSeries{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return models.FundFlowSeries{}, err
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return models.FundFlowSeries{}, fmt.Errorf("sina fundflow parse: %v", err)
+	}
+
+	num := func(v any) float64 { return parseFloat64Safe(toStringLocal(v)) }
+	f2 := func(x float64) string { return strconv.FormatFloat(x, 'f', 2, 64) }
+	lines := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		date := strings.TrimSpace(toStringLocal(row["opendate"]))
+		if date == "" {
+			continue
+		}
+		mainNet := num(row["netamount"])
+		superNet := num(row["r0_net"])
+		mainRatio := num(row["ratioamount"]) * 100
+		superRatio := num(row["r0_ratio"]) * 100
+		lines = append(lines, []string{
+			date,                              // f51 date
+			f2(mainNet),                       // f52 mainNet
+			f2(superNet),                      // f53 superNet
+			f2(mainNet - superNet),            // f54 largeNet(主力−超大反推)
+			"",                                // f55 mediumNet(新浪不单列)
+			"",                                // f56 smallNet
+			f2(mainRatio),                     // f57 mainRatio
+			f2(superRatio),                    // f58 superRatio
+			f2(mainRatio - superRatio),        // f59 largeRatio
+			"",                                // f60 mediumRatio
+			"",                                // f61 smallRatio
+			f2(num(row["trade"])),             // f62 close
+			f2(num(row["changeratio"]) * 100), // f63 changePercent
+			"", "",                            // f64/f65 reserved
+		})
+	}
+	if len(lines) == 0 {
+		return models.FundFlowSeries{}, fmt.Errorf("sina fundflow empty")
+	}
+	// 统一按日期倒序，保证 lines[0] 为最近交易日。
+	sort.SliceStable(lines, func(i, j int) bool { return lines[i][0] > lines[j][0] })
+
+	fields, labels := fundFlowFieldsLabels()
+	result := models.FundFlowSeries{Fields: fields, Lines: lines, Labels: labels}
+	result.Latest = buildFundFlowLatest(result.Fields, result.Lines, result.Labels)
 	return result, nil
 }
 
@@ -1867,14 +1958,21 @@ func (s *F10Service) fetchDataList(urlStr string, headers map[string]string) ([]
 }
 
 func (s *F10Service) fetchJSON(urlStr string, headers map[string]string) (map[string]any, error) {
+	// push2.eastmoney.com 在部分网络无法直连，回退到延迟节点 push2delay.eastmoney.com。
+	urls := []string{urlStr}
+	if alt := eastmoneyDelayFallbackURL(urlStr); alt != "" {
+		urls = append(urls, alt)
+	}
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		result, err := s.fetchJSONOnce(urlStr, headers)
-		if err == nil {
-			return result, nil
+	for _, u := range urls {
+		for attempt := 0; attempt < 3; attempt++ {
+			result, err := s.fetchJSONOnce(u, headers)
+			if err == nil {
+				return result, nil
+			}
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
 		}
-		lastErr = err
-		time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
 	}
 	return nil, lastErr
 }

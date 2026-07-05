@@ -89,7 +89,64 @@ type AppConfig struct {
 	Layout              LayoutConfig        `json:"layout"`     // 界面布局配置
 	OpenClaw            OpenClawConfig      `json:"openClaw"`   // OpenClaw 服务配置
 	Indicators          IndicatorConfig     `json:"indicators"` // 技术指标配置
-	History             HistoryConfig       `json:"history"`    // 历史数据采集配置
+	History             HistoryConfig       `json:"history"`     // 历史数据采集配置
+	Push                PushConfig          `json:"push"`        // 信号推送配置
+	TailForward         TailForwardConfig   `json:"tailForward"`      // 2:30 实盘向前验证配置
+	RemoteBackendURL       string           `json:"remoteBackendUrl"`       // 远程后端(NAS)内网地址,如 http://192.168.1.4:8810。非空且可达则桌面进"瘦身模式",前端路由到 NAS;空=本地全量
+	RemoteBackendPublicURL string           `json:"remoteBackendPublicUrl"` // 公网地址(Cloudflare 隧道,如 https://jcp.junai.uk)。内网探测失败时尝试,在外也能连 NAS
+	RemoteBackendToken     string           `json:"remoteBackendToken"`     // 访问令牌,与 NAS 的 JCP_TOKEN 一致;公网暴露必须设置
+	RemoteUsers            []RemoteUser     `json:"remoteUsers"`            // 访客账号(分发给他人的 app 用账号密码登录,权限受限)
+	RegisterInviteCode     string           `json:"registerInviteCode"`     // 自助注册邀请码;空=开放注册,非空则 Register 必须携带一致的邀请码
+}
+
+// RemoteUser 远程访客账号(密码存 SHA256 十六进制)
+type RemoteUser struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"passwordHash"`
+}
+
+// TailForwardConfig 2:30 实盘向前验证（尾盘买点闭环）配置
+type TailForwardConfig struct {
+	Enabled bool `json:"enabled"` // 2:30 定时扫描总开关
+	Auto    bool `json:"auto"`    // true=自动记入模拟持仓；false=仅出候选清单待确认
+}
+
+// PushConfig 信号推送配置（支持 Bark / Telegram / 飞书 / 企业微信）
+type PushConfig struct {
+	Enabled      bool            `json:"enabled"`      // 总开关
+	DedupHours   int             `json:"dedupHours"`   // 同股同信号防重小时数，<=0 默认 24
+	PushProxyURL string          `json:"pushProxyUrl"` // 国外渠道(Telegram/Bark)专用代理，留空则用全局代理
+	Bark         BarkChannel     `json:"bark"`
+	Telegram     TelegramChannel `json:"telegram"`
+	Feishu       WebhookChannel  `json:"feishu"`
+	WeWork       WebhookChannel  `json:"weWork"`
+	Monitor      MonitorConfig   `json:"monitor"` // 盘中持仓监控
+}
+
+// MonitorConfig 盘中信号监控配置（持仓盯盘 + 时间止损）
+type MonitorConfig struct {
+	Enabled          bool `json:"enabled"`          // 总开关
+	IntervalMinutes  int  `json:"intervalMinutes"`  // 盘中检查间隔(分钟)，<=0 默认 30
+	AfterMarketCheck bool `json:"afterMarketCheck"` // 16:00 盘后时间止损检查
+}
+
+// BarkChannel Bark 推送渠道
+type BarkChannel struct {
+	Enabled bool   `json:"enabled"`
+	URL     string `json:"url"` // 完整地址含 key，如 https://api.day.app/XXXXXX（也支持自建服务）
+}
+
+// TelegramChannel Telegram Bot 推送渠道
+type TelegramChannel struct {
+	Enabled  bool   `json:"enabled"`
+	BotToken string `json:"botToken"` // BotFather 给的 token
+	ChatID   string `json:"chatId"`   // 目标 chat id
+}
+
+// WebhookChannel 通用 Webhook 渠道（飞书自定义机器人 / 企业微信群机器人）
+type WebhookChannel struct {
+	Enabled bool   `json:"enabled"`
+	Webhook string `json:"webhook"` // 机器人 Webhook 地址
 }
 
 // ProxyMode 代理模式
