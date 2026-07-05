@@ -4012,23 +4012,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
             </button>
           ))}
           <div className={`flex items-center gap-2 ml-3 pl-3 border-l ${colors.isDark ? 'border-slate-700' : 'border-slate-300'}`}>
-            <select
-              value={mainChartTemplate}
-              onChange={event => setMainChartTemplate(event.target.value as MainChartTemplate)}
-              className={`rounded border px-1.5 py-0.5 text-[11px] font-semibold outline-none ${
-                colors.isDark
-                  ? 'border-slate-600 bg-slate-800/90 text-slate-100'
-                  : 'border-slate-300 bg-white/90 text-slate-700'
-              }`}
-              style={{ colorScheme: colors.isDark ? 'dark' : 'light' }}
-              title={isTrendLinePeriod ? '主图模板仅日K/周K/月K生效' : '主图模板'}
-            >
-              <option value="standard">主图：标准</option>
-              <option value="openEatFish">主图：开仓吃鱼</option>
-            </select>
-            {isTrendLinePeriod ? (
-              <span className={`text-[11px] ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>切日K生效</span>
-            ) : (
+            {!isTrendLinePeriod && (
               <>
               <div className={`flex items-center gap-1 text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
                 <ZoomIn size={12} />
