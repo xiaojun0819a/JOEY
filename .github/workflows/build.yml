@@ -108,7 +108,9 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path build/bin/${{ matrix.output }} -DestinationPath build/bin/JOEY_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }}
+          # exe 统一叫 JOEY.exe:与分发页安装包一致;自更新按运行中 exe 名匹配包内同名文件
+          Rename-Item -Path build/bin/${{ matrix.output }} -NewName JOEY.exe
+          Compress-Archive -Path build/bin/JOEY.exe -DestinationPath build/bin/JOEY_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.suffix }}
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
