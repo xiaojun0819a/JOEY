@@ -120,6 +120,11 @@ func (r *Registry) registerAllTools() {
 
 	// 注册筹码分布工具（由K线估算：平均成本/套牢比例/集中度）
 	r.registerTool("get_chip_distribution", "估算个股筹码分布（平均成本/获利套牢比例/成本区间集中度/主要套牢区）", r.createChipDistTool)
+
+	// 外部数据源工具(股吧舆情/市场情绪面/巨潮官方公告),实现见 datasource_extra.go
+	r.registerTool("get_guba_sentiment", "获取东方财富股吧个股热帖列表(标题/阅读/评论数)，用于判断散户情绪与题材发酵迹象", r.createGubaSentimentTool)
+	r.registerTool("get_market_mood", "获取全市场情绪面快照：涨跌家数分布、沪深两融余额近5日趋势、行业板块领涨领跌榜", r.createMarketMoodTool)
+	r.registerTool("get_cninfo_announcements", "查询巨潮资讯(证监会官方披露平台)个股公告，支持关键词过滤如问询函/减持/回购", r.createCninfoAnnTool)
 }
 
 // registerTool 注册单个工具并保存信息
