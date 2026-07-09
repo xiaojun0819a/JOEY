@@ -85,6 +85,15 @@ func NewIntradayService(dataDir string, ms *MarketService) (*IntradayService, er
 			return nil, fmt.Errorf("intraday schema: %w", err)
 		}
 	}
+	// 迁移:focus_ticks 增加竞价盘口两列(b1=买一量,s1=卖一量;竞价时段 min=匹配量,差=未匹配量;列已存在时忽略)
+	for _, m := range []string{
+		`ALTER TABLE focus_ticks ADD COLUMN b1 REAL DEFAULT 0`,
+		`ALTER TABLE focus_ticks ADD COLUMN s1 REAL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(m); err != nil {
+			intradayLog("focus_ticks 列迁移跳过: %v", err)
+		}
+	}
 	return &IntradayService{db: db, marketService: ms, finalDone: map[string]bool{}}, nil
 }
 
@@ -246,6 +255,36 @@ func (s *IntradayService) collectFocus(date, tickTime string) {
 	if len(codes) > focusPoolCap {
 		codes = codes[:focusPoolCap]
 	}
+
+	// 竞价时段(≤9:26)改走带盘口的报价:买一/卖一量即 匹配量/未匹配量(min=匹配,差=未匹配,TDX 竞价图口径)
+	if tickTime <= "09:26:00" {
+		rows, err := s.marketService.GetStockDataWithOrderBook(codes...)
+		if err != nil || len(rows) == 0 {
+			return
+		}
+		tx, err := s.db.Begin()
+		if err != nil {
+			return
+		}
+		st, _ := tx.Prepare(`INSERT OR REPLACE INTO focus_ticks (trade_date,stock_code,tick_time,price,pct,cum_volume,cum_amount,b1,s1) VALUES (?,?,?,?,?,?,?,?,?)`)
+		for _, r := range rows {
+			if r.Price <= 0 {
+				continue
+			}
+			var b1, s1 float64
+			if len(r.OrderBook.Bids) > 0 {
+				b1 = float64(r.OrderBook.Bids[0].Size)
+			}
+			if len(r.OrderBook.Asks) > 0 {
+				s1 = float64(r.OrderBook.Asks[0].Size)
+			}
+			_, _ = st.Exec(date, r.Symbol, tickTime, r.Price, r.ChangePercent, float64(r.Volume), r.Amount, b1, s1)
+		}
+		st.Close()
+		_ = tx.Commit()
+		return
+	}
+
 	stocks, err := s.marketService.GetStockRealTimeData(codes...)
 	if err != nil || len(stocks) == 0 {
 		return
@@ -254,7 +293,7 @@ func (s *IntradayService) collectFocus(date, tickTime string) {
 	if err != nil {
 		return
 	}
-	st, _ := tx.Prepare(`INSERT OR REPLACE INTO focus_ticks VALUES (?,?,?,?,?,?,?)`)
+	st, _ := tx.Prepare(`INSERT OR REPLACE INTO focus_ticks (trade_date,stock_code,tick_time,price,pct,cum_volume,cum_amount) VALUES (?,?,?,?,?,?,?)`)
 	for _, r := range stocks {
 		if r.Price <= 0 {
 			continue
@@ -317,13 +356,15 @@ func (s *IntradayService) AuctionFinal(date string, limit int) ([]AuctionFinalRo
 	return out, nil
 }
 
-// IntradayTick 分时点
+// IntradayTick 分时点。B1/S1 仅重点池竞价时段有值(买一/卖一量:min=匹配量,差=未匹配量)。
 type IntradayTick struct {
 	Time   string  `json:"time"`
 	Price  float64 `json:"price"`
 	Pct    float64 `json:"pct"`
 	Volume float64 `json:"volume"`
 	Amount float64 `json:"amount"`
+	B1     float64 `json:"b1,omitempty"`
+	S1     float64 `json:"s1,omitempty"`
 }
 
 // StockIntraday 某股某日分时序列(含竞价段)。
@@ -357,7 +398,7 @@ func (s *IntradayService) StockIntraday(code, date string) (auction []IntradayTi
 
 // StockFocusTicks 某股某日重点池 3s 线(仅自选/持仓股有)。
 func (s *IntradayService) StockFocusTicks(code, date string) ([]IntradayTick, error) {
-	q, err := s.db.Query(`SELECT tick_time,price,pct,cum_volume,cum_amount FROM focus_ticks
+	q, err := s.db.Query(`SELECT tick_time,price,pct,cum_volume,cum_amount,b1,s1 FROM focus_ticks
 		WHERE trade_date=? AND stock_code=? ORDER BY tick_time`, date, code)
 	if err != nil {
 		return nil, err
@@ -366,7 +407,7 @@ func (s *IntradayService) StockFocusTicks(code, date string) ([]IntradayTick, er
 	var out []IntradayTick
 	for q.Next() {
 		var t IntradayTick
-		if q.Scan(&t.Time, &t.Price, &t.Pct, &t.Volume, &t.Amount) == nil {
+		if q.Scan(&t.Time, &t.Price, &t.Pct, &t.Volume, &t.Amount, &t.B1, &t.S1) == nil {
 			out = append(out, t)
 		}
 	}

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { X, RefreshCw, Gavel, Plus, Check, ChevronDown, ChevronUp } from 'lucide-react';
-import { GetAuctionFinal, GetStockIntraday } from '../../wailsjs/go/main/App';
+import { GetAuctionFinal, GetStockIntraday, GetStockFocusTicks } from '../../wailsjs/go/main/App';
 import { useTheme } from '../contexts/ThemeContext';
 import { useCandleColor } from '../contexts/CandleColorContext';
 import type { Stock } from '../types';
@@ -23,6 +23,8 @@ interface AuctionTick {
   pct: number;
   volume: number;
   amount: number;
+  b1?: number; // 买一量(重点池竞价时段有值)
+  s1?: number; // 卖一量;min(b1,s1)=匹配量,差值=未匹配量(在多的一侧)
 }
 
 interface AuctionBoardDialogProps {
@@ -39,36 +41,70 @@ const localDateStr = (d: Date) => {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 };
 
-// 竞价过程迷你曲线(9:15-9:25,30s粒度)。前段可撤单常见"虚拉后回落",尾段9:20后才算真实意图。
+// 通达信式竞价图:上=匹配价折线;下=量区,底部正立柱为匹配量,顶部倒挂柱为未匹配量
+// (红=未匹配在买侧/买盘意愿强,绿=在卖侧)。未匹配量需盘口数据,目前仅自选/持仓股(重点池3s采集)有。
 const AuctionSparkline: React.FC<{ ticks: AuctionTick[]; up: string; down: string }> = ({ ticks, up, down }) => {
   if (!ticks || ticks.length < 2) {
-    return <div className="text-xs opacity-60 py-3 text-center">该股无竞价过程数据(可能停牌/无委托)</div>;
+    return <div className="text-xs opacity-60 py-3 text-center">该股无竞价过程数据(可能停牌/无委托,或早于采集启用日)</div>;
   }
-  const W = 560, H = 96, PAD = 6;
+  const W = 560, PH = 84, VH = 64, GAP = 8, PAD = 6;
+  const H = PH + GAP + VH;
   const prices = ticks.map(t => t.price);
   const min = Math.min(...prices), max = Math.max(...prices);
   const span = max - min || 1;
-  const x = (i: number) => PAD + (i / (ticks.length - 1)) * (W - PAD * 2);
-  const y = (p: number) => PAD + (1 - (p - min) / span) * (H - PAD * 2);
+  const n = ticks.length;
+  const x = (i: number) => PAD + (i / (n - 1)) * (W - PAD * 2);
+  const y = (p: number) => PAD + (1 - (p - min) / span) * (PH - PAD * 2);
   const pts = ticks.map((t, i) => `${x(i).toFixed(1)},${y(t.price).toFixed(1)}`).join(' ');
-  const last = ticks[ticks.length - 1];
-  const color = last.pct >= 0 ? up : down;
-  // 9:20 分界线(之后不可撤单)
+  const last = ticks[n - 1];
+  const lineColor = last.pct >= 0 ? up : down;
   const idx920 = ticks.findIndex(t => t.time >= '09:20');
+
+  // 量区:有盘口(b1/s1)→匹配量=min,未匹配=差值挂顶;无盘口→退化为匹配量柱
+  const hasDepth = ticks.some(t => (t.b1 || 0) > 0 || (t.s1 || 0) > 0);
+  const matched = ticks.map(t => (hasDepth ? Math.min(t.b1 || 0, t.s1 || 0) : t.volume || 0));
+  const unmatched = ticks.map(t => (hasDepth ? Math.abs((t.b1 || 0) - (t.s1 || 0)) : 0));
+  const unmatchedBuySide = ticks.map(t => (t.b1 || 0) > (t.s1 || 0));
+  const volMax = Math.max(...matched, ...unmatched, 1);
+  const volTop = PH + GAP;
+  const barW = Math.max(1.2, ((W - PAD * 2) / n) * 0.6);
+  const vh = (v: number) => (v / volMax) * (VH - 4);
+
   return (
     <div className="py-2">
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 110 }}>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: H + 14 }}>
         {idx920 > 0 && (
-          <line x1={x(idx920)} y1={PAD} x2={x(idx920)} y2={H - PAD} stroke="currentColor" strokeOpacity="0.25" strokeDasharray="3,3" />
+          <line x1={x(idx920)} y1={PAD} x2={x(idx920)} y2={H} stroke="currentColor" strokeOpacity="0.25" strokeDasharray="3,3" />
         )}
-        <polyline points={pts} fill="none" stroke={color} strokeWidth="1.8" />
+        <polyline points={pts} fill="none" stroke={lineColor} strokeWidth="1.8" />
+        <line x1={PAD} y1={volTop} x2={W - PAD} y2={volTop} stroke="currentColor" strokeOpacity="0.15" />
+        {ticks.map((t, i) => {
+          const cx = x(i) - barW / 2;
+          const m = vh(matched[i]);
+          const u = vh(unmatched[i]);
+          return (
+            <g key={i}>
+              {m > 0.5 && (
+                <rect x={cx} y={volTop + VH - m} width={barW} height={m}
+                  fill={t.price >= (ticks[i - 1]?.price ?? t.price) ? up : down} opacity="0.85" />
+              )}
+              {u > 0.5 && (
+                <rect x={cx} y={volTop} width={barW} height={u}
+                  fill={unmatchedBuySide[i] ? up : down} opacity="0.45" />
+              )}
+            </g>
+          );
+        })}
       </svg>
       <div className="flex justify-between text-[11px] opacity-70 px-1">
         <span>9:15</span>
-        <span>9:20(不可撤单)┆</span>
-        <span>
-          9:25 定型 {last.price.toFixed(2)}({last.pct >= 0 ? '+' : ''}{last.pct.toFixed(2)}%) · 高{max.toFixed(2)} 低{min.toFixed(2)}
-        </span>
+        <span>9:20┆不可撤单</span>
+        <span>9:25 定型 {last.price.toFixed(2)}({last.pct >= 0 ? '+' : ''}{last.pct.toFixed(2)}%)</span>
+      </div>
+      <div className="text-[11px] opacity-55 px-1 mt-0.5">
+        {hasDepth
+          ? '下柱=匹配量,顶部倒挂=未匹配量(红:剩在买侧·买盘强;绿:剩在卖侧)'
+          : '柱=匹配量;未匹配量仅自选/持仓股有(加自选后次日生效)'}
       </div>
     </div>
   );
@@ -129,8 +165,15 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
     setTicks([]);
     setTicksLoading(true);
     try {
-      const res: any = await GetStockIntraday(code, date);
-      setTicks((res && res.auction) || []);
+      // 优先重点池3s线(带买一/卖一量→可画未匹配量),回落全A竞价5s线(只有匹配量)
+      const [res, focus] = await Promise.all([
+        GetStockIntraday(code, date) as Promise<any>,
+        (GetStockFocusTicks(code, date) as Promise<any>).catch(() => null),
+      ]);
+      const focusAuction = ((focus as AuctionTick[]) || []).filter(
+        t => t.time <= '09:26:00' && ((t.b1 || 0) > 0 || (t.s1 || 0) > 0)
+      );
+      setTicks(focusAuction.length >= 2 ? focusAuction : ((res && res.auction) || []));
     } finally {
       setTicksLoading(false);
     }

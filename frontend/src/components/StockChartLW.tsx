@@ -1783,7 +1783,14 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const volumeSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   // 分时图前拼接的当日集合竞价段(9:15-9:25,数据来自 NAS intraday 采集,无数据时隐藏)
   const auctionSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
-  const [auctionTicks, setAuctionTicks] = useState<{ time: string; price: number }[]>([]);
+  const [auctionTicks, setAuctionTicks] = useState<{ time: string; price: number; volume: number }[]>([]);
+  // 竞价段降采样到每分钟末笔(130+个tick等距排布会挤掉分时横轴);主图价格线与量图匹配量柱共用
+  const sampledAuction = useMemo(() => {
+    if (auctionTicks.length < 2) return [] as { time: string; price: number; volume: number }[];
+    const byMinute = new Map<string, { time: string; price: number; volume: number }>();
+    for (const t of auctionTicks) byMinute.set(t.time.slice(0, 5), t);
+    return Array.from(byMinute.values());
+  }, [auctionTicks]);
   const vipAxisSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const vipAxisPaneRefs = useRef<Array<ISeriesApi<SeriesType, Time> | null>>([null, null, null]);
   const maSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
@@ -2181,7 +2188,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         const res: any = await GetStockIntraday(stock.symbol, auctionDateKey);
         if (!cancelled) {
           const list = (res && res.auction) || [];
-          setAuctionTicks(list.map((t: any) => ({ time: String(t.time), price: Number(t.price) })));
+          setAuctionTicks(list.map((t: any) => ({ time: String(t.time), price: Number(t.price), volume: Number(t.volume) || 0 })));
         }
       } catch {
         if (!cancelled) setAuctionTicks([]);
@@ -3381,10 +3388,25 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     }
     if (type === 'volume') {
       const s = vc.addSeries(HistogramSeries, { priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false }, paneIndex);
-      s.setData(chartData.map(d => ({
+      const volData = chartData.map(d => ({
         time: parseTime(d.time), value: d.volume,
         color: d.close >= d.open ? chartColors.upColor + '99' : chartColors.downColor + '99',
-      })) as HistogramData[]);
+      })) as HistogramData[];
+      // 分时+竞价开关开:量图前拼竞价匹配量柱(与主图竞价段同点位,保证上下两图时间轴对齐)
+      if (showAuction && period === '1m' && sampledAuction.length >= 2) {
+        const datePrefix = String(chartData[0]?.time || '').slice(0, 10);
+        if (datePrefix) {
+          const preClosePrice = preClose;
+          const auctionBars = sampledAuction.map(t => ({
+            time: parseTime(`${datePrefix} ${t.time}`),
+            value: t.volume,
+            color: (preClosePrice > 0 && t.price < preClosePrice ? chartColors.downColor : chartColors.upColor) + '66',
+          })) as HistogramData[];
+          s.setData([...auctionBars, ...volData]);
+          return [s];
+        }
+      }
+      s.setData(volData);
       return [s];
     }
     if (type === 'macd') {
@@ -3542,7 +3564,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       return refs;
     }
     return [];
-  }, [chartColors, fundFlowPoints, indicatorConfig, tradingSignals, stock?.symbol, stock?.name, floatSharesTick]);
+  }, [chartColors, fundFlowPoints, indicatorConfig, tradingSignals, stock?.symbol, stock?.name, floatSharesTick, showAuction, period, sampledAuction, preClose]);
 
   // 渲染副图：pane0=主选指标；四宫格模式再渲染 pane1/pane2
   const renderSubChart = useCallback((type: SubChartType, chartData: KLineData[]) => {
@@ -3625,18 +3647,16 @@ export const StockChartLW: React.FC<StockChartProps> = ({
 
       // 分时(仅1m,5日不拼)前拼接当日集合竞价段:琥珀色细线,日期取自当前分时数据,避免跨日错拼。
       // 降采样到每分钟末笔(否则130+个tick把横轴挤掉三分之一);不参与纵轴缩放(竞价瞬时撤单价会拉爆价格轴)。
-      if (showAuction && period === '1m' && auctionTicks.length >= 2) {
+      if (showAuction && period === '1m' && sampledAuction.length >= 2) {
         if (!auctionSeriesRef.current) {
           auctionSeriesRef.current = chart.addSeries(LineSeries, {
             color: '#f59e0b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
             autoscaleInfoProvider: () => null,
           });
         }
-        const byMinute = new Map<string, { time: string; price: number }>();
-        for (const t of auctionTicks) byMinute.set(t.time.slice(0, 5), t);
         const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
         const auctionData: LineData[] = datePrefix
-          ? Array.from(byMinute.values()).map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
+          ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
           : [];
         auctionSeriesRef.current.setData(auctionData);
       } else if (auctionSeriesRef.current) {
@@ -3859,7 +3879,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       }
       hasFittedRef.current = true;
     }
-  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, auctionTicks, showAuction]);
+  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, sampledAuction, showAuction]);
 
   // 副图指标独立于主图叠加开关，用户可自由切换 VOL/MACD/KDJ/RSI/CCI/WR（不再随设置回退）
 
