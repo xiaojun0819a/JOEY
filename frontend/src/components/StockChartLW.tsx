@@ -2178,8 +2178,13 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   // 拉取当日集合竞价段(仅分时1m)。日期跟随分时数据首根;9:13-9:27 盘中竞价窗口内 15s 轮询看生长。
   const auctionDateKey = showAuction && period === '1m' ? String(safeData[0]?.time || '').slice(0, 10) : '';
   useEffect(() => {
-    if (!showAuction || period !== '1m' || !stock?.symbol || !auctionDateKey) {
+    // 关闭/非分时/无股票 → 清空;但日期暂不可得(分时刷新的空中间态)时保留上次数据,不清空——
+    // 否则 4s 刷新会把竞价数据抖没,主图竞价折线随之消失。
+    if (!showAuction || period !== '1m' || !stock?.symbol) {
       setAuctionTicks([]);
+      return;
+    }
+    if (!auctionDateKey) {
       return;
     }
     let cancelled = false;
@@ -2204,6 +2209,22 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       if (timer) window.clearInterval(timer);
     };
   }, [period, stock?.symbol, auctionDateKey, showAuction]);
+
+  // 竞价数据异步到达时,主渲染的 fitContent 往往已错过(updateMode 非 full),导致竞价段落在可视窗口左侧外。
+  // 这里在竞价数据变化时补一次 fitContent,把 9:15-9:25 段纳入可视范围(仅竞价数据真变时触发,不受 4s 刷新影响)。
+  useEffect(() => {
+    if (!showAuction || period !== '1m' || sampledAuction.length < 2) return;
+    const chart = chartRef.current;
+    const vc = volumeChartRef.current;
+    if (!chart) return;
+    const id = requestAnimationFrame(() => {
+      try {
+        chart.timeScale().fitContent();
+        vc?.timeScale().fitContent();
+      } catch { /* chart 已卸载 */ }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [sampledAuction, showAuction, period]);
 
   const clearAllSeries = useCallback(() => {
     const chart = chartRef.current;
