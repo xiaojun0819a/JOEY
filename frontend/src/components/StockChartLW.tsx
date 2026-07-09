@@ -34,6 +34,7 @@ import { useCandleColor } from '../contexts/CandleColorContext';
 import { ResizeHandle } from './ResizeHandle';
 import { useIndicator } from '../contexts/IndicatorContext';
 import { getF10Overview } from '../services/f10Service';
+import { GetStockIntraday } from '../../wailsjs/go/main/App';
 import {
   parseTime,
   calculateSMA,
@@ -1778,6 +1779,9 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const volumeChartRef = useRef<IChartApi | null>(null);
   const mainSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
+  // 分时图前拼接的当日集合竞价段(9:15-9:25,数据来自 NAS intraday 采集,无数据时隐藏)
+  const auctionSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
+  const [auctionTicks, setAuctionTicks] = useState<{ time: string; price: number }[]>([]);
   const vipAxisSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const vipAxisPaneRefs = useRef<Array<ISeriesApi<SeriesType, Time> | null>>([null, null, null]);
   const maSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
@@ -2162,6 +2166,36 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   }, [preClose]);
 
   // 清除所有 series（不销毁图表实例）
+  // 拉取当日集合竞价段(仅分时1m)。日期跟随分时数据首根;9:13-9:27 盘中竞价窗口内 15s 轮询看生长。
+  const auctionDateKey = period === '1m' ? String(safeData[0]?.time || '').slice(0, 10) : '';
+  useEffect(() => {
+    if (period !== '1m' || !stock?.symbol || !auctionDateKey) {
+      setAuctionTicks([]);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res: any = await GetStockIntraday(stock.symbol, auctionDateKey);
+        if (!cancelled) {
+          const list = (res && res.auction) || [];
+          setAuctionTicks(list.map((t: any) => ({ time: String(t.time), price: Number(t.price) })));
+        }
+      } catch {
+        if (!cancelled) setAuctionTicks([]);
+      }
+    };
+    load();
+    const now = new Date();
+    const hm = now.getHours() * 100 + now.getMinutes();
+    let timer: number | undefined;
+    if (hm >= 913 && hm <= 927) timer = window.setInterval(load, 15000);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [period, stock?.symbol, auctionDateKey]);
+
   const clearAllSeries = useCallback(() => {
     const chart = chartRef.current;
     const volumeChart = volumeChartRef.current;
@@ -2174,6 +2208,10 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       }
       try { chart.removeSeries(mainSeriesRef.current); } catch { /* already removed */ }
       mainSeriesRef.current = null;
+    }
+    if (auctionSeriesRef.current) {
+      try { chart.removeSeries(auctionSeriesRef.current); } catch { /* already removed */ }
+      auctionSeriesRef.current = null;
     }
     clearSeriesArray(chart, maSeriesRefs);
     clearSeriesArray(chart, emaSeriesRefs);
@@ -3582,6 +3620,22 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         const avgData: LineData[] = safeData.filter(d => d.avg).map(d => ({ time: parseTime(d.time), value: d.avg! }));
         maSeriesRefs.current[0].setData(avgData);
       }
+
+      // 分时(仅1m,5日不拼)前拼接当日集合竞价段:琥珀色细线,日期取自当前分时数据,避免跨日错拼
+      if (period === '1m' && auctionTicks.length >= 2) {
+        if (!auctionSeriesRef.current) {
+          auctionSeriesRef.current = chart.addSeries(LineSeries, {
+            color: '#f59e0b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+          });
+        }
+        const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
+        const auctionData: LineData[] = datePrefix
+          ? auctionTicks.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
+          : [];
+        auctionSeriesRef.current.setData(auctionData);
+      } else if (auctionSeriesRef.current) {
+        auctionSeriesRef.current.setData([]);
+      }
     }
     // ---------- K线图 ----------
     else {
@@ -3799,7 +3853,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       }
       hasFittedRef.current = true;
     }
-  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick]);
+  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, auctionTicks]);
 
   // 副图指标独立于主图叠加开关，用户可自由切换 VOL/MACD/KDJ/RSI/CCI/WR（不再随设置回退）
 
