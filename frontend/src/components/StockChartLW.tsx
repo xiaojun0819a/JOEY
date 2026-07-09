@@ -1784,13 +1784,21 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   // 分时图前拼接的当日集合竞价段(9:15-9:25,数据来自 NAS intraday 采集,无数据时隐藏)
   const auctionSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const [auctionTicks, setAuctionTicks] = useState<{ time: string; price: number; volume: number }[]>([]);
-  // 竞价段降采样到每分钟末笔(130+个tick等距排布会挤掉分时横轴);主图价格线与量图匹配量柱共用
+  // 竞价段:按"价格变化点"降采样,保留通达信那种台阶折线观感(相邻同价合并),点数远少于原始tick,
+  // 不会把分时横轴挤宽;时间保留到秒级(台阶发生在秒级)。
   const sampledAuction = useMemo(() => {
-    if (auctionTicks.length < 2) return [] as { time: string; price: number; volume: number }[];
-    const byMinute = new Map<string, { time: string; price: number; volume: number }>();
-    for (const t of auctionTicks) byMinute.set(t.time.slice(0, 5), t);
-    return Array.from(byMinute.values());
+    const src = auctionTicks;
+    if (src.length < 2) return [] as { time: string; price: number; volume: number }[];
+    const out = [src[0]];
+    for (let i = 1; i < src.length; i++) {
+      if (src[i].price !== out[out.length - 1].price) out.push(src[i]);
+    }
+    const last = src[src.length - 1];
+    if (out[out.length - 1] !== last) out.push(last);
+    return out;
   }, [auctionTicks]);
+  // 竞价折线的纵轴范围:锁到分时线区间,让竞价期极端虚挂价超出部分被裁掉(而非拉爆价格轴)
+  const auctionPriceRangeRef = useRef<{ lo: number; hi: number }>({ lo: 0, hi: 0 });
   const vipAxisSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const vipAxisPaneRefs = useRef<Array<ISeriesApi<SeriesType, Time> | null>>([null, null, null]);
   const maSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
@@ -3669,19 +3677,25 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       // 分时(仅1m,5日不拼)前拼接当日集合竞价段:琥珀色细线,日期取自当前分时数据,避免跨日错拼。
       // 降采样到每分钟末笔(否则130+个tick把横轴挤掉三分之一);不参与纵轴缩放(竞价瞬时撤单价会拉爆价格轴)。
       if (showAuction && period === '1m' && sampledAuction.length >= 2) {
+        // 纵轴锁到分时线区间:竞价真实价格(含虚挂台阶)照画,超出分时区间的极端点被裁,不拉爆价格轴。
+        // autoscaleInfoProvider 返回非 null,竞价段仍参与时间轴(返回 null 会被 fitContent 排出可视区)。
+        const closes = safeData.map(d => d.close).filter(v => v > 0);
+        auctionPriceRangeRef.current = {
+          lo: closes.length ? Math.min(...closes) : 0,
+          hi: closes.length ? Math.max(...closes) : 0,
+        };
         if (!auctionSeriesRef.current) {
           auctionSeriesRef.current = chart.addSeries(LineSeries, {
-            color: '#f59e0b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            color: '#e2e8f0', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            autoscaleInfoProvider: () => {
+              const r = auctionPriceRangeRef.current;
+              return r.lo > 0 && r.hi > r.lo ? { priceRange: { minValue: r.lo, maxValue: r.hi } } : null;
+            },
           });
         }
-        // 竞价价 clamp 到分时线价格区间:避免竞价期虚挂/撤单的极端价把纵轴拉爆;
-        // 但仍让竞价段参与时间轴(不能用 autoscaleInfoProvider=null,否则会被 fitContent 排出可视区)
-        const closes = safeData.map(d => d.close).filter(v => v > 0);
-        const lo = closes.length ? Math.min(...closes) : 0;
-        const hi = closes.length ? Math.max(...closes) : Number.MAX_VALUE;
         const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
         const auctionData: LineData[] = datePrefix
-          ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: Math.min(hi, Math.max(lo, t.price)) }))
+          ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
           : [];
         auctionSeriesRef.current.setData(auctionData);
       } else if (auctionSeriesRef.current) {
