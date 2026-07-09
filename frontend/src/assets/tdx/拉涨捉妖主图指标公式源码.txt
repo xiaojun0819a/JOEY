@@ -1,0 +1,17 @@
+收盘价:=C;
+妖龙起飞A:=IF((收盘价>REF(收盘价,1)),88,0);
+妖龙起飞B:=IF(((收盘价)/(REF(收盘价,1))>1.05) AND ((HIGH)/(收盘价)<1.01) AND (妖龙起飞A>0),91,0);
+捉妖筹码:=(FILTER((妖龙起飞B>90),45)),COLORYELLOW;
+STICKLINE(捉妖筹码,O,C,1.5,0),COLORYELLOW;
+DRAWTEXT(捉妖筹码>0,L,' ★妖股起飞'),COLOR00C5FF;
+DRAWICON(捉妖筹码>0,L,9);MA5:EMA(C,5);
+MA13:EMA(C,13);
+FABC1:=Abs(((3.48*收盘价+HIGH+LOW)/4-EMA(收盘价,23))/EMA(收盘价,23));
+FABC2:=DMA(((2.15*收盘价+LOW+HIGH)/4),FABC1);
+金龙突破:=EMA(FABC2,200)*1.118;
+金龙突破2:=EMA(FABC2,200)*1.118;
+条件:=(C-REF(C,1))/REF(C,1)*100>8;
+金k线:=crOSS(C,金龙突破) AND 条件;
+黑马启动:=金K线*11,LINETHICK2;DRAWICON(金K线,L,13);
+STICKLINE(金K线,O,C,1.5,0),COLORMAGENTA;
+DRAWTEXT(金K线,L*0.99,' ★主力拉涨'),COLORRED;

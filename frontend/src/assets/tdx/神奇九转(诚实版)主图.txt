@@ -1,0 +1,38 @@
+{神奇九转 主图 · TD Sequential 九计数 复刻版
+ 来源: Tom DeMark 的 TD Setup, 平安证券/东方财富/富途的"神奇九转"同源。
+ 规则:
+ 上九转: 连续9日 收盘 > 4日前收盘, 计数标在K线上方, 数到9提示上涨连续性衰竭;
+ 下九转: 连续9日 收盘 < 4日前收盘, 计数标在K线下方, 数到9提示下跌连续性衰竭;
+ 中断即清零重数。
+ 与券商版的一处有意差异: 官方版在连续第6日才回头补显1~5、断了再整段抹掉,
+ 属于事后修改历史显示; 本版从1起实时显示, 1~5灰色弱化、6~8高亮、9醒目, 不重绘。
+ 使用边界(DeMark本人也这么说): 九转只是"连续性衰竭"的计数事实,
+ 适合震荡市和弱趋势; 强趋势中会连续出现多个九转而不反转, 勿单独当买卖依据。}
+
+DRAWKLINE(H,O,L,C);
+
+上计数:=BARSLASTCOUNT(C>REF(C,4));
+下计数:=BARSLASTCOUNT(C<REF(C,4));
+
+{1~5 弱化显示}
+DRAWNUMBER(上计数>=1 AND 上计数<=5,H*1.008,上计数),COLORGRAY;
+DRAWNUMBER(下计数>=1 AND 下计数<=5,L*0.992,下计数),COLORGRAY;
+
+{6~8 高亮: 结构临近完成}
+DRAWNUMBER(上计数>=6 AND 上计数<=8,H*1.008,上计数),COLORYELLOW;
+DRAWNUMBER(下计数>=6 AND 下计数<=8,L*0.992,下计数),COLORCYAN;
+
+{9: 结构完成}
+DRAWNUMBER(上计数=9,H*1.008,9),COLORRED;
+DRAWTEXT(上计数=9,H*1.035,'高九转'),COLORRED;
+DRAWNUMBER(下计数=9,L*0.992,9),COLORRED;
+DRAWTEXT(下计数=9,L*0.965,'低九转'),COLORRED;
+
+{9之后若连续条件仍在延续, 不再逐日计数;
+ 连到13单独提示一次——这本身就是"强趋势、九转失效环境"的客观证据}
+DRAWTEXT(上计数=13,H*1.035,'连续13:强趋势'),COLORMAGENTA;
+DRAWTEXT(下计数=13,L*0.965,'连续13:强趋势'),COLORMAGENTA;
+
+{右上角当前状态读数}
+DRAWTEXT_FIX(ISLASTBAR AND 上计数>0,0.80,0.02,0,STRCAT('上九转计数: ',CON2STR(上计数,0))),COLORYELLOW;
+DRAWTEXT_FIX(ISLASTBAR AND 下计数>0,0.80,0.02,0,STRCAT('下九转计数: ',CON2STR(下计数,0))),COLORCYAN;

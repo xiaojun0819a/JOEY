@@ -151,6 +151,9 @@ export const EXIT_REASON_LABEL: Record<string, string> = {
   time_stop: '5日<3%',
   take_profit: '止盈+15%',
   window_end: '到期',
+  breakeven: '保本离场',
+  trail: '移动止损',
+  struct_stop: '破确认前低',
 };
 export const exitReasonText = (reason?: string): string => {
   if (!reason) return '';

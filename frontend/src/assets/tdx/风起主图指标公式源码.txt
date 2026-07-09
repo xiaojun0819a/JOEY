@@ -1,0 +1,14 @@
+云梦1:=CLOSE*vol;
+云梦2:=EMA(云梦1,3)/EMA(VOL,3);
+云梦3:=EMA(云梦1,6)/EMA(VOL,6);
+云梦4:=EMA(云梦1,12)/EMA(VOL,12);
+云梦5:=EMA(云梦1,9)/EMA(VOL,9);
+云梦6:=(云梦2+云梦3+云梦4+云梦5)/4;
+姑苏:=EMA(云梦6,8);
+云深不知处:=1.06*姑苏;
+云梦云深:=云深不知处-(EMA(CLOSE,3)-云深不知处);
+龙游:EMA(云梦云深,5),COLORYELLOW;
+云梦10:=IF(龙游<=云深不知处,龙游,云深不知处);
+风起:2*云深不知处-云梦10,COLORMAGENTA;
+DRAWICON(crOSS(CLOSE,龙游),0.98*LOW,7);
+DRAWICON(CROSS(风起,龙游),LOW,9);

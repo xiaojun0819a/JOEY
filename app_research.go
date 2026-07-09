@@ -53,9 +53,28 @@ var (
 )
 
 func researchReportsDir() string {
-	dir := filepath.Join(paths.GetDataDir(), "reports")
+	return researchReportsDirAt("")
+}
+
+// researchReportsDirAt 报告目录;userDir 非空(访客分身)时落在用户私有目录下。
+func researchReportsDirAt(userDir string) string {
+	base := paths.GetDataDir()
+	if userDir != "" {
+		base = userDir
+	}
+	dir := filepath.Join(base, "reports")
 	_ = os.MkdirAll(dir, 0755)
 	return dir
+}
+
+// reportsDir 本实例(主人或访客分身)的报告目录。
+func (a *App) reportsDir() string {
+	return researchReportsDirAt(a.guestDataDir)
+}
+
+// researchJobKey 任务键带用户前缀,避免两个用户同时生成同一只股票的报告互相顶掉。
+func (a *App) researchJobKey(stockCode string) string {
+	return a.guestUsername + "|" + stockCode
 }
 
 func researchReportFileName(stockName, stockCode string) string {
@@ -74,8 +93,9 @@ func (a *App) StartResearchReport(stockCode, stockName string) ResearchReportSta
 		return ResearchReportStatus{Status: "failed", Error: "stockCode 不能为空"}
 	}
 
+	jobKey := a.researchJobKey(stockCode)
 	researchJobsMu.Lock()
-	if job, ok := researchJobs[stockCode]; ok {
+	if job, ok := researchJobs[jobKey]; ok {
 		job.mu.Lock()
 		st := job.status
 		job.mu.Unlock()
@@ -92,7 +112,7 @@ func (a *App) StartResearchReport(stockCode, stockName string) ResearchReportSta
 		StockName: stockName,
 		StartedAt: job.start.Format("2006-01-02 15:04:05"),
 	}
-	researchJobs[stockCode] = job
+	researchJobs[jobKey] = job
 	researchJobsMu.Unlock()
 
 	go a.runResearchReport(job, stockCode, stockName)
@@ -105,7 +125,7 @@ func (a *App) StartResearchReport(stockCode, stockName string) ResearchReportSta
 func (a *App) GetResearchReport(stockCode string) ResearchReportStatus {
 	stockCode = strings.TrimSpace(stockCode)
 	researchJobsMu.Lock()
-	job, ok := researchJobs[stockCode]
+	job, ok := researchJobs[a.researchJobKey(stockCode)]
 	researchJobsMu.Unlock()
 	if ok {
 		job.mu.Lock()
@@ -121,7 +141,7 @@ func (a *App) GetResearchReport(stockCode string) ResearchReportStatus {
 	if a.paperService != nil {
 		if rec, err := a.paperService.GetBoardReport(stockCode, researchReportPeriodKey); err == nil && rec != nil && rec.Report != "" {
 			fileName := researchReportFileName(rec.StockName, stockCode)
-			filePath := filepath.Join(researchReportsDir(), fileName)
+			filePath := filepath.Join(a.reportsDir(), fileName)
 			if _, err := os.Stat(filePath); err != nil {
 				// 文件丢了就按 md 重建一份
 				_ = os.WriteFile(filePath, []byte(markdownToWordHTML(strings.TrimSuffix(fileName, ".doc"), rec.Report)), 0644)
@@ -265,7 +285,7 @@ func (a *App) runResearchReport(job *researchJob, stockCode, stockName string) {
 
 	// 产出 Word 文件(HTML-in-.doc，Word/WPS 可直接打开)
 	fileName := researchReportFileName(stockName, stockCode)
-	filePath := filepath.Join(researchReportsDir(), fileName)
+	filePath := filepath.Join(a.reportsDir(), fileName)
 	title := strings.TrimSuffix(fileName, ".doc")
 	if err := os.WriteFile(filePath, []byte(markdownToWordHTML(title, report)), 0644); err != nil {
 		fail("写Word文件失败: " + err.Error())

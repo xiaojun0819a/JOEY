@@ -28,6 +28,30 @@ type ConfigService struct {
 	stockGroups   map[string][]string // symbol -> 分组ID列表
 	groupDefs     []models.StockGroup // 用户自定义分组定义
 	mu            sync.RWMutex
+
+	// configDelegate 非空 = 访客视图:自选/分组存本实例(用户私有目录),
+	// 而 config(AI key/专家/系统配置)全部转发给主人的实例——保持单一数据源且热更新即时可见。
+	configDelegate *ConfigService
+}
+
+// NewGuestConfigService 创建某访客的配置视图:自选/分组落在 userDir(每用户独立),config 委托 shared。
+func NewGuestConfigService(shared *ConfigService, userDir string) (*ConfigService, error) {
+	if err := os.MkdirAll(userDir, 0755); err != nil {
+		return nil, err
+	}
+	cs := &ConfigService{
+		watchlistPath:  filepath.Join(userDir, "watchlist.json"),
+		groupsPath:     filepath.Join(userDir, "watchlist_groups.json"),
+		groupDefsPath:  filepath.Join(userDir, "watchlist_group_defs.json"),
+		stockGroups:    make(map[string][]string),
+		configDelegate: shared,
+	}
+	if err := cs.loadWatchlist(); err != nil {
+		return nil, err
+	}
+	cs.loadStockGroups()
+	cs.loadStockGroupDefs()
+	return cs, nil
 }
 
 // NewConfigService 创建配置服务
@@ -247,6 +271,9 @@ func (cs *ConfigService) saveConfigLocked() error {
 
 // GetConfig 获取配置
 func (cs *ConfigService) GetConfig() *models.AppConfig {
+	if cs.configDelegate != nil {
+		return cs.configDelegate.GetConfig()
+	}
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	return cs.config
@@ -254,6 +281,9 @@ func (cs *ConfigService) GetConfig() *models.AppConfig {
 
 // UpdateConfig 更新配置
 func (cs *ConfigService) UpdateConfig(config *models.AppConfig) error {
+	if cs.configDelegate != nil {
+		return cs.configDelegate.UpdateConfig(config)
+	}
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	cs.config = config

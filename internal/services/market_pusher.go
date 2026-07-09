@@ -438,6 +438,8 @@ func klinePushRequestLength(period string) int {
 		return 1250
 	case "1m":
 		return 250
+	case "1d":
+		return 9000 // 全历史日K(>500根走档案库)
 	default:
 		return 240
 	}
@@ -510,7 +512,7 @@ func (p *MarketDataPusher) pushKLineDay() {
 		return
 	}
 
-	klines, err := p.marketService.GetKLineData(sub.Code, sub.Period, 120)
+	klines, err := p.marketService.GetKLineData(sub.Code, sub.Period, klinePushRequestLength(sub.Period))
 	if err != nil {
 		return
 	}

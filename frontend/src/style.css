@@ -178,6 +178,19 @@
         text-align: left;
     }
 
+    /* markstream 渲染的都是一次性完整文本(全传 final),不该有"仍在流入"的骨架占位。
+       但它对内嵌 HTML 块(如表格)结尾仍会挂灰色占位条,即便 final。这里直接隐藏这些
+       占位/骨架元素,避免报告末尾出现一排空白灰条。 */
+    .agent-message-content .html-block-node__placeholder,
+    .agent-message-content .html-block-node__placeholder-bar,
+    .agent-message-content .loading-skeleton,
+    .agent-message-content .skeleton-line,
+    .agent-message-content .code-skeleton,
+    .agent-message-content .code-height-placeholder,
+    .agent-message-content .code-loading-placeholder {
+        display: none !important;
+    }
+
     .agent-message-content p {
         margin: 0 0 0.5em 0;
     }

@@ -176,22 +176,69 @@ export function showLoginOverlay(base: string) {
 }
 
 export function installRemoteBridge(url: string, token?: string) {
-  const base = url.replace(/\/+$/, '')
+  let base = url.replace(/\/+$/, '')
   // 凭证:主人令牌(config 下发) > 访客会话令牌(登录后存 localStorage)
   const cred = token || localStorage.getItem(SESSION_KEY) || ''
   // 暴露给需要拼下载链接的功能(如投研报告 Word 文件 /reports/);token 供下载链接带 ?token=
   ;(window as any).__jcpRemoteBase = base
   ;(window as any).__jcpRemoteToken = cred
+  // 主人身份标志:凭证来自 config 下发的主人令牌(token 参数)而非访客会话令牌。
+  // 只有主人的 app 会拿到 token,分发版走登录换会话令牌→此标志为 false→账号管理入口隐藏。
+  ;(window as any).__jcpIsAdmin = !!token
+
+  // 按方法名挑超时:真正耗时的 AI/扫描/回补给长超时,其余给普通超时。
+  // 没有超时的 fetch 遇到公网隧道抖动会永远吊住,触发它的按钮就"点不动"。
+  const LONG_METHOD = /Scanner|Scan|Backfill|Enrich|Collect|Report|Meeting|GenerateStrategy|EnhancePrompt|Generate|Review|Diagnos/i
+  const rpcTimeout = (method: string) => {
+    if (LONG_METHOD.test(method)) return 16 * 60 * 1000 // 16min:圆桌/投研报告等
+    return 30 * 1000 // 普通操作 30s
+  }
+
+  // 网络切换自愈:连续网络级失败(超时/连不上)达阈值→让本地 Go 重新探测(内网↔公网隧道),热切地址。
+  // 典型场景:在家启动锁内网,出门切热点后内网全死;重探测会命中公网隧道,无需重启 app。
+  let netFailStreak = 0
+  let lastReprobeAt = 0
+  const maybeReprobe = () => {
+    netFailStreak++
+    const now = Date.now()
+    if (netFailStreak < 3 || now - lastReprobeAt < 30_000) return
+    lastReprobeAt = now
+    const w2 = window as any
+    const native = w2.__jcpLocalApp
+    if (!native?.ReprobeBackend) return
+    native.ReprobeBackend().then((m: any) => {
+      const next = String(m?.url || '').replace(/\/+$/, '')
+      if (m?.mode === 'remote' && next && next !== base) {
+        console.info('[remoteBridge] 网络切换,后端地址热切:', base, '→', next)
+        base = next
+        netFailStreak = 0
+      }
+    }).catch(() => { /* 重探测失败保持现址,下次再试 */ })
+  }
 
   // ---- 1) RPC 代理：接管 window.go.main.App ----
-  const rpc = async (method: string, args: any[]) => {
+  const rpc = async (method: string, args: any[], timeoutMs?: number) => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (cred) headers['X-JCP-Token'] = cred
-    const resp = await fetch(`${base}/rpc/${method}`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(args ?? []),
-    })
+    const ac = new AbortController()
+    const to = timeoutMs ?? rpcTimeout(method)
+    const timer = setTimeout(() => ac.abort(), to)
+    let resp: Response
+    try {
+      resp = await fetch(`${base}/rpc/${method}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(args ?? []),
+        signal: ac.signal,
+      })
+    } catch (e: any) {
+      clearTimeout(timer)
+      maybeReprobe()
+      if (e?.name === 'AbortError') throw new Error(`请求超时(${method})，请检查网络后重试`)
+      throw new Error(`网络错误(${method}): ${e?.message || e}`)
+    }
+    clearTimeout(timer)
+    netFailStreak = 0
     // 凭证无效/过期(或分发版首次使用):弹登录层换会话令牌
     if (resp.status === 401 && !token) {
       localStorage.removeItem(SESSION_KEY)
@@ -217,6 +264,7 @@ export function installRemoteBridge(url: string, token?: string) {
   // 装桥前先抓住本地真 Wails 绑定：窗口控制/打开浏览器/自更新这些是本地桌面操作，
   // 必须走本地，不能转发到无头的 NAS(NAS 上是空操作，点了没反应)。
   const localApp = w.go?.main?.App
+  w.__jcpLocalApp = localApp // 供网络自愈重探测直呼本地 Go(绕过远程代理)
   const LOCAL_METHODS = new Set([
     'OpenURL',
     'WindowMinimize',
@@ -226,7 +274,42 @@ export function installRemoteBridge(url: string, token?: string) {
     'DoUpdate',
     'RestartApp',
     'GetCurrentVersion',
+    // 交易情报库(第二大脑)V1:笔记存本机 intel.db、AI 用本机 config key,先本地跑。
+    // (持仓由前端从 NAS 取好传进 GenerateIntelDigest。后续要多设备同步/分发再迁 NAS。)
+    'AddIntelNote',
+    'ListIntelNotes',
+    'DeleteIntelNote',
+    'GenerateIntelDigest',
   ])
+
+  // 公开行情(高频轮询类)改由客户端本地直连数据源(腾讯等),不经 NAS——
+  // 分散负载、避免 NAS 单 IP 被数据源限流(实测新浪对 NAS 返 456)、且更快(无 NAS 中转/家宽瓶颈)。
+  // 私有/独占资源(账号/持仓/会话/AI/深度历史档案)仍走 NAS。
+  const LOCAL_MARKET_METHODS = new Set([
+    'GetMarketIndices',      // 大盘指数
+    'GetStockRealTimeData',  // 实时报价
+    'GetOrderBook',          // 盘口
+    'GetTelegraphList',      // 快讯
+    'SearchStocks',          // 股票搜索(公开数据,客户端本地搜;失败回落 NAS)
+  ])
+  // GetKLineData 按周期分:分时/5日(公开、高频)走本地;日/周/月要档案深度历史→走 NAS。
+  const routeLocalMarket = (method: string, args: any[]): boolean => {
+    if (!localApp || typeof localApp[method] !== 'function') return false
+    if (LOCAL_MARKET_METHODS.has(method)) return true
+    if (method === 'GetKLineData' && (args?.[1] === '1m' || args?.[1] === '5d')) return true
+    return false
+  }
+  // 行情类先本地,本地取数失败(个别客户端连不上数据源)才回落 NAS;其余直接 NAS。
+  const callMarketOrRpc = async (method: string, args: any[], timeoutMs?: number) => {
+    if (routeLocalMarket(method, args)) {
+      try {
+        return await localApp[method](...(args ?? []))
+      } catch {
+        return await rpc(method, args, timeoutMs)
+      }
+    }
+    return await rpc(method, args, timeoutMs)
+  }
 
   const appProxy = new Proxy(
     {},
@@ -236,7 +319,7 @@ export function installRemoteBridge(url: string, token?: string) {
         if (LOCAL_METHODS.has(prop) && localApp && typeof localApp[prop] === 'function') {
           return (...args: any[]) => localApp[prop](...args)
         }
-        return (...args: any[]) => rpc(prop, args)
+        return (...args: any[]) => callMarketOrRpc(prop, args)
       },
     }
   )
@@ -280,11 +363,28 @@ export function installRemoteBridge(url: string, token?: string) {
   const seenTelegraph = new Set<string>()
   let telegraphFirst = true
 
+  // 轮询用短超时:8s 没回就放弃这拍(数据本来就会被下一拍覆盖),避免慢请求堆积。
+  // 行情类轮询(指数/报价/盘口/K线)经 callMarketOrRpc 走本地直连,不再压 NAS。
+  const POLL_TIMEOUT = 8000
   const safeRpc = async (method: string, args: any[]) => {
     try {
-      return await rpc(method, args)
+      return await callMarketOrRpc(method, args, POLL_TIMEOUT)
     } catch {
       return null
+    }
+  }
+
+  // guard:给轮询加"在途锁"——上一拍还没回来就跳过这一拍,防止请求叠罗汉压垮主线程。
+  const guard = (fn: () => Promise<any>) => {
+    let busy = false
+    return async () => {
+      if (busy) return
+      busy = true
+      try {
+        await fn()
+      } finally {
+        busy = false
+      }
     }
   }
   const pollIndices = async () => {
@@ -320,23 +420,37 @@ export function installRemoteBridge(url: string, token?: string) {
   const pollKLine = async () => {
     if (!klineSub || !klineSub.code) return
     const { code, period } = klineSub
+    if (period === '1d') {
+      // 日K前端已一次性加载全历史,轮询只增量刷新最新一根(整包替换会把图缩回去且费流量)
+      const data = await safeRpc('GetKLineData', [code, '1d', 2])
+      if (Array.isArray(data) && data.length) {
+        dispatch(EV_KLINE, [{ code, period, data: [data[data.length - 1]], incremental: true }])
+      }
+      return
+    }
     const data = await safeRpc('GetKLineData', [code, period, klineLen(period)])
     if (Array.isArray(data) && data.length) dispatch(EV_KLINE, [{ code, period, data }])
   }
+  // 每个轮询套上在途锁:慢网络下也只会有一个在飞,不叠加。
+  const gIndices = guard(pollIndices)
+  const gStocks = guard(pollStocks)
+  const gTelegraph = guard(pollTelegraph)
+  const gOrderBook = guard(pollOrderBook)
+  const gKLine = guard(pollKLine)
   // 立即拉一次 + 定时轮询(盘口最快、快讯较慢)
   const kick = () => {
-    pollIndices()
-    pollTelegraph()
-    pollStocks()
-    pollOrderBook()
-    pollKLine()
+    gIndices()
+    gTelegraph()
+    gStocks()
+    gOrderBook()
+    gKLine()
   }
   setTimeout(kick, 300)
-  setInterval(pollIndices, 5000)
-  setInterval(pollStocks, 4000)
-  setInterval(pollTelegraph, 20000)
-  setInterval(pollOrderBook, 2500)
-  setInterval(pollKLine, 5000)
+  setInterval(gIndices, 5000)
+  setInterval(gStocks, 4000)
+  setInterval(gTelegraph, 20000)
+  setInterval(gOrderBook, 2500)
+  setInterval(gKLine, 5000)
 
   // —— 圆桌会议消息轮询 ——
   // 专家发言由后端 rt.Emit("meeting:message:<code>") 推送，远程模式 WS 不通收不到。
@@ -364,9 +478,10 @@ export function installRemoteBridge(url: string, token?: string) {
         st.count = msgs.length // 会话被清空
       }
     }
-    st.timer = setInterval(tick, 2000)
+    const gTick = guard(tick) // 同样加在途锁,慢网络下会议轮询不叠加
+    st.timer = setInterval(gTick, 2000)
     meetingPollers.set(code, st)
-    tick()
+    gTick()
   }
   const stopMeetingPoller = (code: string) => {
     const st = meetingPollers.get(code)

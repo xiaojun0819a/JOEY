@@ -103,6 +103,7 @@ type AppConfig struct {
 type RemoteUser struct {
 	Username     string `json:"username"`
 	PasswordHash string `json:"passwordHash"`
+	Trusted      bool   `json:"trusted"` // 信任账号:免资源类防线(重采集/未来的AI配额),但安全类限制(配置/密钥/账号管理)不变
 }
 
 // TailForwardConfig 2:30 实盘向前验证（尾盘买点闭环）配置

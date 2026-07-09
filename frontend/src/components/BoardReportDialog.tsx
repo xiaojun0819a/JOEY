@@ -449,6 +449,7 @@ export const BoardReportDialog: React.FC<BoardReportDialogProps> = ({
   // 默认展示本地四图合并判读面板(秒开)；老陈完整报告按需点按钮生成(慢、走AI网关)
   const [showAIReport, setShowAIReport] = useState(false);
   const [reportLoading, setReportLoading] = useState(false);
+  const [reportElapsed, setReportElapsed] = useState(0); // 生成已耗秒数(异步轮询回报),让用户看到在动
   const [generatedReport, setGeneratedReport] = useState('');
   const [reportError, setReportError] = useState('');
   const [reportAgentName, setReportAgentName] = useState('老陈');
@@ -465,6 +466,7 @@ export const BoardReportDialog: React.FC<BoardReportDialogProps> = ({
     generationStartedRef.current = true;
     setShowAIReport(true);
     setReportLoading(true);
+    setReportElapsed(0);
     setReportError('');
     setGeneratedReport('');
     setReportGeneratedAt('');
@@ -475,7 +477,7 @@ export const BoardReportDialog: React.FC<BoardReportDialogProps> = ({
         stockCode: stock.symbol,
         stockName: stock.name || '',
         period: PERIOD_LABELS[period],
-      });
+      }, (sec) => setReportElapsed(sec));
 
       if (!res) {
         setReportError('当前为浏览器预览模式，请从 Wails 开发入口打开后生成老陈完整报告。');
@@ -784,9 +786,11 @@ export const BoardReportDialog: React.FC<BoardReportDialogProps> = ({
             ) : reportLoading ? (
               <div className={`flex min-h-[420px] flex-col items-center justify-center rounded-md border p-6 text-center ${reportPanelClass}`}>
                 <Loader2 className="mb-3 h-7 w-7 animate-spin text-cyan-300" />
-                <div className="text-sm font-semibold">老陈正在生成完整报告</div>
+                <div className="text-sm font-semibold">
+                  老陈正在生成完整报告{reportElapsed > 0 ? ` · 已 ${reportElapsed}s` : ''}
+                </div>
                 <div className={`mt-2 max-w-[520px] text-xs leading-relaxed ${mutedTextClass}`}>
-                  正在拉取最新行情、财务、估值、主营业务、研报和同行对比数据。完整报告可能需要3-6分钟，可先点「看板」回本地判读。
+                  正在拉取最新行情、财务、估值、主营业务、研报和同行对比数据。完整报告可能需要3-8分钟，生成在后台进行，此窗口可关闭稍后回来看，也可先点「看板」回本地判读。
                 </div>
               </div>
             ) : reportError ? (

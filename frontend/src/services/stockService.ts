@@ -43,5 +43,11 @@ export const searchStocks = async (keyword: string): Promise<StockSearchResult[]
     warnWailsUnavailable('股票搜索', 'go');
     return [];
   }
-  return await SearchStocks(keyword) as StockSearchResult[];
+  try {
+    const r = await SearchStocks(keyword);
+    return Array.isArray(r) ? (r as StockSearchResult[]) : [];
+  } catch (e) {
+    console.error('[searchStocks] 失败', e);
+    return [];
+  }
 };

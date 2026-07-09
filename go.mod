@@ -9,9 +9,10 @@ require (
 	github.com/go-ego/gse v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/inconshreveable/go-update v0.0.0-20160112193335-8152e7eb6ccf
 	github.com/injoyai/tdx v0.0.79-0.20260225123406-1c15720bfffa
+	github.com/kr/binarydist v0.1.0
 	github.com/modelcontextprotocol/go-sdk v0.7.0
-	github.com/run-bigpig/go-github-selfupdate v1.0.1
 	github.com/sashabaranov/go-openai v1.41.2
 	github.com/wailsapp/wails/v2 v2.11.0
 	golang.org/x/text v0.31.0
@@ -34,14 +35,12 @@ require (
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/go-github/v30 v30.1.0 // indirect
-	github.com/google/go-querystring v1.0.0 // indirect
 	github.com/google/jsonschema-go v0.3.0 // indirect
+	github.com/google/pprof v0.0.0-20250403155104-27863c87afa6 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/safehtml v0.1.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect
 	github.com/googleapis/gax-go/v2 v2.15.0 // indirect
-	github.com/inconshreveable/go-update v0.0.0-20160112193335-8152e7eb6ccf // indirect
 	github.com/injoyai/base v1.2.20 // indirect
 	github.com/injoyai/conv v1.2.5 // indirect
 	github.com/injoyai/ios v1.2.2 // indirect
@@ -58,6 +57,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/onsi/gomega v1.38.3 // indirect
 	github.com/pelletier/go-toml/v2 v2.1.1 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
@@ -66,9 +66,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/samber/lo v1.49.1 // indirect
 	github.com/syndtr/goleveldb v1.0.0 // indirect
-	github.com/tcnksm/go-gitconfig v0.1.2 // indirect
 	github.com/tkrajina/go-reflector v0.5.8 // indirect
-	github.com/ulikunitz/xz v0.5.9 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/vcaesar/cedar v0.20.2 // indirect
@@ -81,10 +79,8 @@ require (
 	go.opentelemetry.io/otel/metric v1.38.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.38.0 // indirect
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/oauth2 v0.32.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251014184007-4626949a642f // indirect
 	google.golang.org/grpc v1.76.0 // indirect

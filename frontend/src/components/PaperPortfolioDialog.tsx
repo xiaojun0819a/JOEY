@@ -392,9 +392,9 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
                 <span key={s.source} className="shrink-0 fin-text-secondary">
                   {SOURCE_LABEL[s.source] || s.source}
                   <span className="ml-1 fin-text-tertiary">{s.total}笔</span>
-                  {s.closed > 0 && <span className={`ml-1 font-medium ${s.winRate >= 50 ? 'text-red-400' : 'text-green-400'}`}>胜{s.winRate.toFixed(0)}%</span>}
-                  {s.closed > 0 && <span className={`ml-1 ${s.avgReturn >= 0 ? 'text-red-400' : 'text-green-400'}`}>期望{s.avgReturn >= 0 ? '+' : ''}{s.avgReturn.toFixed(1)}%</span>}
-                  {s.closed > 0 && <span className="ml-1 fin-text-tertiary">赔{s.payoffRatio.toFixed(1)}</span>}
+                  {s.closed > 0 && <span className={`ml-1 font-medium ${(s.winRate || 0) >= 50 ? 'text-red-400' : 'text-green-400'}`}>胜{(s.winRate || 0).toFixed(0)}%</span>}
+                  {s.closed > 0 && <span className={`ml-1 ${(s.avgReturn || 0) >= 0 ? 'text-red-400' : 'text-green-400'}`}>期望{(s.avgReturn || 0) >= 0 ? '+' : ''}{(s.avgReturn || 0).toFixed(1)}%</span>}
+                  {s.closed > 0 && <span className="ml-1 fin-text-tertiary">赔{(s.payoffRatio || 0).toFixed(1)}</span>}
                 </span>
               ))}
             </div>
@@ -621,7 +621,7 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
                           <input type="number" step={0.01} defaultValue={p.costPrice}
                             onBlur={e => { const v = Number(e.target.value); if (v > 0 && v !== p.costPrice) saveCost(p, v, p.shares); }}
                             className={`w-20 px-1 py-0.5 rounded text-right font-mono ${dark ? 'bg-slate-900 text-slate-100 border border-slate-700' : 'bg-white text-slate-800 border border-slate-300'}`} />
-                        ) : <span className="font-mono">{p.costPrice.toFixed(2)}</span>}
+                        ) : <span className="font-mono">{(p.costPrice || 0).toFixed(2)}</span>}
                       </td>
                       <td className={`${td} text-right`}>
                         {isOpen ? (

@@ -103,12 +103,15 @@ type App struct {
 	f10Service        *services.F10Service
 	historyService    *services.HistoryService
 	archiveService    *services.ArchiveService // 1991-2025 全量历史档案(archive.db)
+	intradayService   *services.IntradayService // 竞价/分时实时采集(intraday.db)
 	pushService       *services.PushService
 	monitorService    *services.MonitorService
 	journalService    *services.JournalService
 	paperService      *services.PaperService
 	hotTrendService   *hottrend.HotTrendService
 	longHuBangService *services.LongHuBangService
+	compositeScoreService *services.CompositeScoreService // 综合评分选股(惰性初始化)
+	backupService     *services.BackupService             // 数据备份(惰性初始化)
 	marketPusher      *services.MarketDataPusher
 	meetingService    *meeting.Service
 	sessionService    *services.SessionService
@@ -172,6 +175,10 @@ func NewApp() *App {
 		log.Warn("History service error: %v", err)
 	}
 	archiveService := services.NewArchiveService()
+	intradayService, err := services.NewIntradayService(dataDir, marketService)
+	if err != nil {
+		log.Warn("Intraday service error: %v", err)
+	}
 
 	// 初始化推送服务
 	pushService, err := services.NewPushService(dataDir, configService)
@@ -259,8 +266,16 @@ func NewApp() *App {
 	agentContainer := agent.NewContainer()
 	agentContainer.LoadAgents(strategyService.GetAllAgents())
 
-	// 初始化更新服务(自更新从 xiaojun0819a/JOEY 独立仓库的 Release 拉取)
-	updateService := services.NewUpdateService("xiaojun0819a", "JOEY", Version)
+	// 初始化更新服务(自更新从 NAS joey-app.junai.uk 拉取,不走 GitHub)。
+	// 更新源优先用 config 的公网地址,空则用默认公网隧道。
+	updateService := services.NewUpdateService(Version, func() string {
+		if configService != nil {
+			if u := strings.TrimSpace(configService.GetConfig().RemoteBackendPublicURL); u != "" {
+				return u
+			}
+		}
+		return ""
+	})
 
 	// 初始化 OpenClaw 服务
 	openClawServer := openclaw.NewServer(meetingService, agentContainer, func(aiConfigID string) *models.AIConfig {
@@ -294,6 +309,7 @@ func NewApp() *App {
 		f10Service:          f10Service,
 		historyService:      historyService,
 		archiveService:      archiveService,
+		intradayService:     intradayService,
 		pushService:         pushService,
 		monitorService:      monitorService,
 		journalService:      journalService,
@@ -367,6 +383,20 @@ func (a *App) startup(ctx context.Context) {
 		log.Info("历史数据自动采集检查服务已启动")
 	}
 
+	// 每日 03:30 自动备份(库 VACUUM INTO + 配置/用户文件 tar;周日附带 intraday)
+	a.backup().Start()
+	log.Info("数据备份调度已启动(每日03:30,日备7份/周备4份)")
+
+	// 每周五收盘后自动综合评分:落快照攒验证样本 + Top10 过门等权开进模拟盘
+	a.composite().StartAutoRun(a.paperService)
+	log.Info("综合评分周任务已启动(周五16:30,快照+Top10模拟盘)")
+
+	// 竞价/分时实时采集(真实数据集自建:历史竞价/分时无处可补,只能前向攒)
+	if a.intradayService != nil {
+		a.intradayService.SetFocusPool(a.intradayFocusPool)
+		a.intradayService.Start(ctx)
+	}
+
 	// 启动时对模拟持仓按低吸退出纪律自动平仓一次（用真实前向日K，仅确认收盘）
 	if a.paperService != nil {
 		go func() {
@@ -404,6 +434,19 @@ func (a *App) startup(ctx context.Context) {
 // headless/NAS 后端是权威后端，绝不能因探测到自己而进瘦身模式，所以默认 false。
 var allowRemoteBackend = false
 
+// defaultRemoteBackendPublicURL 分发版内置的默认远程后端地址(公网隧道)。
+// config 里配了 RemoteBackendURL/PublicURL 则以 config 为准(主人机器不受影响)。
+const defaultRemoteBackendPublicURL = "https://joey-app.junai.uk"
+
+// ReprobeBackend 网络环境变化后重新探测远程后端(前端连续请求失败时调用)。
+// 典型场景:在家启动锁定内网地址,出门切热点后内网全超时→重探测切公网隧道,无需重启。
+func (a *App) ReprobeBackend() BackendMode {
+	a.remoteMode = false
+	a.remoteURL = ""
+	a.detectRemoteBackend()
+	return a.GetBackendMode()
+}
+
 // detectRemoteBackend 探测配置的远程后端(NAS)是否可达。短超时，不阻塞启动。
 func (a *App) detectRemoteBackend() {
 	if !allowRemoteBackend {
@@ -415,8 +458,9 @@ func (a *App) detectRemoteBackend() {
 		lanURL = strings.TrimSpace(cfg.RemoteBackendURL)
 		pubURL = strings.TrimSpace(cfg.RemoteBackendPublicURL)
 	}
+	// config 完全没配地址时,用内置分发默认(公网 NAS),保证 exe 单独双击也连服务器。
 	if lanURL == "" && pubURL == "" {
-		return // 未配置远程后端 = 本地全量模式(默认行为，零回归)
+		pubURL = defaultRemoteBackendPublicURL
 	}
 	a.remoteConfigured = true
 
@@ -431,18 +475,36 @@ func (a *App) detectRemoteBackend() {
 		return resp.StatusCode == http.StatusOK
 	}
 
-	// 先内网(快)，失败再公网(Cloudflare 隧道，在外也能连)
+	// 先内网(快):主人在家走局域网
 	if lanURL != "" && probe(lanURL, 2*time.Second) {
 		a.remoteMode = true
 		a.remoteURL = strings.TrimRight(lanURL, "/")
 		return
 	}
-	if pubURL != "" && probe(pubURL, 8*time.Second) {
+
+	// 没配内网地址 = 分发给别人的机器(主人机一定有内网地址 192.168.1.4)。
+	// 这类机器没有有价值的本地数据,直接进远程模式,不探测、绝不回落本地。
+	// (不能只判 usingDefault=config全空——旧版跑过 Install.bat 会残留公网地址,那时 usingDefault=false
+	//  却仍是分发机,若走探测+回落就会掉进本地模式显示本机垃圾自选、大盘/盘口抓不动。)
+	// 前端 remoteBridge 带 30s 超时连接,冷连接几秒自然连上,首开即正确。
+	if lanURL == "" {
 		a.remoteMode = true
 		a.remoteURL = strings.TrimRight(pubURL, "/")
-		log.Info("内网后端不可达，改走公网隧道: %s", a.remoteURL)
 		return
 	}
+
+	// 主人显式配的公网地址(在外时):探测+重试(冷启动 DNS/TLS/CF 慢,单次 8s 常不够)
+	if pubURL != "" {
+		for _, to := range []time.Duration{8 * time.Second, 12 * time.Second} {
+			if probe(pubURL, to) {
+				a.remoteMode = true
+				a.remoteURL = strings.TrimRight(pubURL, "/")
+				log.Info("走公网隧道后端: %s", a.remoteURL)
+				return
+			}
+		}
+	}
+	// 主人机探测失败:保留 fallback 回落本地快照
 	if a.remoteURL == "" {
 		if lanURL != "" {
 			a.remoteURL = strings.TrimRight(lanURL, "/")
@@ -8666,7 +8728,7 @@ func (a *App) SendMeetingMessage(req MeetingMessageRequest) []models.ChatMessage
 	// 先保存用户消息
 	userMsg := models.ChatMessage{
 		AgentID:   "user",
-		AgentName: "老韭菜",
+		AgentName: "",
 		Content:   req.Content,
 		ReplyTo:   req.ReplyToId,
 		Mentions:  req.MentionIds,

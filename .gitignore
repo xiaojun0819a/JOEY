@@ -19,3 +19,6 @@ flowforge
 *.log
 deploy_remote_access.sh
 tmp
+*.v1
+build/jcp-nas
+build/release-history/

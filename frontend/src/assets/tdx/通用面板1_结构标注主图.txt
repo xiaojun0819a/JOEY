@@ -1,0 +1,71 @@
+{通用面板1 · 结构标注 主图 · 诚实版
+ 原则: 只标注可验证事实,不画买卖点,所有线不重绘。
+ 适用: 全市场——主板10%/科创板创业板20%/北交所30%/ST5%自动判定。}
+
+{—— 板块与涨停幅度判定(含2020-08-24创业板注册制切换) ——}
+KCB:=CODELIKE('688');
+CYB:=CODELIKE('300') OR CODELIKE('301');
+BJS:=CODELIKE('43') OR CODELIKE('83') OR CODELIKE('87') OR CODELIKE('92');
+STG:=NAMELIKE('ST') OR NAMELIKE('*');
+ZTF:=IF(BJS,0.3,IF(KCB OR (CYB AND DATE>1200823),0.2,IF(STG,0.05,0.1)));
+涨停价:=ZTPRICE(REF(C,1),ZTF);
+跌停价:=DTPRICE(REF(C,1),ZTF);
+涨停:=C>=涨停价 AND C=H;
+跌停:=C<=跌停价 AND C=L;
+
+{—— K线: 涨停紫红/跌停亮绿高亮,其余默认 ——}
+DRAWKLINE(H,O,L,C);
+STICKLINE(涨停,O,C,3,0),COLORMAGENTA;
+STICKLINE(涨停,H,L,0,0),COLORMAGENTA;
+STICKLINE(跌停,O,C,3,0),COLOR00FF00;
+STICKLINE(跌停,H,L,0,0),COLOR00FF00;
+
+{—— 均线: 只画3条,减少噪音 ——}
+MA20:MA(C,20),COLORYELLOW;
+MA60:MA(C,60),COLORMAGENTA;
+MA250:MA(C,250),COLORGREEN;
+
+{—— 均线排列状态(右上角文字,状态陈述非信号) ——}
+多头:=C>MA20 AND MA20>MA60;
+空头:=C<MA20 AND MA20<MA60;
+DRAWTEXT_FIX(ISLASTBAR AND 多头,0.80,0.02,0,'均线:多头排列'),COLORRED;
+DRAWTEXT_FIX(ISLASTBAR AND 空头,0.80,0.02,0,'均线:空头排列'),COLORGREEN;
+DRAWTEXT_FIX(ISLASTBAR AND NOT(多头 OR 空头),0.80,0.02,0,'均线:纠缠'),COLORGRAY;
+
+{—— 确认前高/前低: 5日枢轴,实际高低点出现5日后才生效。
+     滞后是代价,换来的是历史线段永不回改(无BACKSET无ZIG)。}
+M:=5;
+HDOK:=REF(H,M)=HHV(H,2*M+1);
+LDOK:=REF(L,M)=LLV(L,2*M+1);
+确认前高:REF(REF(H,M),BARSLAST(HDOK)),COLORWHITE,DOTLINE;
+确认前低:REF(REF(L,M),BARSLAST(LDOK)),COLORBLUE,DOTLINE;
+
+{—— 止损参考: 昨日之前10日最低。纯位置参考,非建议。}
+止损参考:REF(LLV(L,10),1),COLORGREEN;
+
+{—— 事实标注 ——}
+DRAWTEXT(涨停 AND H=L,H*1.01,'一字'),COLORMAGENTA;
+炸板:=H>=涨停价*0.998 AND NOT(涨停);
+DRAWTEXT(炸板,H*1.01,'炸板'),COLORGREEN;
+倍量:=V>=REF(V,1)*2 AND V>MA(V,5);
+DRAWTEXT(倍量,L*0.99,'倍量'),COLORYELLOW;
+
+{—— 信息栏 ——}
+换手:=V/CAPITAL*100;
+DRAWTEXT_FIX(ISLASTBAR,0.005,0.02,0,STRCAT('流通市值(亿): ',CON2STR(C*CAPITAL/1000000,1))),COLORYELLOW;
+DRAWTEXT_FIX(ISLASTBAR,0.005,0.07,0,STRCAT('今日换手%: ',CON2STR(换手,2))),COLORYELLOW;
+DRAWTEXT_FIX(ISLASTBAR,0.005,0.12,0,STRCAT(STRCAT('明日涨停: ',CON2STR(C*(1+ZTF),2)),STRCAT('   明日跌停: ',CON2STR(C*(1-ZTF),2)))),COLORWHITE;
+
+{—— 结构事件标注(收盘确认的客观事件,非买卖建议。
+     确认前高/前低本身滞后5日不重绘,因此这些标注历史上也不回改。}
+破前高:=CROSS(C,确认前高);
+回破前低:=CROSS(确认前低,C);
+破十日低:=CROSS(止损参考,C);
+上季线:=FILTER(CROSS(C,MA60),5);
+破季线:=FILTER(CROSS(MA60,C),5);
+DRAWTEXT(破前高,L*0.985,'↑破前高'),COLORRED;
+DRAWTEXT(破前高 AND 倍量,L*0.965,'倍量'),COLORYELLOW;
+DRAWTEXT(回破前低,H*1.015,'↓破前低'),COLOR00FF00;
+DRAWTEXT(破十日低 AND NOT(回破前低),H*1.03,'↓破10日低'),COLORGREEN;
+DRAWTEXT(上季线,L*0.965,'↑站上季线'),COLORMAGENTA;
+DRAWTEXT(破季线,H*1.03,'↓破季线'),COLORGREEN;

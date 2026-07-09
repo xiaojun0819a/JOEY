@@ -97,17 +97,31 @@ func (a *App) Login(username, password string) LoginResponse {
 	}
 	cfg := a.configService.GetConfig()
 	hash := sha256Hex(password)
-	matched := false
+	// 主人万能钥匙:密码=JCP_TOKEN 时可登录任意已存在账号(代登查看该用户空间,审计留痕)。
+	masterLogin := false
+	master := os.Getenv("JCP_TOKEN")
+	matched := ""
 	for _, u := range cfg.RemoteUsers {
-		if strings.EqualFold(u.Username, username) && u.PasswordHash == hash {
-			matched = true
-			break
+		if !strings.EqualFold(u.Username, username) {
+			continue
 		}
+		if u.PasswordHash == hash {
+			matched = u.Username // 用账号表里的规范写法(登录不区分大小写,但数据目录按规范名隔离)
+		} else if master != "" && password == master {
+			matched = u.Username
+			masterLogin = true
+		}
+		break
 	}
-	if !matched {
+	if matched == "" {
 		// 小延迟增加暴力尝试成本
 		time.Sleep(600 * time.Millisecond)
 		return LoginResponse{Success: false, Error: "账号或密码错误"}
+	}
+	username = matched
+	if masterLogin {
+		recordAudit(username, "Login(主人代登)", "", "")
+		log.Info("主人代登访客账号: %s", username)
 	}
 	token, err := issueRemoteSession(username)
 	if err != nil {
@@ -194,6 +208,42 @@ func (a *App) SetRemoteUser(username, password string) string {
 	return "success"
 }
 
+// SetRegisterInviteCode 设置自助注册邀请码(空=开放注册)。仅主人令牌可调,headless 对访客拉黑。
+func (a *App) SetRegisterInviteCode(code string) string {
+	cfg := a.configService.GetConfig()
+	cfg.RegisterInviteCode = strings.TrimSpace(code)
+	if err := a.configService.UpdateConfig(cfg); err != nil {
+		return "保存失败: " + err.Error()
+	}
+	return "success"
+}
+
+// SetUserTrusted 设置/取消信任账号(仅主人令牌可调)。信任账号免资源类防线(重采集、未来的AI配额),
+// 但数据仍各自隔离,安全类限制(配置/密钥/账号/审计)照旧。
+func (a *App) SetUserTrusted(username string, trusted bool) string {
+	cfg := a.configService.GetConfig()
+	for i := range cfg.RemoteUsers {
+		if strings.EqualFold(cfg.RemoteUsers[i].Username, username) {
+			cfg.RemoteUsers[i].Trusted = trusted
+			if err := a.configService.UpdateConfig(cfg); err != nil {
+				return "保存失败: " + err.Error()
+			}
+			return "success"
+		}
+	}
+	return "账号不存在: " + username
+}
+
+// IsTrustedRemoteUser 查询某访客是否为信任账号(headless 分发器用)。
+func (a *App) IsTrustedRemoteUser(username string) bool {
+	for _, u := range a.configService.GetConfig().RemoteUsers {
+		if strings.EqualFold(u.Username, username) {
+			return u.Trusted
+		}
+	}
+	return false
+}
+
 // DeleteRemoteUser 删除访客账号并吊销其会话。
 func (a *App) DeleteRemoteUser(username string) string {
 	cfg := a.configService.GetConfig()
@@ -246,5 +296,10 @@ func (a *App) GetConfigMasked() *models.AppConfig {
 	cp.RemoteUsers = nil
 	cp.RegisterInviteCode = ""
 	cp.OpenClaw.APIKey = ""
+	// 推送渠道(Bark/Telegram/飞书/企微)全是主人的私人通道密钥;MCP 配置可能在 Endpoint/Args 里带 key;
+	// 代理地址可能内嵌账号密码——访客一律不可见。
+	cp.Push = models.PushConfig{Enabled: src.Push.Enabled}
+	cp.MCPServers = nil
+	cp.Proxy.CustomURL = ""
 	return &cp
 }

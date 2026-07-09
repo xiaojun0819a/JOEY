@@ -301,7 +301,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate, 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
       agentId: 'user',
-      agentName: '老韭菜',
+      agentName: '',
       role: '',
       content: query,
       timestamp: Date.now(),
@@ -659,13 +659,13 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate, 
               .filter(Boolean);
             // 获取引用的消息
             const quotedMsg = msg.replyTo ? messages.find(m => m.id === msg.replyTo) : null;
-            const displayName = msg.agentName || '老韭菜';
+            const displayName = ''; // 用户自己的消息不显示名字(拿掉"老韭菜")
 
             return (
                <div key={msg.id} className="flex gap-3 justify-end animate-in fade-in slide-in-from-bottom-2 duration-300">
                  <div className="flex-1 text-right max-w-[85%]">
                     <div className="flex items-baseline gap-2 mb-1 justify-end">
-                      <span className="text-xs font-bold text-accent-2">{displayName}</span>
+                      {displayName && <span className="text-xs font-bold text-accent-2">{displayName}</span>}
                       {mentionNames.length > 0 && (
                         <span className={`text-[10px] ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
                           @{mentionNames.join(', ')}

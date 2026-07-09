@@ -22,7 +22,9 @@ interface Props {
   dense?: boolean; // 紧凑模式（用于面板头部）
 }
 
-const fmtPct = (v: number, sign = false) => `${sign && v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
+// 容错:字段缺失/非数(远程数据可能没这些字段)时按 0 处理,绝不让 .toFixed 抛错崩页。
+const num = (v: any) => (typeof v === 'number' && isFinite(v) ? v : 0);
+const fmtPct = (v: number, sign = false) => { const n = num(v); return `${sign && n >= 0 ? '+' : ''}${n.toFixed(2)}%`; };
 
 // 涨红跌绿（A股习惯）：正=红 负=绿
 const upDown = (v: number) => (v >= 0 ? 'text-red-400' : 'text-green-400');
@@ -35,14 +37,14 @@ export const StrategyScorecard: React.FC<Props> = ({ title, metrics: m, classNam
   const tiles: { label: string; value: string; cls?: string; hint?: string; emph?: boolean }[] = [
     { label: '期望值/笔', value: fmtPct(m.expectancy, true), cls: upDown(m.expectancy), emph: true, hint: '每笔扣成本净收益均值，>0才赚钱' },
     { label: '超额/笔(alpha)', value: m.excess === undefined ? '—' : fmtPct(m.excess, true), cls: m.excess === undefined ? 'fin-text-tertiary' : upDown(m.excess), emph: true, hint: '相对同期等权全A的超额，>0才算真本事' },
-    { label: '胜率', value: `${m.winRate.toFixed(1)}%`, cls: m.winRate >= 50 ? 'text-red-400' : 'fin-text-secondary' },
-    { label: '赔率', value: m.payoffRatio.toFixed(2), cls: m.payoffRatio >= 1 ? 'text-red-400' : 'text-green-400', hint: '盈利单均值/亏损单均值，低胜率要靠高赔率' },
-    { label: '盈利因子', value: m.profitFactor.toFixed(2), cls: m.profitFactor >= 1 ? 'text-red-400' : 'text-green-400', hint: '总盈利/总亏损，>1才正期望' },
+    { label: '胜率', value: `${num(m.winRate).toFixed(1)}%`, cls: num(m.winRate) >= 50 ? 'text-red-400' : 'fin-text-secondary' },
+    { label: '赔率', value: num(m.payoffRatio).toFixed(2), cls: num(m.payoffRatio) >= 1 ? 'text-red-400' : 'text-green-400', hint: '盈利单均值/亏损单均值，低胜率要靠高赔率' },
+    { label: '盈利因子', value: num(m.profitFactor).toFixed(2), cls: num(m.profitFactor) >= 1 ? 'text-red-400' : 'text-green-400', hint: '总盈利/总亏损，>1才正期望' },
     { label: '单笔最大亏', value: fmtPct(m.maxLoss), cls: 'text-green-400', hint: '尾部风险，决定能否拿住' },
   ];
-  if (m.maxDrawdown !== undefined) tiles.push({ label: '最大回撤', value: fmtPct(-Math.abs(m.maxDrawdown)), cls: 'text-green-400' });
+  if (m.maxDrawdown !== undefined) tiles.push({ label: '最大回撤', value: fmtPct(-Math.abs(num(m.maxDrawdown))), cls: 'text-green-400' });
   if (m.benchmark !== undefined) tiles.push({ label: '同期基准', value: fmtPct(m.benchmark, true), cls: upDown(m.benchmark) });
-  if (m.avgHold !== undefined) tiles.push({ label: '持有', value: `${m.avgHold.toFixed(1)}天`, cls: 'fin-text-secondary' });
+  if (m.avgHold !== undefined) tiles.push({ label: '持有', value: `${num(m.avgHold).toFixed(1)}天`, cls: 'fin-text-secondary' });
 
   return (
     <div className={className}>

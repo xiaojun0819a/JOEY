@@ -9,6 +9,8 @@ import {mcp} from '../models';
 
 export function AddAgentConfig(arg1:models.AgentConfig):Promise<string>;
 
+export function AddIntelNote(arg1:string,arg2:Array<string>,arg3:string):Promise<main.IntelNote>;
+
 export function AddMCPServer(arg1:models.MCPServerConfig):Promise<string>;
 
 export function AddPaperPosition(arg1:string,arg2:string,arg3:string,arg4:number,arg5:number):Promise<string>;
@@ -43,9 +45,13 @@ export function CollectDailyHistory(arg1:models.HistoryCollectRequest):Promise<m
 
 export function DeleteAgentConfig(arg1:string):Promise<string>;
 
+export function DeleteIntelNote(arg1:number):Promise<string>;
+
 export function DeleteMCPServer(arg1:string):Promise<string>;
 
 export function DeletePaperPosition(arg1:number):Promise<string>;
+
+export function DeleteRemoteUser(arg1:string):Promise<string>;
 
 export function DeleteStockGroupDef(arg1:string):Promise<string>;
 
@@ -59,11 +65,13 @@ export function EnhancePrompt(arg1:main.EnhancePromptRequest):Promise<main.Enhan
 
 export function EnrichBacktestData(arg1:number,arg2:boolean):Promise<models.HistoryBackfillResult>;
 
+export function ForUser(arg1:string):Promise<main.App>;
+
 export function GenerateBoardReport(arg1:main.GenerateBoardReportRequest):Promise<main.GenerateBoardReportResponse>;
 
-export function GenerateStrategy(arg1:main.GenerateStrategyRequest):Promise<main.GenerateStrategyResponse>;
+export function GenerateIntelDigest(arg1:Array<models.HeldPosition>):Promise<main.IntelDigestResponse>;
 
-export function GetCachedBoardReport(arg1:string,arg2:string):Promise<main.GetCachedBoardReportResponse>;
+export function GenerateStrategy(arg1:main.GenerateStrategyRequest):Promise<main.GenerateStrategyResponse>;
 
 export function GetActiveStrategyID():Promise<string>;
 
@@ -71,7 +79,25 @@ export function GetAgentConfigs():Promise<Array<models.AgentConfig>>;
 
 export function GetAllHotTrends():Promise<Array<hottrend.HotTrendResult>>;
 
+export function GetArchiveBars(arg1:string,arg2:string,arg3:string,arg4:number):Promise<Array<services.ArchiveBar>>;
+
+export function GetArchiveCoverage():Promise<services.ArchiveCoverage>;
+
+export function GetArchiveKLine(arg1:string,arg2:string,arg3:string,arg4:number):Promise<Array<models.KLineData>>;
+
+export function GetArchiveStockInfo(arg1:string):Promise<services.ArchiveStockInfo>;
+
+export function GetAuctionFinal(arg1:string,arg2:number):Promise<Array<services.AuctionFinalRow>>;
+
+export function GetAuditLogs(arg1:string,arg2:string,arg3:number,arg4:number):Promise<Array<main.AuditEntry>>;
+
+export function GetAuditUsers():Promise<Array<main.AuditUserSummary>>;
+
 export function GetAvailableTools():Promise<Array<tools.ToolInfo>>;
+
+export function GetBackendMode():Promise<main.BackendMode>;
+
+export function GetBackupStatus():Promise<services.BackupResult>;
 
 export function GetBoardFundFlow(arg1:string,arg2:number,arg3:number):Promise<models.BoardFundFlowList>;
 
@@ -81,13 +107,25 @@ export function GetBoardFundFlowTracking(arg1:string,arg2:number,arg3:string):Pr
 
 export function GetBoardLeaders(arg1:string,arg2:number):Promise<models.BoardLeaderList>;
 
+export function GetBoardReportStatus(arg1:string,arg2:string):Promise<main.BoardReportStatus>;
+
+export function GetCachedBoardReport(arg1:string,arg2:string):Promise<main.GetCachedBoardReportResponse>;
+
+export function GetCninfoAnnouncements(arg1:string,arg2:string,arg3:number):Promise<services.CninfoResult>;
+
+export function GetCompositeValidation():Promise<models.CompositeValidationResult>;
+
 export function GetConfig():Promise<models.AppConfig>;
+
+export function GetConfigMasked():Promise<models.AppConfig>;
 
 export function GetCurrentVersion():Promise<string>;
 
 export function GetF10Overview(arg1:string):Promise<models.F10Overview>;
 
 export function GetF10Valuation(arg1:string):Promise<models.StockValuation>;
+
+export function GetGubaSentiment(arg1:string,arg2:number):Promise<services.GubaSummary>;
 
 export function GetHeldPositions():Promise<Array<models.HeldPosition>>;
 
@@ -96,6 +134,8 @@ export function GetHistoryAutoCollectStatus():Promise<models.HistoryAutoCollectS
 export function GetHotTrend(arg1:string):Promise<hottrend.HotTrendResult>;
 
 export function GetHotTrendPlatforms():Promise<Array<hottrend.PlatformInfo>>;
+
+export function GetIntradayCoverage():Promise<services.IntradayCoverage>;
 
 export function GetKLineData(arg1:string,arg2:string,arg3:number):Promise<Array<models.KLineData>>;
 
@@ -113,6 +153,8 @@ export function GetMarketChangeDistribution(arg1:boolean):Promise<models.MarketC
 
 export function GetMarketIndices():Promise<Array<models.MarketIndex>>;
 
+export function GetMarketMood():Promise<services.MarketMood>;
+
 export function GetMarketRegime():Promise<models.MarketRegime>;
 
 export function GetMarketStatus():Promise<services.MarketStatus>;
@@ -129,11 +171,19 @@ export function GetPaperRiskSummary():Promise<models.PaperRiskSummary>;
 
 export function GetPaperStats():Promise<models.PaperStats>;
 
+export function GetResearchReport(arg1:string):Promise<main.ResearchReportStatus>;
+
+export function GetResearchReportHTML(arg1:string):Promise<string>;
+
 export function GetSessionMessages(arg1:string):Promise<Array<models.ChatMessage>>;
+
+export function GetStockFocusTicks(arg1:string,arg2:string):Promise<Array<services.IntradayTick>>;
 
 export function GetStockGroupDefs():Promise<Array<models.StockGroup>>;
 
 export function GetStockGroups():Promise<Record<string, Array<string>>>;
+
+export function GetStockIntraday(arg1:string,arg2:string):Promise<main.StockIntradayResult>;
 
 export function GetStockMoves(arg1:string,arg2:number,arg3:number):Promise<models.StockMoveList>;
 
@@ -159,7 +209,15 @@ export function GetWatchlist():Promise<Array<models.Stock>>;
 
 export function Greet(arg1:string):Promise<string>;
 
+export function IsTrustedRemoteUser(arg1:string):Promise<boolean>;
+
+export function ListIntelNotes(arg1:string,arg2:number):Promise<Array<main.IntelNote>>;
+
 export function ListPaperPositions():Promise<Array<models.PaperPosition>>;
+
+export function ListRemoteUsers():Promise<Array<string>>;
+
+export function Login(arg1:string,arg2:string):Promise<main.LoginResponse>;
 
 export function NotifyFrontendReady():Promise<void>;
 
@@ -171,11 +229,15 @@ export function RefreshFundamentals():Promise<string>;
 
 export function RefreshFundamentalsHistory():Promise<string>;
 
+export function Register(arg1:string,arg2:string,arg3:string):Promise<main.LoginResponse>;
+
 export function RemoveFromWatchlist(arg1:string):Promise<string>;
 
 export function RenameStockGroupDef(arg1:string,arg2:string):Promise<string>;
 
 export function ReopenPaperPosition(arg1:number):Promise<string>;
+
+export function ReprobeBackend():Promise<main.BackendMode>;
 
 export function RestartApp():Promise<string>;
 
@@ -187,9 +249,13 @@ export function RunAfterMarketCheckOnce():Promise<number>;
 
 export function RunBacktest(arg1:models.BacktestRequest):Promise<models.BacktestResult>;
 
+export function RunBackupNow(arg1:boolean):Promise<services.BackupResult>;
+
 export function RunCaoYuanStandardScanner4A(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
 
 export function RunCaoYuanZhuangScanner4B(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
+
+export function RunCompositeScore(arg1:string):Promise<models.CompositeScoreResult>;
 
 export function RunDipEntryScannerV8(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
 
@@ -251,9 +317,19 @@ export function SendMeetingMessage(arg1:main.MeetingMessageRequest):Promise<Arra
 
 export function SetActiveStrategy(arg1:string):Promise<string>;
 
+export function SetRegisterInviteCode(arg1:string):Promise<string>;
+
+export function SetRemoteUser(arg1:string,arg2:string):Promise<string>;
+
 export function SetStockGroups(arg1:string,arg2:Array<string>):Promise<string>;
 
 export function SetTailForwardConfig(arg1:boolean,arg2:boolean):Promise<string>;
+
+export function SetUserTrusted(arg1:string,arg2:boolean):Promise<string>;
+
+export function StartBoardReport(arg1:main.GenerateBoardReportRequest):Promise<main.BoardReportStatus>;
+
+export function StartResearchReport(arg1:string,arg2:string):Promise<main.ResearchReportStatus>;
 
 export function SyncTradeJournalWatchGroup():Promise<string>;
 

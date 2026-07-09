@@ -171,8 +171,7 @@ func (ms *MarketService) cleanExpiredCache() {
 
 // getKLineCacheTTL 返回不同周期的缓存策略
 func (ms *MarketService) getKLineCacheTTL(period string) time.Duration {
-	// 分时需要高时效，避免增量推送读取到过旧缓存
-	// 30/60分钟当前K仍在盘中生长,同样走短缓存
+	// 分时需要高时效，避免增量推送读取到过旧缓存;30/60分钟当前K仍在盘中生长,同样走短缓存
 	if period == "1m" || period == "5d" || period == "30m" || period == "60m" {
 		return klineCacheTTLIntraday
 	}
@@ -480,6 +479,94 @@ func (ms *MarketService) fetchKLineDataFromSina(code string, period string, days
 const tencentKLineURL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq"
 
 // fetchKLineDataFromTencent 腾讯日线（又快又稳，作日线首选兜底）。仅日线。
+// tencentMinuteURL 腾讯当日分时(走势图),又快又稳(~0.2s)。返回 "HHMM 价 累计量 累计额" 数组。
+const tencentMinuteURL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=%s"
+
+// fetchTimeShareFromTencent 取今日分时。取代慢的 TDX GetKlineMinuteAll(~8s)+被限流的新浪(456)。
+func (ms *MarketService) fetchTimeShareFromTencent(code string) ([]models.KLineData, error) {
+	resp, err := ms.client.Get(fmt.Sprintf(tencentMinuteURL, code))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Data map[string]struct {
+			Data struct {
+				Date string   `json:"date"`
+				Data []string `json:"data"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, err
+	}
+	node, ok := r.Data[code]
+	if !ok || len(node.Data.Data) == 0 {
+		return nil, fmt.Errorf("腾讯分时无数据: %s", code)
+	}
+	date := node.Data.Date
+	if len(date) == 8 {
+		date = date[:4] + "-" + date[4:6] + "-" + date[6:8]
+	}
+	// 先解析成 (HH:MM, 价, 累计量, 累计额)
+	type mp struct {
+		hhmm             string
+		price, cVol, cAmt float64
+	}
+	pts := make([]mp, 0, len(node.Data.Data))
+	for _, line := range node.Data.Data {
+		f := strings.Fields(line) // "HHMM 价 累计量 累计额"
+		if len(f) < 3 || len(f[0]) != 4 {
+			continue
+		}
+		price, _ := strconv.ParseFloat(f[1], 64)
+		if price <= 0 {
+			continue
+		}
+		cVol, _ := strconv.ParseFloat(f[2], 64)
+		cAmt := 0.0
+		if len(f) >= 4 {
+			cAmt, _ = strconv.ParseFloat(f[3], 64)
+		}
+		pts = append(pts, mp{hhmm: f[0], price: price, cVol: cVol, cAmt: cAmt})
+	}
+	if len(pts) == 0 {
+		return nil, fmt.Errorf("腾讯分时解析为空: %s", code)
+	}
+	// ⚠️腾讯分时 volume 单位按板块不一致:科创板(688)是"股",主板/创业板是"手"(1手=100股)。
+	// calculateAvgLine 用 amount/volume 算 VWAP,需要 volume 是"股",否则主板算出 100 倍(均价线飞到天上)。
+	// 用最后一点的 累计额/累计量 与价格比判定:明显>价格(≈100倍)即 volume 是"手",全体×100 转股。
+	volScale := 1.0
+	if last := pts[len(pts)-1]; last.cVol > 0 && last.price > 0 {
+		if last.cAmt/last.cVol > last.price*5 {
+			volScale = 100
+		}
+	}
+	klines := make([]models.KLineData, 0, len(pts))
+	var prevVol, prevAmt float64
+	for _, p := range pts {
+		incVol := (p.cVol - prevVol) * volScale // 统一成"股"
+		incAmt := p.cAmt - prevAmt
+		if incVol < 0 {
+			incVol = 0
+		}
+		if incAmt < 0 {
+			incAmt = 0
+		}
+		prevVol, prevAmt = p.cVol, p.cAmt
+		klines = append(klines, models.KLineData{
+			Time:   date + " " + p.hhmm[:2] + ":" + p.hhmm[2:] + ":00",
+			Open:   p.price, High: p.price, Low: p.price, Close: p.price,
+			Volume: int64(incVol), Amount: incAmt,
+		})
+	}
+	return calculateAvgLine(klines), nil
+}
+
 func (ms *MarketService) fetchKLineDataFromTencent(code string, period string, days int) ([]models.KLineData, error) {
 	if period != "1d" {
 		return nil, fmt.Errorf("腾讯K线仅支持日线")
@@ -1176,6 +1263,7 @@ type ScanSnapshotRow struct {
 	Name               string
 	Price              float64
 	ChangePercent      float64
+	Volume             float64 // 成交量(手);竞价时段=匹配量
 	Amount             float64
 	TurnoverRate       float64
 	VolumeRatio        float64
@@ -1243,7 +1331,7 @@ func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) 
 		params.Set("pn", strconv.Itoa(page))
 		params.Set("pz", strconv.Itoa(pageSize))
 		params.Set("fs", fs)
-		params.Set("fields", "f12,f14,f2,f3,f6,f8,f10,f20,f21,f62,f184,f124,f13")
+		params.Set("fields", "f12,f14,f2,f3,f5,f6,f8,f10,f20,f21,f62,f184,f124,f13")
 		params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
 
 		raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
@@ -1284,6 +1372,7 @@ func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) 
 				Name:               name,
 				Price:              toFloat64Any(row["f2"]),
 				ChangePercent:      toFloat64Any(row["f3"]),
+				Volume:             toFloat64Any(row["f5"]),
 				Amount:             toFloat64Any(row["f6"]),
 				TurnoverRate:       toFloat64Any(row["f8"]),
 				VolumeRatio:        toFloat64Any(row["f10"]),

@@ -2,29 +2,49 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/run-bigpig/go-github-selfupdate/selfupdate"
+	"github.com/inconshreveable/go-update"
 	"github.com/run-bigpig/jcp/internal/logger"
 	"github.com/run-bigpig/jcp/internal/rt"
 )
 
 var updateLog = logger.New("update")
 
+// 默认更新源(NAS 公网隧道)。可被 config.RemoteBackendPublicURL 覆盖。
+const defaultUpdateBase = "https://joey-app.junai.uk"
+
 // UpdateService 更新检测服务
-// 负责从 GitHub Releases 检测和下载更新
+// 从自建 NAS(joey-app.junai.uk)拉版本清单和安装包,不走 GitHub(国内常连不上导致卡死)。
 type UpdateService struct {
 	ctx            context.Context
-	repoOwner      string // GitHub 仓库所有者
-	repoName       string // GitHub 仓库名称
-	currentVersion string // 当前版本号
+	currentVersion string           // 当前版本号
+	baseURLFn      func() string     // 返回更新源基址(默认公网隧道,可被 config 覆盖)
 }
+
+// updateManifest NAS 上的版本清单(/update/manifest.json)。
+// assets 按 "<GOOS>/<GOARCH>" 索引到全量安装包文件名(相对 /update/)。
+// patches 按 "<GOOS>/<GOARCH>" → "<当前版本>" 索引到增量补丁文件名——
+// 客户端当前版本有对应补丁时只下补丁(几百KB~几MB),否则回落下全量包。
+type updateManifest struct {
+	Version string                       `json:"version"`
+	Notes   string                       `json:"notes"`
+	Assets  map[string]string            `json:"assets"`
+	Patches map[string]map[string]string `json:"patches,omitempty"`
+}
+
+// assetKey 当前平台在清单里的键。
+func assetKey() string { return runtime.GOOS + "/" + runtime.GOARCH }
 
 // UpdateInfo 更新信息
 type UpdateInfo struct {
@@ -43,13 +63,46 @@ type UpdateProgress struct {
 	Percent int    `json:"percent"` // 进度百分比 (0-100)
 }
 
-// NewUpdateService 创建更新服务实例
-func NewUpdateService(repoOwner, repoName, currentVersion string) *UpdateService {
+// NewUpdateService 创建更新服务实例。baseURLFn 返回更新源基址(为空时用默认公网隧道)。
+func NewUpdateService(currentVersion string, baseURLFn func() string) *UpdateService {
 	return &UpdateService{
-		repoOwner:      repoOwner,
-		repoName:       repoName,
 		currentVersion: currentVersion,
+		baseURLFn:      baseURLFn,
 	}
+}
+
+// baseURL 解析当前更新源基址。
+func (u *UpdateService) baseURL() string {
+	base := ""
+	if u.baseURLFn != nil {
+		base = strings.TrimSpace(u.baseURLFn())
+	}
+	if base == "" {
+		base = defaultUpdateBase
+	}
+	return strings.TrimRight(base, "/")
+}
+
+// fetchManifest 拉取 NAS 版本清单。
+func (u *UpdateService) fetchManifest() (*updateManifest, error) {
+	url := u.baseURL() + "/update/manifest.json"
+	client := &http.Client{Timeout: 12 * time.Second} // 有超时,连不上会明确失败而非无限卡住
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("连接更新服务器失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("更新服务器返回 %d", resp.StatusCode)
+	}
+	var m updateManifest
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m); err != nil {
+		return nil, fmt.Errorf("解析版本清单失败: %w", err)
+	}
+	if m.Version == "" {
+		return nil, fmt.Errorf("版本清单缺少 version 字段")
+	}
+	return &m, nil
 }
 
 // Startup 在应用启动时调用
@@ -68,51 +121,49 @@ func (u *UpdateService) GetCurrentVersion() string {
 
 // CheckForUpdate 检查是否有可用更新
 func (u *UpdateService) CheckForUpdate() UpdateInfo {
-	repo := fmt.Sprintf("%s/%s", u.repoOwner, u.repoName)
-	updateLog.Info("检查更新: repo=%s, current=%s", repo, u.currentVersion)
+	updateLog.Info("检查更新: source=%s, current=%s", u.baseURL(), u.currentVersion)
 
-	latest, found, err := selfupdate.DetectLatest(repo)
+	m, err := u.fetchManifest()
 	if err != nil {
 		updateLog.Error("检测更新失败: %v", err)
 		return UpdateInfo{
 			HasUpdate:      false,
 			CurrentVersion: u.currentVersion,
-			Error:          fmt.Sprintf("检测更新失败: %v", err),
+			Error:          err.Error(),
 		}
 	}
 
-	if !found {
+	// 当前平台有没有对应安装包
+	if _, ok := m.Assets[assetKey()]; !ok {
 		return UpdateInfo{
 			HasUpdate:      false,
 			CurrentVersion: u.currentVersion,
-			LatestVersion:  u.currentVersion,
-			Error:          "未找到 GitHub Release",
+			LatestVersion:  m.Version,
+			ReleaseNotes:   m.Notes,
+			Error:          "该版本暂无当前系统(" + assetKey() + ")的安装包",
 		}
 	}
 
-	updateLog.Info("检测到版本: %s, URL: %s", latest.Version.String(), latest.URL)
+	updateLog.Info("检测到版本: %s", m.Version)
 
-	// 解析当前版本并比较
-	currentVer, err := semver.ParseTolerant(u.currentVersion)
-	if err != nil {
-		hasUpdate := latest.Version.String() != u.currentVersion
-		return UpdateInfo{
-			HasUpdate:      hasUpdate,
-			CurrentVersion: u.currentVersion,
-			LatestVersion:  latest.Version.String(),
-			ReleaseURL:     latest.URL,
-			ReleaseNotes:   latest.ReleaseNotes,
-			Error:          fmt.Sprintf("版本格式解析失败: %v", err),
+	hasUpdate := false
+	if cur, err := semver.ParseTolerant(u.currentVersion); err == nil {
+		if latest, err2 := semver.ParseTolerant(m.Version); err2 == nil {
+			hasUpdate = latest.GT(cur)
+		} else {
+			hasUpdate = m.Version != u.currentVersion
 		}
+	} else {
+		// 当前版本号非标准(如 dev):版本串不同即认为可更新
+		hasUpdate = m.Version != u.currentVersion
 	}
 
-	hasUpdate := latest.Version.GT(currentVer)
 	return UpdateInfo{
 		HasUpdate:      hasUpdate,
 		CurrentVersion: u.currentVersion,
-		LatestVersion:  latest.Version.String(),
-		ReleaseURL:     latest.URL,
-		ReleaseNotes:   latest.ReleaseNotes,
+		LatestVersion:  m.Version,
+		ReleaseURL:     u.baseURL() + "/download",
+		ReleaseNotes:   m.Notes,
 	}
 }
 
@@ -129,72 +180,123 @@ func (u *UpdateService) emitProgress(status, message string, percent int) {
 	rt.Emit("update:progress", progress)
 }
 
-// Update 执行更新（下载并替换当前可执行文件）
+// Update 执行更新：从 NAS 下载当前平台安装包并原地替换可执行文件。
 func (u *UpdateService) Update() error {
-	u.emitProgress("checking", "正在检查更新...", 0)
+	u.emitProgress("checking", "正在检查更新...", 10)
 
-	repo := fmt.Sprintf("%s/%s", u.repoOwner, u.repoName)
-
-	u.emitProgress("checking", "正在检测最新版本...", 10)
-	latest, found, err := selfupdate.DetectLatest(repo)
+	m, err := u.fetchManifest()
 	if err != nil {
-		u.emitProgress("error", fmt.Sprintf("检测更新失败: %v", err), 0)
-		return fmt.Errorf("检测更新失败: %w", err)
+		u.emitProgress("error", err.Error(), 0)
+		return err
 	}
 
-	if !found {
-		u.emitProgress("error", "未找到更新", 0)
-		return fmt.Errorf("未找到更新")
+	asset, ok := m.Assets[assetKey()]
+	if !ok || asset == "" {
+		msg := "该版本暂无当前系统(" + assetKey() + ")的安装包"
+		u.emitProgress("error", msg, 0)
+		return fmt.Errorf("%s", msg)
 	}
 
-	currentVer, err := semver.ParseTolerant(u.currentVersion)
-	if err != nil {
-		u.emitProgress("error", fmt.Sprintf("版本格式解析失败: %v", err), 0)
-		return fmt.Errorf("版本格式解析失败: %w", err)
-	}
-
-	if !latest.Version.GT(currentVer) {
-		u.emitProgress("error", "已是最新版本", 0)
-		return fmt.Errorf("已是最新版本")
-	}
-
-	exe, err := os.Executable()
-	if err != nil {
-		u.emitProgress("error", fmt.Sprintf("获取可执行文件路径失败: %v", err), 0)
-		return fmt.Errorf("获取可执行文件路径失败: %w", err)
-	}
-
-	// 下载进度回调
-	progressCallback := func(downloaded, total int64) {
-		if total > 0 {
-			downloadPercent := float64(downloaded) / float64(total)
-			currentPercent := 30 + int(downloadPercent*40)
-			downloadedMB := float64(downloaded) / (1024 * 1024)
-			totalMB := float64(total) / (1024 * 1024)
-			u.emitProgress("downloading",
-				fmt.Sprintf("正在下载 %s... (%.2f MB / %.2f MB)",
-					latest.Version.String(), downloadedMB, totalMB),
-				currentPercent)
-		} else {
-			downloadedMB := float64(downloaded) / (1024 * 1024)
-			u.emitProgress("downloading",
-				fmt.Sprintf("正在下载 %s... (已下载 %.2f MB)",
-					latest.Version.String(), downloadedMB),
-				50)
+	// 已是最新则不动(版本可比时)
+	if cur, e1 := semver.ParseTolerant(u.currentVersion); e1 == nil {
+		if latest, e2 := semver.ParseTolerant(m.Version); e2 == nil && !latest.GT(cur) {
+			u.emitProgress("error", "已是最新版本", 0)
+			return fmt.Errorf("已是最新版本")
 		}
 	}
 
-	u.emitProgress("downloading", fmt.Sprintf("正在下载版本 %s...", latest.Version.String()), 30)
-
-	if err := selfupdate.UpdateToWithProcess(latest.AssetURL, exe, progressCallback); err != nil {
-		u.emitProgress("error", fmt.Sprintf("更新失败: %v", err), 0)
-		return fmt.Errorf("更新失败: %w", err)
+	// 优先增量更新:当前版本有对应补丁则只下补丁(小、快),apply 时打到现有 exe 上。
+	if patch, ok := m.Patches[assetKey()][u.currentVersion]; ok && patch != "" {
+		if err := u.applyDownload(m.Version, patch, true); err == nil {
+			u.emitProgress("completed", fmt.Sprintf("更新完成！新版本 %s 已安装,重启后生效", m.Version), 100)
+			return nil
+		} else {
+			// 补丁失败(exe 被改过/补丁不匹配)→ 回落全量,不让用户卡住
+			updateLog.Warn("增量补丁失败,回落全量下载: %v", err)
+			u.emitProgress("downloading", "增量更新不适用,改为完整下载...", 30)
+		}
 	}
 
-	u.emitProgress("installing", "正在安装更新...", 90)
-	u.emitProgress("completed", fmt.Sprintf("更新完成！新版本 %s 已安装", latest.Version.String()), 100)
-
+	// 全量下载安装
+	if err := u.applyDownload(m.Version, asset, false); err != nil {
+		return err
+	}
+	u.emitProgress("completed", fmt.Sprintf("更新完成！新版本 %s 已安装,重启后生效", m.Version), 100)
 	return nil
+}
+
+// applyDownload 下载 name(相对 /update/ 或完整 URL)并 apply。isPatch=true 时按 bsdiff 补丁打到现有 exe。
+func (u *UpdateService) applyDownload(version, name string, isPatch bool) error {
+	url := name
+	if !strings.HasPrefix(name, "http") {
+		url = u.baseURL() + "/update/" + strings.TrimLeft(name, "/")
+	}
+	label := "完整包"
+	if isPatch {
+		label = "增量补丁"
+	}
+	u.emitProgress("downloading", fmt.Sprintf("正在下载%s (v%s)...", label, version), 30)
+
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		u.emitProgress("error", "下载失败: "+err.Error(), 0)
+		return fmt.Errorf("下载失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("下载失败,服务器返回 %d", resp.StatusCode)
+	}
+
+	total := resp.ContentLength
+	pr := &progressReader{
+		reader: resp.Body,
+		total:  total,
+		onProgress: func(read int64) {
+			pct := 30
+			msg := fmt.Sprintf("正在下载%s... (%.1f MB)", label, float64(read)/(1024*1024))
+			if total > 0 {
+				pct = 30 + int(float64(read)/float64(total)*55)
+				msg = fmt.Sprintf("正在下载%s... (%.1f / %.1f MB)", label,
+					float64(read)/(1024*1024), float64(total)/(1024*1024))
+			}
+			u.emitProgress("downloading", msg, pct)
+		},
+	}
+
+	u.emitProgress("installing", "正在安装更新...", 88)
+	opts := update.Options{}
+	if isPatch {
+		opts.Patcher = update.NewBSDiffPatcher() // 把补丁打到当前正在运行的 exe 上
+	}
+	if err := update.Apply(pr, opts); err != nil {
+		if rerr := update.RollbackError(err); rerr != nil {
+			u.emitProgress("error", "更新失败且回滚失败: "+rerr.Error(), 0)
+			return fmt.Errorf("更新失败且回滚失败: %w", rerr)
+		}
+		return fmt.Errorf("安装失败: %w", err)
+	}
+	return nil
+}
+
+// progressReader 包装下载流,边读边回报进度。
+type progressReader struct {
+	reader     io.Reader
+	total      int64
+	read       int64
+	onProgress func(read int64)
+	lastEmit   time.Time
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.reader.Read(b)
+	p.read += int64(n)
+	// 限流:最多 ~5 次/秒,避免事件刷屏
+	if p.onProgress != nil && time.Since(p.lastEmit) > 200*time.Millisecond {
+		p.onProgress(p.read)
+		p.lastEmit = time.Now()
+	}
+	return n, err
 }
 
 // RestartApplication 重启应用程序

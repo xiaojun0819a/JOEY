@@ -23,6 +23,13 @@ import {
 } from 'lightweight-charts';
 import { KLineData, TimePeriod, Stock, FundFlowSeries } from '../types';
 import { useTheme } from '../contexts/ThemeContext';
+import { evaluateTdxFormula } from '../utils/tdxEngine';
+import { getTdxFormula, TDX_MAIN_GROUPS, TDX_SUB_GROUPS } from '../utils/tdxCatalog';
+import { getF10Valuation } from '../services/f10Service';
+
+// 股本/估值缓存,供 TDX 引擎筹码估算(WINNER/COST)与 CAPITAL/FINANCE;跨图表实例共享
+interface StockFinCtx { floatShares?: number; totalShares?: number; pe?: number; pb?: number; floatMcap?: number; totalMcap?: number }
+const finCtxCache = new Map<string, StockFinCtx>();
 import { useCandleColor } from '../contexts/CandleColorContext';
 import { ResizeHandle } from './ResizeHandle';
 import { useIndicator } from '../contexts/IndicatorContext';
@@ -60,6 +67,7 @@ interface StockChartProps {
   dayKData?: KLineData[];
   mainChartTemplate?: MainChartTemplate;
   onMainChartTemplateChange?: (template: MainChartTemplate) => void;
+  showTemplateSelect?: boolean; // 在周期栏内显示主图模板切换(全屏图表用)
   initialGridMode?: boolean;
   initialSubChartType?: SubChartType;
   initialSubType2?: SubChartType;
@@ -83,7 +91,8 @@ export type SubChartType =
   | 'sellRisk'
   | 'vipAnomaly'
   | 'vipShortEnergy'
-  | 'vipFiveDragon';
+  | 'vipFiveDragon'
+  | `tdx:${string}`;
 type SubSelectOption = SubChartType | 'openEatFishMain';
 
 const SUB_OPTIONS: { id: SubSelectOption; label: string }[] = [
@@ -104,6 +113,48 @@ const SUB_OPTIONS: { id: SubSelectOption; label: string }[] = [
   { id: 'vipFiveDragon', label: '3五维擒龙VIP' },
   { id: 'openEatFishMain', label: '主图：开仓吃鱼' },
 ];
+
+// 四窗口自动组合:一键设置 主图模板 + 三个副图(仅全屏看板的组合下拉使用)
+interface ChartCombo {
+  id: string;
+  label: string;
+  main: MainChartTemplate;
+  subs: [SubChartType, SubChartType, SubChartType];
+}
+const CHART_COMBOS: ChartCombo[] = [
+  { id: 'fishBody', label: '鱼身组合', main: 'openEatFish', subs: ['vipAnomaly', 'vipShortEnergy', 'vipFiveDragon'] },
+  {
+    // 套餐A 打板/情绪周期:涨停判定(客观事实) + 影线拆量 + RSI/DMI状态带 + 开盘箱体大小单
+    id: 'limitUpMood',
+    label: '打板情绪',
+    main: 'tdx:连板王主图指标公式源码',
+    subs: ['tdx:监控资金波动指标公式', 'tdx:多彩共振指标公式源码', 'tdx:AI分时主图指标公式源码'],
+  },
+  {
+    // 套餐B 波段持仓:结构标注主图(原筹码云主图因COST无数据已删) + 量均线体系 + 中期区间位置 + 三级撑压
+    id: 'chipSwing',
+    label: '波段持仓',
+    main: 'tdx:通用面板1_结构标注主图',
+    subs: ['tdx:放量起飞指标公式源码', 'tdx:抓住黑马指标公式源码', 'tdx:短中长线撑压主图指标公式源码'],
+  },
+  {
+    // 套餐C 趋势跟踪+风控:唯一带止损止盈线的公式 + DMI趋势状态 + 量能 + 均线结构注释
+    id: 'trendRisk',
+    label: '趋势风控',
+    main: 'tdx:战赢趋势主图指标公式源码',
+    subs: ['tdx:多彩共振指标公式源码', 'tdx:监控资金波动指标公式', 'tdx:唐能通精准买卖源码'],
+  },
+  {
+    // 诚实版通用面板:结构标注(涨停/均线状态) + 情绪数板 + 量能结构 + 位置读数;只陈述事实不画买卖点
+    id: 'honestPanel',
+    label: '诚实面板',
+    main: 'tdx:通用面板1_结构标注主图',
+    subs: ['tdx:通用面板2_情绪数板副图', 'tdx:通用面板3_量能结构副图', 'tdx:通用面板4_位置读数副图'],
+  },
+];
+
+// 副图下拉的常规选项集合;组合可能把主图类TDX塞进副图窗口,不在此集合时下拉补一个回显项
+const TDX_SUB_OPTION_IDS = new Set(TDX_SUB_GROUPS.flatMap(g => g.items.map(f => f.id)));
 
 function isVipSubChartType(type: SubChartType): type is 'vipAnomaly' | 'vipShortEnergy' | 'vipFiveDragon' {
   return type === 'vipAnomaly' || type === 'vipShortEnergy' || type === 'vipFiveDragon';
@@ -183,6 +234,7 @@ export type VipAnomalyPoint = {
   superCount: number;
   purpleTop: number;
   purpleBottom: number;
+  escape: boolean; // 6.0 逃顶信号(趋势高位拐头/能量峰值回落),绿色钻石卖出
 };
 
 export type VipAnomalySeries = {
@@ -241,7 +293,7 @@ export type VipFiveDragonSeries = {
   endPrice: number;
 };
 
-export type MainChartTemplate = 'standard' | 'openEatFish';
+export type MainChartTemplate = 'standard' | 'openEatFish' | `tdx:${string}`;
 
 export type OpenEatFishPoint = {
   time: Time;
@@ -279,6 +331,7 @@ export type OpenEatFishSeries = {
   ma60: LineData[];
   lowerLimit: LineData[];
   upperBound: LineData[];
+  lowerBound: LineData[]; // 透明撑底线:保证彩带下方的止盈钻石(×0.86)在自动缩放范围内
 };
 
 type RangeStats = {
@@ -709,7 +762,7 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
   const sz9 = tdxSmaNumbers(sz8, 3, 1);
   const sz10 = sz8.map((value, index) => 3 * value - 2 * sz9[index]);
   const sz11 = close.map((_, index) => sz6[index] >= 76 || sz10[index] > 95);
-  const sz12 = sz4.map(value => value < 25);
+  const sz12 = sz4.map(value => value < 28);
   const sz13 = sz11.map((value, index) => value || sz12[index]);
 
   const sz14 = emaNumbers(close, 20);
@@ -737,15 +790,15 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
   const sz35 = sz33.map((value, index) => sz34[index] !== 0 ? value / sz34[index] : Infinity);
   const sz36 = low.map((value, index) => sz27[index] !== 0 ? value / sz27[index] : Infinity);
   const sz37 = close.map((value, index) => (
-    sz35[index] < 1.5
-    && refValue(sz36, index, 1) < 1.08
+    sz35[index] < 1.9
+    && refValue(sz36, index, 1) < 1.12
     && value > sz14[index]
     && value > sz33[index]
-    && sz36[index] < 1.1
+    && sz36[index] < 1.18
   ));
   const sz38 = amount.map(value => value / 10000);
   const llvSz38Two = rollingLowest(sz38, 2);
-  const sz39 = sz38.map((value, index) => llvSz38Two[index] > 600 && value > 1500);
+  const sz39 = sz38.map((value, index) => llvSz38Two[index] > 200 && value > 800);
   const sz40 = close.map((value, index) => index > 0 && close[index - 1] !== 0 ? value / close[index - 1] : 1);
 
   const sz41 = emaNumbers(close, 5);
@@ -758,7 +811,7 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
     && value > sz44[index]
     && volume[index] > refValue(volume, index, 1) * 1.05
     && sz39[index]
-    && sz40[index] > 1.01
+    && sz40[index] > 1.03
     && sz37[index]
   ));
 
@@ -770,7 +823,7 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
     crossUpValues(sz48, Array(data.length).fill(100), index)
     && volume[index] > refValue(volume, index, 1) * 1.05
     && sz39[index]
-    && sz40[index] > 1.01
+    && sz40[index] > 1.03
     && sz37[index]
   ));
 
@@ -783,17 +836,17 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
   const sz56 = close.map((_, index) => Math.abs(sz50[index] / sz52[index] - 1));
   const sz58 = sz40.map(value => value - 1);
   const sz59 = close.map((_, index) => (sz50[index] + sz51[index] + sz52[index]) / 3);
-  const sz60 = close.map((value, index) => value > sz59[index] * 1.01 && value < sz59[index] * 1.25);
+  const sz60 = close.map((value, index) => value > sz59[index] * 1.00 && value < sz59[index] * 1.35);
   const sz61 = sz53.map((value, index) => {
     const ref = refValue(sz53, index, 20);
     return ref !== 0 ? value / ref : NaN;
   });
   const sz62 = sz61.map(value => Math.abs(value - 1));
-  const sz63 = sz62.map(value => value < 0.08);
+  const sz63 = sz62.map(value => value < 0.12);
   const sz64 = close.map((_, index) => (
-    sz54[index] < 0.08
-    && sz55[index] < 0.08
-    && sz56[index] < 0.08
+    sz54[index] < 0.12
+    && sz55[index] < 0.12
+    && sz56[index] < 0.12
     && sz58[index] > 0.02
     && sz60[index]
     && sz63[index]
@@ -801,12 +854,12 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
   ));
   const sz65 = close.map((_, index) => sz64[index] && volume[index] > refValue(volume, index, 1) * 1.05 && sz39[index] && sz37[index]);
   const sz66 = close.map((value, index) => (
-    sz35[index] < 1.35
-    && refValue(sz36, index, 1) < 1.10
+    sz35[index] < 1.45
+    && refValue(sz36, index, 1) < 1.12
     && value > sz14[index]
     && value > sz33[index]
-    && sz36[index] < 1.15
-    && sz40[index] > 1.02
+    && sz36[index] < 1.18
+    && sz40[index] > 1.03
     && volume[index] > refValue(volume, index, 1) * 1.05
     && sz39[index]
     && sz37[index]
@@ -814,11 +867,65 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
   const sz67 = close.map((value, index) => (
     low[index] < sz34[index]
     && value > sz33[index]
-    && sz40[index] > 1.02
+    && sz40[index] > 1.03
     && volume[index] > refValue(volume, index, 1) * 1.05
   ));
-  const sz68 = close.map((_, index) => sz46[index] || sz49[index] || sz65[index] || sz66[index] || sz67[index]);
+
+  // 6.0 鱼头/鱼尾门控:仅红彩带多头区间触发鱼头(与主图彩带同口径),鱼尾自动屏蔽
+  const a13 = emaNumbers(tp3, 13);
+  const abc2 = emaNumbers(tp3, 14);
+  const strong = a13.map((value, index) => value > refValue(a13, index, 1) && lifeLine[index] < abc2[index]);
+  const maBull = close.map((_, index) => (
+    sz41[index] > refValue(sz41, index, 1) && sz42[index] > refValue(sz41, index, 1) // 按源码原样:S42>REF(S41,1)
+  ));
+  const sz68 = close.map((_, index) => (
+    (sz46[index] || sz49[index] || sz65[index] || sz66[index] || sz67[index])
+    && maBull[index]
+    && sz40[index] > 1.03
+    && existTrue(strong, index, 3)
+    && strong[index]
+  ));
   const sz71 = sz68.map((value, index) => (value ? sz2[index] : 0));
+
+  // 6.0 逃顶止盈模块:55日随机值趋势>=90拐头(10日去重) 或 短均差能量峰值回落
+  const hhv55 = rollingHighest(high, 55);
+  const llv55 = rollingLowest(low, 55);
+  const rsv55 = close.map((value, index) => {
+    const range = hhv55[index] - llv55[index];
+    return range !== 0 ? (value - llv55[index]) / range * 100 : 0;
+  });
+  const rsv55Sma = tdxSmaNumbers(rsv55, 5, 1);
+  const rsv55Sma2 = tdxSmaNumbers(rsv55Sma, 3, 1);
+  const var113 = rsv55Sma.map((value, index) => 3 * value - 2 * rsv55Sma2[index]);
+  const trendLine = emaNumbers(var113, 3).map(value => value - 10);
+  const trendTurn = trendLine.map((value, index) => {
+    const prev = refValue(trendLine, index, 1);
+    return prev !== 0 && Number.isFinite(prev) ? (value - prev) / prev * 100 : 0;
+  });
+  const var116: boolean[] = new Array(data.length).fill(false);
+  {
+    let cool = -1;
+    for (let index = 0; index < data.length; index += 1) {
+      if (index > cool && trendLine[index] >= 90 && trendTurn[index] < 0) {
+        var116[index] = true;
+        cool = index + 10;
+      }
+    }
+  }
+  const ma1to9 = [1, 3, 5, 7, 9].map(n => simpleMovingNumbers(close, n));
+  const ma2to10 = [2, 4, 6, 8, 10].map(n => simpleMovingNumbers(close, n));
+  const var13 = close.map((_, index) => ma1to9.reduce((sum, arr) => sum + arr[index], 0) / 5);
+  const var14 = close.map((_, index) => ma2to10.reduce((sum, arr) => sum + arr[index], 0) / 5);
+  const var13Ema = emaNumbers(var13, 2);
+  const var14Ema = emaNumbers(var14, 5);
+  const var16 = var13Ema.map((value, index) => Math.max(value - var14Ema[index], 0) * 200);
+  const var17 = emaNumbers(var16, 5);
+  const reduceSignal = var17.map((value, index) => (
+    value < refValue(var17, index, 1)
+    && refValue(var17, index, 1) >= refValue(var17, index, 2)
+    && value > 0
+  ));
+  const escape = var116.map((value, index) => value || reduceSignal[index]);
 
   const eatFish = close.map((value, index) => {
     const crossLife = crossUpValues(abc4, lifeLine, index);
@@ -832,7 +939,7 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
   let lastWaveStart = -1;
   const superCondition = close.map((_, index) => {
     if (newWave[index]) lastWaveStart = index;
-    return lastWaveStart >= 0 && index - lastWaveStart >= 1 && sz40[index] > 1.02;
+    return lastWaveStart >= 0 && index - lastWaveStart >= 1 && sz40[index] > 1.03;
   });
 
   lastWaveStart = -1;
@@ -840,7 +947,7 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
     if (newWave[index]) lastWaveStart = index;
     const superCount = lastWaveStart >= 0 ? countTrueSince(superCondition, lastWaveStart, index) : 0;
     const anomaly = sz68[index];
-    const fire = anomaly && sz40[index] > 1.02;
+    const fire = anomaly && sz40[index] > 1.03;
     const multiplier = anomaly ? 6 : 4;
     return {
       time: parseTime(item.time),
@@ -855,6 +962,7 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
       superCount,
       purpleTop: sz71[index] * multiplier,
       purpleBottom: -sz71[index] * multiplier,
+      escape: escape[index],
     };
   });
 
@@ -868,7 +976,7 @@ export function buildVipAnomalySeries(data: KLineData[]): VipAnomalySeries {
 
 export function buildOpenEatFishSeries(data: KLineData[]): OpenEatFishSeries {
   if (data.length === 0) {
-    return { points: [], ma5: [], ma10: [], ma20: [], ma30: [], ma60: [], lowerLimit: [], upperBound: [] };
+    return { points: [], ma5: [], ma10: [], ma20: [], ma30: [], ma60: [], lowerLimit: [], upperBound: [], lowerBound: [] };
   }
 
   const close = data.map(item => item.close || 0);
@@ -996,6 +1104,14 @@ export function buildOpenEatFishSeries(data: KLineData[]): OpenEatFishSeries {
     base: high[index] * 1.12,
   }));
 
+  // 透明撑底:止盈钻石画在 MIN(ABC2,生命价线)×0.86,需纳入自动缩放,否则被裁出可视区
+  const lowerBound = low.map((value, index) => {
+    const ribbonFloor = Number.isFinite(abc2[index]) && Number.isFinite(lifeLine[index])
+      ? Math.min(abc2[index], lifeLine[index]) * 0.855
+      : value;
+    return Math.min(value, Number.isFinite(lowerLimit[index]) ? lowerLimit[index] : value, ribbonFloor);
+  });
+
   return {
     points,
     latest: points[points.length - 1],
@@ -1006,6 +1122,7 @@ export function buildOpenEatFishSeries(data: KLineData[]): OpenEatFishSeries {
     ma60: lineDataFromValues(data, ma60),
     lowerLimit: lineDataFromValues(data, lowerLimit),
     upperBound: lineDataFromValues(data, upperBound),
+    lowerBound: lineDataFromValues(data, lowerBound),
   };
 }
 
@@ -1638,6 +1755,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   dayKData = [],
   mainChartTemplate: controlledMainChartTemplate,
   onMainChartTemplateChange,
+  showTemplateSelect = false,
   initialGridMode,
   initialSubChartType,
   initialSubType2,
@@ -1666,6 +1784,8 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const emaSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const bollSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const openEatFishSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
+  const tdxMainSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
+  const tdxMainMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const subSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const signalMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const seriesTypeRef = useRef<'line' | 'candle' | null>(null);
@@ -1709,6 +1829,8 @@ export const StockChartLW: React.FC<StockChartProps> = ({
 
   // 四宫格(主图+3副图)模式
   const [gridMode, setGridMode] = React.useState(initialGridModeValue);
+  const [tdxMainHint, setTdxMainHint] = React.useState(''); // TDX主图模板无可显示输出时的提示
+  const [floatSharesTick, setFloatSharesTick] = React.useState(0); // 流通股本到位后触发TDX重算
   const gridModeRef = useRef(initialGridModeValue);
   const [subType2, setSubType2] = React.useState<SubChartType>(initialSubType2Value);
   const subType2Ref = useRef<SubChartType>(initialSubType2Value);
@@ -2353,13 +2475,13 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         ctx.restore();
       };
 
-      const drawDiamond = (x: number, yValue: number) => {
+      const drawDiamond = (x: number, yValue: number, fill = VIP_COLORS.diamond, stroke = '#ffc0cb') => {
         const y = yOf(yValue);
         if (y == null) return;
         const r = clampNumber(spacing * 0.24, 4, 7);
         ctx.save();
-        ctx.fillStyle = VIP_COLORS.diamond;
-        ctx.strokeStyle = '#ffc0cb';
+        ctx.fillStyle = fill;
+        ctx.strokeStyle = stroke;
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(x, y - r);
@@ -2372,9 +2494,15 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         ctx.restore();
       };
 
+      // 彩带(2026.07.08版):红绿互斥无重叠——强势红带填 ABC2↔生命价线;
+      // 弱势绿带悬挂在下方:生命价线→MIN(ABC2,生命价线)×0.97
       visiblePoints.forEach(({ point, x }) => {
-        if (Number.isFinite(point.abc2) && Number.isFinite(point.lifeLine)) {
-          drawStick(x, point.abc2, point.lifeLine, point.strong ? '#ff0000' : '#00cc00', ribbonWidth, 0.88);
+        if (!Number.isFinite(point.abc2) || !Number.isFinite(point.lifeLine)) return;
+        if (point.strong) {
+          drawStick(x, point.abc2, point.lifeLine, '#ff0000', ribbonWidth, 0.88);
+        } else {
+          const greenLow = Math.min(point.abc2, point.lifeLine) * 0.97;
+          drawStick(x, point.lifeLine, greenLow, '#00cc00', ribbonWidth, 0.88);
         }
       });
       const trendStickWidth = clampNumber(spacing * 0.48, 2, 7);
@@ -2409,6 +2537,13 @@ export const StockChartLW: React.FC<StockChartProps> = ({
             lastEatFishTextX = x;
           }
           drawDiamond(x, point.lifeLine * 0.91);
+        }
+      });
+
+      // 顶层最后绘制:止盈绿钻石固定在彩带底部(MIN(ABC2,生命价线)×0.86),不被彩带遮挡——"绿色钻石必走"
+      visiblePoints.forEach(({ point, x }) => {
+        if (point.takeProfit && Number.isFinite(point.abc2) && Number.isFinite(point.lifeLine)) {
+          drawDiamond(x, Math.min(point.abc2, point.lifeLine) * 0.86, '#16a34a', '#86efac');
         }
       });
 
@@ -2855,7 +2990,6 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       drawLine(anomalyPointsForDraw.map(point => point.purpleBottom), VIP_COLORS.magenta, 2.4);
 
       let lastAnomalyTextX = -Infinity;
-      let lastFireTextX = -Infinity;
       let lastEatFishTextX = -Infinity;
       let lastSuperTextX = -Infinity;
       type VipLabel = {
@@ -2890,18 +3024,22 @@ export const StockChartLW: React.FC<StockChartProps> = ({
           yValue: typeof adjustedValue === 'number' && Number.isFinite(adjustedValue) ? Number(adjustedValue) : label.yValue,
         });
       };
+      let lastEscapeTextX = -Infinity;
       anomalyVisible.forEach(({ point, x }) => {
         const showAnomalyText = point.anomaly && (x - lastAnomalyTextX >= labelGap || point.superSignal);
-        const showFireText = point.fire && x - lastFireTextX >= labelGap * 0.9;
         const showEatFishText = point.eatFish && (x - lastEatFishTextX >= labelGap || point.superSignal);
         const showSuperText = point.superSignal && x - lastSuperTextX >= labelGap * 0.72;
+        // 6.0:鱼头文字仅多头红彩带出现(anomaly 已含强势门控)
         if (point.anomaly && showAnomalyText) {
-          drawText('异动', x, point.sz2 + 5, VIP_COLORS.yellow, 11);
+          drawText('异动', x, point.sz2 * 4 + 20, VIP_COLORS.yellow, 11);
+          drawText('鱼头', x, point.sz3 * 4 - 40, VIP_COLORS.red, 11);
           lastAnomalyTextX = x;
         }
-        if (showFireText) {
-          drawText('点火', x, point.sz3 - 5, VIP_COLORS.yellow, 11);
-          lastFireTextX = x;
+        // 6.0 逃顶预警:下箭头+白字,规避高位回落
+        if (point.escape && x - lastEscapeTextX >= labelGap * 0.72) {
+          drawText('↓', x, point.sz3 * 4 - 25, VIP_COLORS.green, 13);
+          drawText('逃顶', x, point.sz3 * 4 - 45, '#ffffff', 11);
+          lastEscapeTextX = x;
         }
         if (showSuperText) {
           const text = point.superCount === 1
@@ -2938,6 +3076,10 @@ export const StockChartLW: React.FC<StockChartProps> = ({
           }
           drawDiamond(x, point.sz2 - 35, VIP_COLORS.diamond);
         }
+      });
+      // 6.0 顶层最后绘制:能量柱顶部的逃顶绿钻石("绿色钻石卖出")
+      anomalyVisible.forEach(({ point, x }) => {
+        if (point.escape) drawDiamond(x, point.sz2 * 4 + 30, '#16a34a');
       });
       normalLabels
         .sort((a, b) => a.layer - b.layer || a.priority - b.priority)
@@ -3152,6 +3294,51 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     const vc = volumeChartRef.current;
     if (!vc || chartData.length === 0) return [];
     const base = { priceLineVisible: false, lastValueVisible: false };
+    if (typeof type === 'string' && type.startsWith('tdx:')) {
+      // 通达信公式副图:引擎求值 → 柱(直方近似)+线+标记
+      const formula = getTdxFormula(type);
+      if (!formula) return [];
+      const out = evaluateTdxFormula(formula.id, formula.source, chartData, {
+        code: stock?.symbol, name: stock?.name,
+        ...(stock?.symbol ? finCtxCache.get(stock.symbol) : undefined),
+      });
+      const series: ISeriesApi<SeriesType, Time>[] = [];
+      const times = chartData.map(d => parseTime(d.time));
+      for (const st of out.sticks) {
+        const hs = vc.addSeries(HistogramSeries, { ...base, color: st.color || '#64748b', title: '' }, paneIndex);
+        hs.setData(times.map((t, i) => (st.segs[i]
+          ? { time: t, value: st.segs[i]![1], color: st.color || '#64748b' }
+          : { time: t, value: 0, color: 'rgba(0,0,0,0)' })) as HistogramData[]);
+        series.push(hs);
+      }
+      for (const ln of out.lines) {
+        const lsr = vc.addSeries(LineSeries, {
+          ...base,
+          color: ln.color || '#38bdf8',
+          lineWidth: Math.min(4, Math.max(1, ln.width || 1)) as 1 | 2 | 3 | 4,
+          lineStyle: ln.dotted ? LineStyle.Dotted : LineStyle.Solid,
+          title: '',
+        }, paneIndex);
+        lsr.setData(times.map((t, i) => (ln.values[i] == null ? { time: t } : { time: t, value: ln.values[i] as number })) as LineData[]);
+        series.push(lsr);
+      }
+      if (out.markers.length > 0 && series.length === 0) {
+        // 只有标记没有线/柱的公式:加一条透明零线承载标记
+        const host = vc.addSeries(LineSeries, { ...base, color: 'rgba(0,0,0,0)', title: '' }, paneIndex);
+        host.setData(times.map(t => ({ time: t, value: 0 })) as LineData[]);
+        series.push(host);
+      }
+      if (out.markers.length > 0 && series.length > 0) {
+        createSeriesMarkers(series[series.length - 1], out.markers.map(m => ({
+          time: times[m.index],
+          position: m.above ? 'aboveBar' as const : 'belowBar' as const,
+          color: m.color || '#eab308',
+          shape: m.above ? 'arrowDown' as const : 'arrowUp' as const,
+          text: m.text,
+        })));
+      }
+      return series;
+    }
     if (type === 'volume') {
       const s = vc.addSeries(HistogramSeries, { priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false }, paneIndex);
       s.setData(chartData.map(d => ({
@@ -3315,7 +3502,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       return refs;
     }
     return [];
-  }, [chartColors, fundFlowPoints, indicatorConfig, tradingSignals]);
+  }, [chartColors, fundFlowPoints, indicatorConfig, tradingSignals, stock?.symbol, stock?.name, floatSharesTick]);
 
   // 渲染副图：pane0=主选指标；四宫格模式再渲染 pane1/pane2
   const renderSubChart = useCallback((type: SubChartType, chartData: KLineData[]) => {
@@ -3445,6 +3632,76 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       for (const s of maSeriesRefs.current) seriesIndicatorMap.current.delete(s);
       clearSeriesArray(chart, maSeriesRefs);
       clearSeriesArray(chart, openEatFishSeriesRefs);
+
+      // --- TDX 主图公式叠加(线+买卖点标记;引擎求值,不支持的子结构自动降级) ---
+      clearSeriesArray(chart, tdxMainSeriesRefs);
+      if (typeof mainChartTemplate === 'string' && mainChartTemplate.startsWith('tdx:')) {
+        const tdxFormula = getTdxFormula(mainChartTemplate);
+        if (tdxFormula) {
+          const tdxOut = evaluateTdxFormula(tdxFormula.id, tdxFormula.source, safeData, {
+            code: stock?.symbol, name: stock?.name,
+            ...(stock?.symbol ? finCtxCache.get(stock.symbol) : undefined),
+          });
+          const tdxTimes = safeData.map(d => parseTime(d.time));
+          const added: ISeriesApi<SeriesType, Time>[] = [];
+          for (const ln of tdxOut.lines) {
+            // 主图上过滤明显非价格量纲的线(如0-100震荡值),避免把价格轴拉爆
+            let vmin = Infinity, vmax = -Infinity;
+            for (const v of ln.values) { if (v != null) { if (v < vmin) vmin = v; if (v > vmax) vmax = v; } }
+            const pmin = Math.min(...safeData.map(d => d.low)), pmax = Math.max(...safeData.map(d => d.high));
+            if (!(vmax >= pmin * 0.3 && vmin <= pmax * 3)) continue;
+            const lsr = chart.addSeries(LineSeries, {
+              color: ln.color || '#38bdf8',
+              lineWidth: Math.min(4, Math.max(1, ln.width || 1)) as 1 | 2 | 3 | 4,
+              lineStyle: ln.dotted ? LineStyle.Dotted : LineStyle.Solid,
+              priceLineVisible: false,
+              lastValueVisible: false,
+              title: '',
+            });
+            lsr.setData(tdxTimes.map((t, i) => (ln.values[i] == null ? { time: t } : { time: t, value: ln.values[i] as number })) as LineData[]);
+            added.push(lsr);
+          }
+          const markerItems: { idx: number; m: { time: Time; position: 'aboveBar' | 'belowBar'; color: string; shape: 'arrowDown' | 'arrowUp' | 'square'; text: string } }[] = [];
+          for (const m of tdxOut.markers) {
+            markerItems.push({
+              idx: m.index,
+              m: {
+                time: tdxTimes[m.index],
+                position: m.above ? 'aboveBar' : 'belowBar',
+                color: m.color || '#eab308',
+                shape: m.above ? 'arrowDown' : 'arrowUp',
+                text: m.text,
+              },
+            });
+          }
+          // 稀疏信号柱(STICKLINE)转方块标记;密集重涂K线的(段数>20%)跳过,避免刷屏
+          for (const st of tdxOut.sticks) {
+            const idxs: number[] = [];
+            st.segs.forEach((seg, i) => { if (seg) idxs.push(i); });
+            if (idxs.length === 0 || idxs.length > safeData.length * 0.2) continue;
+            for (const i of idxs) {
+              const seg = st.segs[i]!;
+              const above = Math.max(seg[0], seg[1]) >= safeData[i].close;
+              markerItems.push({
+                idx: i,
+                m: { time: tdxTimes[i], position: above ? 'aboveBar' : 'belowBar', color: st.color || '#eab308', shape: 'square', text: '' },
+              });
+            }
+          }
+          markerItems.sort((x, y) => x.idx - y.idx);
+          const tdxMarkerList = markerItems.map(x => x.m);
+          if (tdxMainMarkersRef.current) tdxMainMarkersRef.current.setMarkers(tdxMarkerList);
+          else if (tdxMarkerList.length > 0) tdxMainMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, tdxMarkerList);
+          tdxMainSeriesRefs.current = added;
+          const hint = added.length === 0 && tdxMarkerList.length === 0
+            ? `该公式在当前K线区间无可显示输出${tdxOut.notes.length ? `:${tdxOut.notes[0]}` : '(可能只在特定信号日打标)'}`
+            : '';
+          setTdxMainHint(prev => (prev === hint ? prev : hint));
+        }
+      } else {
+        if (tdxMainMarkersRef.current) tdxMainMarkersRef.current.setMarkers([]);
+        setTdxMainHint(prev => (prev === '' ? prev : ''));
+      }
       if (mainChartTemplate === 'openEatFish' && openEatFishSeries) {
         const addTemplateLine = (points: LineData[], color: string, lineWidth: 1 | 2 = 1) => {
           const series = chart.addSeries(LineSeries, {
@@ -3465,6 +3722,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         addTemplateLine(openEatFishSeries.ma60, '#ffffff', 2);
         addTemplateLine(openEatFishSeries.lowerLimit, '#ffffff', 2);
         addTemplateLine(openEatFishSeries.upperBound, '#00000000', 1);
+        addTemplateLine(openEatFishSeries.lowerBound, '#00000000', 1);
       } else if (indicatorConfig.ma.enabled) {
         indicatorConfig.ma.periods.forEach((p, idx) => {
           const maSeries = chart.addSeries(LineSeries, {
@@ -3541,7 +3799,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       }
       hasFittedRef.current = true;
     }
-  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars]);
+  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick]);
 
   // 副图指标独立于主图叠加开关，用户可自由切换 VOL/MACD/KDJ/RSI/CCI/WR（不再随设置回退）
 
@@ -3577,6 +3835,30 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     requestAnimationFrame(() => rerenderSubs());
   }, [rerenderSubs]);
 
+  // 应用四窗口组合:主图模板 + 三副图 + 四图模式,趋势周期自动切日K
+  const applyCombo = useCallback((combo: ChartCombo) => {
+    setSubChartType(combo.subs[0]);
+    subChartTypeRef.current = combo.subs[0];
+    setSubType2(combo.subs[1]);
+    subType2Ref.current = combo.subs[1];
+    setSubType3(combo.subs[2]);
+    subType3Ref.current = combo.subs[2];
+    setWindowMode(true);
+    setMainChartTemplate(combo.main);
+    if (isTrendLinePeriod) onPeriodChange('1d');
+    rerenderSubs();
+  }, [setWindowMode, setMainChartTemplate, isTrendLinePeriod, onPeriodChange, rerenderSubs]);
+
+  // 当前四窗口状态若恰好等于某个组合,下拉回显该组合;手动改任一窗口即回落到占位项
+  const activeComboId = gridMode
+    ? (CHART_COMBOS.find(c =>
+        c.main === mainChartTemplate
+        && c.subs[0] === subChartType
+        && c.subs[1] === subType2
+        && c.subs[2] === subType3,
+      )?.id ?? '')
+    : '';
+
   const clearRange = useCallback(() => {
     setRangeStart(null);
     setRangeEnd(null);
@@ -3588,6 +3870,26 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   useEffect(() => {
     clearRange();
   }, [stock?.symbol, period, clearRange]);
+
+  // 拉股本/估值(一次一只,缓存),供筹码类 TDX 公式(WINNER/COST)与 CAPITAL/FINANCE
+  useEffect(() => {
+    const sym = stock?.symbol;
+    if (!sym || finCtxCache.has(sym)) return;
+    let cancelled = false;
+    getF10Valuation(sym).then(v => {
+      if (cancelled) return;
+      finCtxCache.set(sym, {
+        floatShares: v?.floatShares || 0,
+        totalShares: v?.totalShares || 0,
+        pe: v?.peTtm || 0,
+        pb: v?.pb || 0,
+        floatMcap: v?.floatMarketCap || 0,
+        totalMcap: v?.totalMarketCap || 0,
+      });
+      setFloatSharesTick(t => t + 1);
+    }).catch(() => { /* 拿不到就保持无筹码/财务估算 */ });
+    return () => { cancelled = true; };
+  }, [stock?.symbol]);
 
   // 选中区间的像素坐标（随缩放/滚动更新），用于绘制高亮框
   useEffect(() => {
@@ -3946,6 +4248,14 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       } ${extraClass}`}
     >
       {SUB_OPTIONS.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+      {TDX_SUB_GROUPS.map(g => (
+        <optgroup key={g.category} label={`通达信·${g.category}`}>
+          {g.items.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+        </optgroup>
+      ))}
+      {value.startsWith('tdx:') && !TDX_SUB_OPTION_IDS.has(value) && (
+        <option value={value}>主图·{getTdxFormula(value)?.name ?? '通达信'}</option>
+      )}
     </select>
   );
 
@@ -4013,6 +4323,54 @@ export const StockChartLW: React.FC<StockChartProps> = ({
               {p.label}
             </button>
           ))}
+          {showTemplateSelect && (
+            <select
+              value={mainChartTemplate}
+              onChange={(e) => {
+                const next = e.target.value as MainChartTemplate;
+                setMainChartTemplate(next);
+                if (next !== 'standard' && isTrendLinePeriod) onPeriodChange('1d');
+              }}
+              className={`ml-2 h-[24px] rounded border px-2 text-xs font-semibold outline-none transition-colors ${
+                colors.isDark
+                  ? 'border-slate-700 bg-slate-900/70 text-slate-200 hover:border-accent/60'
+                  : 'border-slate-300 bg-white/80 text-slate-700 hover:border-accent/60'
+              }`}
+              style={{ colorScheme: colors.isDark ? 'dark' : 'light' }}
+              title="主图模板;非标准模板会自动切到日K"
+            >
+              <option value="standard">主图：标准</option>
+              <option value="openEatFish">主图：开仓吃鱼</option>
+              {TDX_MAIN_GROUPS.map(g => (
+                <optgroup key={g.category} label={`通达信·${g.category}`}>
+                  {g.items.map(f => (
+                    <option key={f.id} value={f.id}>{f.name}</option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          )}
+          {showTemplateSelect && (
+            <select
+              value={activeComboId}
+              onChange={(e) => {
+                const combo = CHART_COMBOS.find(c => c.id === e.target.value);
+                if (combo) applyCombo(combo);
+              }}
+              className={`ml-1.5 h-[24px] rounded border px-2 text-xs font-semibold outline-none transition-colors ${
+                colors.isDark
+                  ? 'border-amber-500/50 bg-slate-900/70 text-amber-200 hover:border-amber-400'
+                  : 'border-amber-500/60 bg-white/80 text-amber-700 hover:border-amber-500'
+              }`}
+              style={{ colorScheme: colors.isDark ? 'dark' : 'light' }}
+              title="四窗口自动组合:一键设置主图模板+三个副图"
+            >
+              <option value="">四窗口组合</option>
+              {CHART_COMBOS.map(c => (
+                <option key={c.id} value={c.id}>{c.label}</option>
+              ))}
+            </select>
+          )}
           <div className={`flex items-center gap-2 ml-3 pl-3 border-l ${colors.isDark ? 'border-slate-700' : 'border-slate-300'}`}>
             {!isTrendLinePeriod && (
               <>
@@ -4084,6 +4442,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({
           className={`absolute inset-0 z-10 pointer-events-none ${mainChartTemplate === 'openEatFish' && !isTrendLinePeriod ? 'block' : 'hidden'}`}
         />
         {!isTrendLinePeriod && mainChartTemplate === 'standard' && renderBottomLegend(mainIndicatorLegend, 'bottom-1.5')}
+        {!isTrendLinePeriod && typeof mainChartTemplate === 'string' && mainChartTemplate.startsWith('tdx:') && tdxMainHint && (
+          <div className="absolute left-1/2 top-10 z-20 -translate-x-1/2 rounded border border-amber-500/40 bg-slate-900/85 px-3 py-1.5 text-[11px] text-amber-200 pointer-events-none">
+            {tdxMainHint}
+          </div>
+        )}
         {!isTrendLinePeriod && mainChartTemplate === 'openEatFish' && openEatFishMainSeries && (
           <div className="absolute left-1 top-1 z-20 flex max-w-[calc(100%-84px)] flex-wrap items-center gap-x-1.5 gap-y-0 text-[10px] font-mono font-bold leading-4 pointer-events-none">
             <span className="text-slate-300">{stock?.name || ''}({period === '1d' ? '日线' : period === '1w' ? '周线' : '月线'})</span>

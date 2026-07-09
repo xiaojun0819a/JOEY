@@ -1,0 +1,10 @@
+主力倍量:=C;
+放量反包出击1:=REF(主力倍量,1)< REF(O,1);
+趋势线:MA(主力倍量,10)DOTLINE;
+放量反包出击2:=REF(vol,1)>REF(VOL,2);
+放量反包出击3:=主力倍量>REF(HIGH,1);
+AA:=C>MA(C,10);
+条件:=放量反包出击1 AND 放量反包出击2 AND 放量反包出击3 AND AA;
+STICKLINE(条件,O,C,2,0),COLORRED;
+DRAWICON(条件,L,9);
+DRAWTEXT(条件,L*0.98,' ★反包出击'),COLORYELLOW;

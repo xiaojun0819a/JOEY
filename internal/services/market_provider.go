@@ -60,6 +60,13 @@ func (ms *MarketService) fetchKLineDataWithFallback(code string, period string, 
 			return data, nil
 		}
 	}
+	// 分时(今日)优先腾讯(~0.2s):主源 TDX 的 GetKlineMinuteAll 慢(~8s)、新浪备源被限流(456)。
+	if period == "1m" {
+		if data, err := ms.fetchTimeShareFromTencent(code); err == nil && len(data) > 0 {
+			return data, nil
+		}
+		log.Warn("腾讯分时获取失败,回落 TDX/新浪: %s", code)
+	}
 
 	if ms.primaryProvider != nil {
 		data, err := ms.primaryProvider.FetchKLineData(code, period, days)

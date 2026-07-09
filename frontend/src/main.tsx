@@ -41,6 +41,19 @@ window.addEventListener('unhandledrejection', (event) => {
 
 hideWailsSpinner()
 
+// 禁用 WebView 的"页面缩放"(Ctrl+滚轮 / Ctrl加减 / 触控板双指捏合会以浏览器方式缩放整页,布局会乱、变丑)。
+// 窗口大小改变靠拖边框(响应式布局等比缩放)。图表自身的缩放用的是不带 Ctrl 的普通滚轮,不受影响。
+window.addEventListener(
+    'wheel',
+    (e) => {
+        if (e.ctrlKey) e.preventDefault() // 触控板捏合在浏览器里也表现为 ctrlKey 的 wheel
+    },
+    { passive: false }
+)
+window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && ['+', '-', '=', '_', '0'].includes(e.key)) e.preventDefault()
+})
+
 const container = document.getElementById('root')
 
 if (!container) {

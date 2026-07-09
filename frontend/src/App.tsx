@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { StockList } from './components/StockList';
 import { StockChartLW, type MainChartTemplate } from './components/StockChartLW';
+import { TDX_MAIN_GROUPS } from './utils/tdxCatalog';
 import { OrderBook as OrderBookComponent } from './components/OrderBook';
 import { F10Panel } from './components/F10Panel';
 import { AgentRoom } from './components/AgentRoom';
@@ -25,16 +26,19 @@ import BoardReportDialog from './components/BoardReportDialog';
 import { ResearchReportDialog } from './components/ResearchReportDialog';
 import { MarketRegimeBadge } from './components/MarketRegimeBadge';
 import { PaperPortfolioDialog } from './components/PaperPortfolioDialog';
+import { IntelDialog } from './components/IntelDialog';
+import { addIntelNote } from './services/intelService';
 import FundamentalScanDialog from './components/FundamentalScanDialog';
+import CompositeScoreDialog from './components/CompositeScoreDialog';
 import { AddToGroupButton } from './components/AddToGroupButton';
 import SafeBoundary from './components/SafeBoundary';
-import { WelcomePage } from './components/WelcomePage';
 import { useTheme } from './contexts/ThemeContext';
 import { useCandleColor } from './contexts/CandleColorContext';
 import { ResizeHandle } from './components/ResizeHandle';
 import { isWailsGoReady, isWailsRuntimeReady, warnWailsUnavailable } from './utils/wailsEnv';
 import { getWatchlist, addToWatchlist, removeFromWatchlist, syncTradeJournalWatchGroup } from './services/watchlistService';
 import { getKLineData, getOrderBook, getStockRealTimeData } from './services/stockService';
+import { klineHistoryDays, KLINE_RANGE_CHANGED_EVENT } from './utils/klineRange';
 import { getF10Overview, getF10Valuation } from './services/f10Service';
 import {
   collectDailyHistory,
@@ -61,7 +65,7 @@ import { checkForUpdate } from './services/updateService';
 import { useMarketEvents } from './hooks/useMarketEvents';
 import { useMarketStatus } from './hooks/useMarketStatus';
 import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex, F10Overview, StockValuation } from './types';
-import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity, RefreshCw, Search, Gauge, FileText, Wallet, ChevronDown, Maximize2 } from 'lucide-react';
+import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity, RefreshCw, Search, Gauge, FileText, Wallet, ChevronDown, Maximize2, Brain } from 'lucide-react';
 import logo from './assets/images/logo.png';
 import { GetTelegraphList, OpenURL, WindowMinimize, WindowMaximize, WindowClose } from '../wailsjs/go/main/App';
 import { WindowIsMaximised, WindowGetSize } from '../wailsjs/runtime/runtime';
@@ -179,8 +183,18 @@ const isMinuteTrendPeriod = (period: TimePeriod) => period === '1m' || period ==
 
 const getKLineRequestLength = (period: TimePeriod) => {
   if (period === '5d') return 1250;
-  if (period === '30m' || period === '60m') return 320; // 分钟K:约40-80个交易日
-  return period === '1m' ? 250 : 240;
+  if (period === '1m') return 250;
+  if (period === '30m') return 320; // 30分钟K:8根/日,约40个交易日
+  if (period === '60m') return 320; // 60分钟K:4根/日,约80个交易日
+  if (period === '1d') return klineHistoryDays(); // 按设置里的「历史日K范围」(默认近3年;后端>500根自动走档案库)
+  return 240;
+};
+
+// 新用户空账号的默认展示股(蓝筹,数据稳)。有自选或搜索预览会替换它——
+// 避免落到全屏欢迎页/空屏,登录后直接进主界面。数据由订阅自动填充。
+const DEFAULT_STOCK: Stock = {
+  symbol: 'sh600519', name: '贵州茅台', price: 0, change: 0, changePercent: 0,
+  volume: 0, amount: 0, marketCap: '', sector: '', open: 0, high: 0, low: 0, preClose: 0,
 };
 
 const App: React.FC = () => {
@@ -194,9 +208,16 @@ const App: React.FC = () => {
   const [timePeriod, setTimePeriod] = useState<TimePeriod>('1m');
   const [kLineData, setKLineData] = useState<KLineData[]>([]);
   const [kLineUpdateMode, setKLineUpdateMode] = useState<KLineUpdateMode>('full');
+  const [klineRangeTick, setKlineRangeTick] = useState(0); // 设置里改「历史日K范围」时 +1 触发重载
+  useEffect(() => {
+    const onRangeChange = () => setKlineRangeTick(t => t + 1);
+    window.addEventListener(KLINE_RANGE_CHANGED_EVENT, onRangeChange);
+    return () => window.removeEventListener(KLINE_RANGE_CHANGED_EVENT, onRangeChange);
+  }, []);
   const [orderBook, setOrderBook] = useState<OrderBook>({ bids: [], asks: [] });
   const [marketMessage, setMarketMessage] = useState<string>('市场数据加载中...');
   const [telegraphList, setTelegraphList] = useState<Telegraph[]>([]);
+  const [savedIntel, setSavedIntel] = useState<Set<number>>(new Set()); // 已存入情报库的快讯下标(打勾反馈)
   const [showTelegraphList, setShowTelegraphList] = useState(false);
   const [telegraphLoading, setTelegraphLoading] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -213,9 +234,11 @@ const App: React.FC = () => {
   const [lowBuyStrategySubtitle, setLowBuyStrategySubtitle] = useState('V1.2 高胜率短线规则（全A · 回踩偏好 · Top3）');
   const [showLowBuyStrategyMenu, setShowLowBuyStrategyMenu] = useState(false);
   const [showFundamental, setShowFundamental] = useState(false);
+  const [showComposite, setShowComposite] = useState(false);
   const [showLateDayChaseScanner, setShowLateDayChaseScanner] = useState(false);
   const [showWaveScanner, setShowWaveScanner] = useState(false);
   const [showPaper, setShowPaper] = useState(false);
+  const [showIntel, setShowIntel] = useState(false);
   const [showWaveModel, setShowWaveModel] = useState(false);
   const [showJournal, setShowJournal] = useState(false);
   const [showF10, setShowF10] = useState(false);
@@ -284,7 +307,7 @@ const App: React.FC = () => {
     const watched = watchlist.find(s => s.symbol.toLowerCase() === normalizedSelected);
     if (watched) return watched;
     if (previewStock && previewStock.symbol.toLowerCase() === normalizedSelected) return previewStock;
-    return watchlist[0] || previewStock;
+    return watchlist[0] || previewStock || DEFAULT_STOCK;
   }, [selectedSymbol, watchlist, previewStock]);
   const watchlistSubscriptionKey = useMemo(() => (
     Array.from(new Set(watchlist.map(stock => String(stock.symbol || '').trim()).filter(Boolean))).join(',')
@@ -600,6 +623,16 @@ const App: React.FC = () => {
     }, BOOTSTRAP_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [loading]);
+
+  // 把一条快讯存入情报库(第二大脑),source=news
+  const handleSaveTelegraphToIntel = useCallback(async (tg: Telegraph, idx: number) => {
+    if (savedIntel.has(idx)) return;
+    try {
+      const text = `${tg.time ? tg.time + ' ' : ''}${tg.content}`.trim();
+      await addIntelNote(text, [], 'news');
+      setSavedIntel(prev => new Set(prev).add(idx));
+    } catch { /* service 已打日志 */ }
+  }, [savedIntel]);
 
   // 获取快讯列表
   const handleShowTelegraphList = async () => {
@@ -1088,7 +1121,7 @@ const App: React.FC = () => {
     };
 
     void loadKLineData();
-  }, [selectedSymbol, timePeriod, subscribeKLine]);
+  }, [selectedSymbol, timePeriod, subscribeKLine, klineRangeTick]);
 
   useEffect(() => {
     setShowF10(false);
@@ -1210,12 +1243,8 @@ const App: React.FC = () => {
     );
   }
 
-  // 没有自选股时显示欢迎页面
-  if (watchlist.length === 0) {
-    return <WelcomePage onAddStock={handleAddStock} />;
-  }
-
-  if (!selectedStock) return <div className="h-screen w-screen flex items-center justify-center fin-app text-white">请添加自选股</div>;
+  // 空账号不再拦到欢迎页:selectedStock 有 DEFAULT_STOCK 兜底,登录后直接进主界面,
+  // 用左上搜索框加自己的自选股即可(搜索时 previewStock 会替换默认股)。
 
   return (
     <div className="flex flex-col h-screen text-slate-100 font-sans fin-app">
@@ -1266,11 +1295,18 @@ const App: React.FC = () => {
                   <div
                     key={idx}
                     onClick={() => handleOpenTelegraph(tg)}
-                    className={`p-3 border-b fin-divider last:border-b-0 cursor-pointer transition-colors ${colors.isDark ? 'hover:bg-slate-800/50' : 'hover:bg-slate-100/80'}`}
+                    className={`group p-3 border-b fin-divider last:border-b-0 cursor-pointer transition-colors ${colors.isDark ? 'hover:bg-slate-800/50' : 'hover:bg-slate-100/80'}`}
                   >
                     <div className="flex items-start gap-2">
                       <span className="text-xs text-accent-2 font-mono shrink-0">{tg.time}</span>
-                      <span className={`text-xs line-clamp-2 ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>{tg.content}</span>
+                      <span className={`text-xs line-clamp-2 flex-1 min-w-0 ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>{tg.content}</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleSaveTelegraphToIntel(tg, idx); }}
+                        title={savedIntel.has(idx) ? '已存入情报库' : '存入情报库(第二大脑)'}
+                        className={`shrink-0 rounded p-1 transition-opacity ${savedIntel.has(idx) ? 'text-cyan-400 opacity-100' : 'text-slate-500 opacity-0 group-hover:opacity-100 hover:text-cyan-400'}`}
+                      >
+                        <Brain className="h-3.5 w-3.5" />
+                      </button>
                     </div>
                   </div>
                 ))
@@ -1296,6 +1332,14 @@ const App: React.FC = () => {
             <Wallet className="h-3.5 w-3.5" />
             <span>模拟持仓</span>
           </button>
+          <button
+            onClick={() => setShowIntel(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-cyan-400/40`}
+            title="交易情报库 · 第二大脑（信息入库 + 反证晨报）"
+          >
+            <Brain className="h-3.5 w-3.5" />
+            <span>情报库</span>
+          </button>
           <div ref={lowBuyStrategyMenuRef} className="relative">
             <button
               onClick={() => setShowLowBuyStrategyMenu(prev => !prev)}
@@ -1313,6 +1357,12 @@ const App: React.FC = () => {
                   className="w-full text-left px-3 py-2 rounded-md text-xs font-medium text-indigo-300 hover:bg-indigo-500/15 transition-colors"
                 >
                   📊 基本面选股(价值/景气)
+                </button>
+                <button
+                  onClick={() => { setShowComposite(true); setShowLowBuyStrategyMenu(false); }}
+                  className="w-full text-left px-3 py-2 rounded-md text-xs font-medium text-amber-300 hover:bg-amber-500/15 transition-colors"
+                >
+                  🏆 综合评分(质量+结构+催化)
                 </button>
                 <div className="my-1 border-t fin-divider-soft" />
                 <button
@@ -1660,6 +1710,13 @@ const App: React.FC = () => {
                 >
                   <option value="standard">主图：标准</option>
                   <option value="openEatFish">主图：开仓吃鱼</option>
+                  {TDX_MAIN_GROUPS.map(g => (
+                    <optgroup key={g.category} label={`通达信·${g.category}`}>
+                      {g.items.map(f => (
+                        <option key={f.id} value={f.id}>{f.name}</option>
+                      ))}
+                    </optgroup>
+                  ))}
                 </select>
                 {mainChartTemplate === 'openEatFish' && (
                   <span className={`text-[11px] ${colors.isDark ? 'text-cyan-300' : 'text-cyan-700'}`}>
@@ -1818,12 +1875,30 @@ const App: React.FC = () => {
 	        onClose={() => setShowJournal(false)}
 	        onChanged={handleTradeJournalChanged}
 	      />
-      <PaperPortfolioDialog
-        isOpen={showPaper}
-        onClose={() => setShowPaper(false)}
-        onOpenStock={handleOpenStockFromStrategy}
-      />
+      {/* 单独用边界包住:模拟持仓渲染出错时只影响本弹窗且可一键关闭,不再拖垮整个界面 */}
+      <SafeBoundary title="模拟持仓页面出错" resetKey={showPaper ? 'open' : 'closed'} onReset={() => setShowPaper(false)}>
+        <PaperPortfolioDialog
+          isOpen={showPaper}
+          onClose={() => setShowPaper(false)}
+          onOpenStock={handleOpenStockFromStrategy}
+        />
+      </SafeBoundary>
+      <SafeBoundary title="情报库页面出错" resetKey={showIntel ? 'open' : 'closed'} onReset={() => setShowIntel(false)}>
+        <IntelDialog isOpen={showIntel} onClose={() => setShowIntel(false)} />
+      </SafeBoundary>
       <FundamentalScanDialog isOpen={showFundamental} onClose={() => setShowFundamental(false)} />
+      <CompositeScoreDialog
+        isOpen={showComposite}
+        onClose={() => setShowComposite(false)}
+        onOpenStock={(symbol, name, price) => {
+          setShowComposite(false);
+          void handleOpenStockFromStrategy({
+            symbol, name, price,
+            change: 0, changePercent: 0, volume: 0, amount: 0,
+            marketCap: '', sector: '', open: price, high: price, low: price, preClose: price,
+          });
+        }}
+      />
       <WaveScannerDialog
         isOpen={showWaveScanner}
         onClose={() => setShowWaveScanner(false)}
@@ -1903,6 +1978,7 @@ const App: React.FC = () => {
                 dayKData={multiCycleKLines.daily}
                 mainChartTemplate={mainChartTemplate}
                 onMainChartTemplateChange={handleMainChartTemplateChange}
+                showTemplateSelect
                 initialGridMode={chartFullscreenMode === 'strategy' ? true : undefined}
                 initialSubChartType={chartFullscreenMode === 'strategy' ? 'vipAnomaly' : undefined}
                 initialSubType2={chartFullscreenMode === 'strategy' ? 'vipShortEnergy' : undefined}

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { X, Cpu, ChevronLeft, Plug, Plus, Trash2, Wrench, Check, Loader2, Brain, RefreshCw, Download, RotateCcw, Globe, Layers, Sliders, Star, MessageSquare, Copy, Sparkles, Bell, Send, Palette, Moon, Sun } from 'lucide-react';
+import { X, Cpu, ChevronLeft, Plug, Plus, Trash2, Wrench, Check, Loader2, Brain, RefreshCw, Download, RotateCcw, Globe, Layers, Sliders, Star, MessageSquare, Copy, Sparkles, Bell, Send, Palette, Moon, Sun, Users, ShieldCheck } from 'lucide-react';
 import { getConfig, updateConfig, getAvailableTools, ToolInfo, testAIConnection } from '../services/configService';
 import { testPush, runPositionMonitorOnce } from '../services/pushService';
 import { getAgentConfigs } from '../services/strategyService';
@@ -7,6 +7,7 @@ import { getMCPServers, MCPServerConfig, MCPServerStatus, testMCPConnection, get
 import { checkForUpdate, doUpdate, restartApp, getCurrentVersion, onUpdateProgress, UpdateInfo, UpdateProgress } from '../services/updateService';
 import { getStrategies, getActiveStrategyID, setActiveStrategy, deleteStrategy, generateStrategy, updateStrategy, enhancePrompt, Strategy, StrategyAgent } from '../services/strategyService';
 import { useTheme, themes, ThemeType } from '../contexts/ThemeContext';
+import { KLINE_RANGE_OPTIONS, getKlineHistoryYears, setKlineHistoryYears } from '../utils/klineRange';
 import { useCandleColor, CandleColorMode } from '../contexts/CandleColorContext';
 import { useIndicator, IndicatorConfig, IndicatorType, DEFAULT_INDICATORS } from '../contexts/IndicatorContext';
 
@@ -56,7 +57,14 @@ interface OpenClawConfig {
   apiKey: string;
 }
 
-type TabType = 'provider' | 'appearance' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'chart' | 'proxy' | 'openclaw' | 'push' | 'update';
+type TabType = 'provider' | 'appearance' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'chart' | 'proxy' | 'openclaw' | 'push' | 'update' | 'accounts';
+
+// ADMIN_BUILD:编译期常量(vite.config.ts 里按 VITE_ADMIN_BUILD 注入,分发构建恒 false)。
+// 恒 false 时 Vite 把下面所有 `ADMIN_BUILD && …` 死分支连同 AccountsSettings 组件从产物剔除,
+// 安装包里根本不含账号管理代码。**分发/线上构建绝不可设置 VITE_ADMIN_BUILD。**
+// 注意:__ADMIN_BUILD__ 的类型声明在 src/vite-env.d.ts,不能在这里 `declare const`,
+// 否则 esbuild 把它当局部绑定不做 define 替换 → 变 undefined → 功能被误剔除。
+const ADMIN_BUILD = __ADMIN_BUILD__;
 
 // 推送配置类型（与后端 models.PushConfig 对应）
 interface PushBarkChannel { enabled: boolean; url: string; }
@@ -338,6 +346,10 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose,
     { id: 'openclaw', label: 'OpenClaw', icon: <Plug className="h-4 w-4" /> },
     { id: 'push', label: '信号推送', icon: <Bell className="h-4 w-4" /> },
     { id: 'update', label: '软件更新', icon: <RefreshCw className="h-4 w-4" /> },
+    // 账号管理只认编译期开关 ADMIN_BUILD:个人版(VITE_ADMIN_BUILD=1)恒 true,分发版根本不编入。
+    // 不再叠加运行时 __jcpIsAdmin——那个随远程模式探测时序飘忽(重启后偶发判 fallback 就丢),
+    // 导致 tab 时有时无。后端 SetRemoteUser/DeleteRemoteUser 对访客 403 仍是最终防线。
+    ...(ADMIN_BUILD ? [{ id: 'accounts' as TabType, label: '账号管理', icon: <Users className="h-4 w-4" /> }] : []),
   ];
 
   return (
@@ -496,6 +508,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose,
             {activeTab === 'update' && (
               <UpdateSettings />
             )}
+            {ADMIN_BUILD && activeTab === 'accounts' && (
+              <AccountsSettings showToast={showToast} />
+            )}
           </div>
         </div>
       </div>
@@ -527,6 +542,210 @@ const Header: React.FC<{ onClose: () => void }> = ({ onClose }) => {
       <button onClick={onClose} className={`transition-colors p-1 rounded ${colors.isDark ? 'text-slate-500 hover:text-white hover:bg-slate-800/60' : 'text-slate-400 hover:text-slate-700 hover:bg-slate-200/60'}`}>
         <X className="h-5 w-5" />
       </button>
+    </div>
+  );
+};
+
+// ========== 账号管理选项卡(仅主人 app 可见) ==========
+interface AccountUser {
+  username: string;
+  trusted: boolean;
+  count: number;
+  lastTime: string;
+}
+
+interface AccountsSettingsProps {
+  showToast: (type: ToastState['type'], message: string) => void;
+}
+
+const AccountsSettings: React.FC<AccountsSettingsProps> = ({ showToast }) => {
+  const { colors } = useTheme();
+  const [users, setUsers] = useState<AccountUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [newName, setNewName] = useState('');
+  const [newPass, setNewPass] = useState('');
+  const [inviteCode, setInviteCode] = useState('');
+  const [inviteSaved, setInviteSaved] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const app = () => (window as any).go?.main?.App;
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const a = app();
+      const [names, summaries, cfg] = await Promise.all([
+        a?.ListRemoteUsers?.() ?? [],
+        a?.GetAuditUsers?.().catch(() => []) ?? [],
+        a?.GetConfig?.().catch(() => null),
+      ]);
+      // 信任标记从 config.remoteUsers 读(ListRemoteUsers 只返回名字)
+      const trustedMap: Record<string, boolean> = {};
+      (cfg?.remoteUsers ?? []).forEach((u: any) => { trustedMap[u.username?.toLowerCase()] = !!u.trusted; });
+      const sumMap: Record<string, any> = {};
+      (summaries ?? []).forEach((s: any) => { sumMap[s.username?.toLowerCase()] = s; });
+      const list: AccountUser[] = (names ?? []).map((n: string) => ({
+        username: n,
+        trusted: !!trustedMap[n.toLowerCase()],
+        count: sumMap[n.toLowerCase()]?.count ?? 0,
+        lastTime: sumMap[n.toLowerCase()]?.lastTime ?? '',
+      }));
+      setUsers(list);
+      setInviteCode(cfg?.registerInviteCode ?? '');
+      setInviteSaved(cfg?.registerInviteCode ?? '');
+    } catch (e: any) {
+      showToast('error', '加载账号失败: ' + (e?.message ?? e));
+    }
+    setLoading(false);
+  }, [showToast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const addUser = async () => {
+    const name = newName.trim();
+    if (!name || newPass.length < 6) { showToast('error', '账号必填,密码至少6位'); return; }
+    setBusy(true);
+    try {
+      const r = await app()?.SetRemoteUser?.(name, newPass);
+      if (r === 'success') {
+        showToast('success', '已添加账号 ' + name);
+        setNewName(''); setNewPass('');
+        await load();
+      } else { showToast('error', r || '添加失败'); }
+    } catch (e: any) { showToast('error', '添加失败: ' + (e?.message ?? e)); }
+    setBusy(false);
+  };
+
+  const resetPass = async (name: string) => {
+    const p = window.prompt(`给「${name}」设置新密码(至少6位):`);
+    if (p == null) return;
+    if (p.length < 6) { showToast('error', '密码至少6位'); return; }
+    try {
+      const r = await app()?.SetRemoteUser?.(name, p);
+      showToast(r === 'success' ? 'success' : 'error', r === 'success' ? '密码已重置' : (r || '失败'));
+    } catch (e: any) { showToast('error', '失败: ' + (e?.message ?? e)); }
+  };
+
+  const delUser = async (name: string) => {
+    if (!window.confirm(`确定删除账号「${name}」?其自选/持仓/会话等数据会保留在服务器,但该账号无法再登录。`)) return;
+    try {
+      const r = await app()?.DeleteRemoteUser?.(name);
+      if (r === 'success') { showToast('success', '已删除 ' + name); await load(); }
+      else showToast('error', r || '删除失败');
+    } catch (e: any) { showToast('error', '删除失败: ' + (e?.message ?? e)); }
+  };
+
+  const toggleTrust = async (u: AccountUser) => {
+    try {
+      const r = await app()?.SetUserTrusted?.(u.username, !u.trusted);
+      if (r === 'success') { showToast('success', (!u.trusted ? '已设为信任账号' : '已取消信任') + ': ' + u.username); await load(); }
+      else showToast('error', r || '操作失败');
+    } catch (e: any) { showToast('error', '操作失败: ' + (e?.message ?? e)); }
+  };
+
+  const saveInvite = async () => {
+    try {
+      const r = await app()?.SetRegisterInviteCode?.(inviteCode.trim());
+      if (r === 'success') { setInviteSaved(inviteCode.trim()); showToast('success', inviteCode.trim() ? '邀请码已设置' : '已改为开放注册'); }
+      else showToast('error', r || '保存失败');
+    } catch (e: any) { showToast('error', '保存失败: ' + (e?.message ?? e)); }
+  };
+
+  const card = colors.isDark ? 'bg-slate-800/40 border-slate-700/50' : 'bg-white border-slate-200';
+  const inputCls = `flex-1 px-3 py-2 rounded-lg border text-sm outline-none ${colors.isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-300 text-slate-800'}`;
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h3 className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>账号管理</h3>
+        <p className="text-xs text-slate-400 mt-1">
+          新增/删减登录账号,即时同步到服务器。此页仅你的 app 可见,别人下载的版本不含此功能。
+        </p>
+      </div>
+
+      {/* 新增账号 */}
+      <div className={`rounded-xl border p-4 ${card}`}>
+        <div className="text-sm font-medium mb-3 flex items-center gap-2">
+          <Plus className="h-4 w-4 text-[var(--accent)]" /> 新增账号
+        </div>
+        <div className="flex gap-2">
+          <input className={inputCls} placeholder="账号名" value={newName}
+            onChange={e => setNewName(e.target.value)} />
+          <input className={inputCls} placeholder="密码(≥6位)" value={newPass}
+            onChange={e => setNewPass(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') addUser(); }} />
+          <button disabled={busy} onClick={addUser}
+            className="px-4 py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-br from-[var(--accent)] to-[var(--accent-2)] disabled:opacity-50 whitespace-nowrap">
+            {busy ? '添加中…' : '添加'}
+          </button>
+        </div>
+      </div>
+
+      {/* 账号列表 */}
+      <div className={`rounded-xl border p-4 ${card}`}>
+        <div className="text-sm font-medium mb-3 flex items-center justify-between">
+          <span>已有账号 ({users.length})</span>
+          <button onClick={load} className="text-xs text-slate-400 hover:text-[var(--accent)] flex items-center gap-1">
+            <RefreshCw className="h-3 w-3" /> 刷新
+          </button>
+        </div>
+        {loading ? (
+          <div className="text-sm text-slate-400 py-6 text-center flex items-center justify-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" /> 加载中…
+          </div>
+        ) : users.length === 0 ? (
+          <div className="text-sm text-slate-400 py-6 text-center">还没有访客账号</div>
+        ) : (
+          <div className="space-y-2">
+            {users.map(u => (
+              <div key={u.username} className={`flex items-center gap-3 px-3 py-2.5 rounded-lg ${colors.isDark ? 'bg-slate-900/60' : 'bg-slate-100'}`}>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-medium flex items-center gap-2">
+                    {u.username}
+                    {u.trusted && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 flex items-center gap-0.5">
+                        <ShieldCheck className="h-2.5 w-2.5" /> 信任
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">
+                    {u.count > 0 ? `${u.count} 次操作` : '未活跃'}
+                    {u.lastTime ? ` · 最近 ${u.lastTime.replace('T', ' ').slice(5, 16)}` : ''}
+                  </div>
+                </div>
+                <button onClick={() => toggleTrust(u)} title={u.trusted ? '取消信任' : '设为信任账号(免资源防线)'}
+                  className={`text-xs px-2 py-1 rounded ${u.trusted ? 'text-amber-400 hover:bg-amber-500/10' : 'text-slate-400 hover:bg-slate-700/50'}`}>
+                  <ShieldCheck className="h-4 w-4" />
+                </button>
+                <button onClick={() => resetPass(u.username)} title="重置密码"
+                  className="text-xs px-2 py-1 rounded text-slate-400 hover:bg-slate-700/50">
+                  <RotateCcw className="h-4 w-4" />
+                </button>
+                <button onClick={() => delUser(u.username)} title="删除账号"
+                  className="text-xs px-2 py-1 rounded text-red-400 hover:bg-red-500/10">
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 注册邀请码 */}
+      <div className={`rounded-xl border p-4 ${card}`}>
+        <div className="text-sm font-medium mb-1">自助注册邀请码</div>
+        <p className="text-[11px] text-slate-400 mb-3">
+          留空 = 任何人可在下载版 app 上自助注册;填写后,注册必须输入正确邀请码。
+        </p>
+        <div className="flex gap-2">
+          <input className={inputCls} placeholder="留空则开放注册" value={inviteCode}
+            onChange={e => setInviteCode(e.target.value)} />
+          <button disabled={inviteCode.trim() === inviteSaved.trim()} onClick={saveInvite}
+            className="px-4 py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-br from-[var(--accent)] to-[var(--accent-2)] disabled:opacity-40 whitespace-nowrap">
+            保存
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -1777,6 +1996,7 @@ const MCPEditForm: React.FC<MCPEditFormProps> = ({ server, status, tools, onBack
 const ChartSettings: React.FC<{ saveConfig: (updates: any) => void }> = ({ saveConfig }) => {
   const { colors } = useTheme();
   const { mode, setMode } = useCandleColor();
+  const [klineYears, setKlineYears] = useState(getKlineHistoryYears());
   const { config: indConfig, updateIndicator, resetIndicator } = useIndicator();
 
   // 保存指标配置到后端
@@ -1814,6 +2034,32 @@ const ChartSettings: React.FC<{ saveConfig: (updates: any) => void }> = ({ saveC
 
   return (
     <div className="space-y-6 overflow-y-auto max-h-[420px] pr-1">
+      {/* ===== 历史K线范围 ===== */}
+      <div>
+        <h3 className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>历史日K范围</h3>
+        <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+          日K图默认加载的历史长度,默认近3年;选"全部"可看到上市以来完整走势(数据来自1991年起的本地档案库)
+        </p>
+        <div className="mt-2 flex flex-wrap gap-2">
+          {KLINE_RANGE_OPTIONS.map(opt => (
+            <button
+              key={opt.years}
+              type="button"
+              onClick={() => { setKlineYears(opt.years); setKlineHistoryYears(opt.years); }}
+              className={`px-3 py-1.5 rounded border text-xs transition-colors ${
+                klineYears === opt.years
+                  ? 'border-cyan-400/60 bg-cyan-400/15 text-cyan-200 font-semibold'
+                  : colors.isDark
+                    ? 'border-slate-700 text-slate-300 hover:border-slate-500'
+                    : 'border-slate-300 text-slate-600 hover:border-slate-400'
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
       {/* ===== 涨跌颜色 ===== */}
       <div>
         <h3 className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>涨跌颜色</h3>
