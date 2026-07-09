@@ -8,6 +8,7 @@
 #   ⑤重建下载页两个 zip(免脚本新结构)并上传 data/dist/
 # 用法: scripts/release-nas.sh 1.0.19 "更新说明"
 set -e
+export COPYFILE_DISABLE=1  # 防 macOS tar 打包 ._AppleDouble 垃圾
 VER="$1"; NOTES="${2:-新版本 $VER}"
 [ -z "$VER" ] && { echo "用法: $0 <版本号如1.0.19> [更新说明]"; exit 2; }
 REPO="xiaojun0819a/JOEY"
