@@ -10,6 +10,7 @@ import { PositionDialog } from './components/PositionDialog';
 import { TradeJournalDialog } from './components/TradeJournalDialog';
 import { HotTrendDialog } from './components/HotTrendDialog';
 import { LongHuBangDialog } from './components/LongHuBangDialog';
+import { AuctionBoardDialog } from './components/AuctionBoardDialog';
 import { MarketMovesDialog } from './components/MarketMovesDialog';
 import LowBuyScannerDialog, {
   type HistoryAutoCollectRequest,
@@ -65,7 +66,7 @@ import { checkForUpdate } from './services/updateService';
 import { useMarketEvents } from './hooks/useMarketEvents';
 import { useMarketStatus } from './hooks/useMarketStatus';
 import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex, F10Overview, StockValuation } from './types';
-import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity, RefreshCw, Search, Gauge, FileText, Wallet, ChevronDown, Maximize2, Brain } from 'lucide-react';
+import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3, Activity, RefreshCw, Search, Gauge, FileText, Wallet, ChevronDown, Maximize2, Brain, Gavel } from 'lucide-react';
 import logo from './assets/images/logo.png';
 import { GetTelegraphList, OpenURL, WindowMinimize, WindowMaximize, WindowClose } from '../wailsjs/go/main/App';
 import { WindowIsMaximised, WindowGetSize } from '../wailsjs/runtime/runtime';
@@ -227,6 +228,7 @@ const App: React.FC = () => {
   const [showPosition, setShowPosition] = useState(false);
   const [showHotTrend, setShowHotTrend] = useState(false);
   const [showLongHuBang, setShowLongHuBang] = useState(false);
+  const [showAuctionBoard, setShowAuctionBoard] = useState(false);
   const [showMarketMoves, setShowMarketMoves] = useState(false);
   const [showLowBuyScanner, setShowLowBuyScanner] = useState(false);
   const [lowBuyStrategyMode, setLowBuyStrategyMode] = useState<LowBuyStrategyMode>('lowbuy');
@@ -1445,6 +1447,13 @@ const App: React.FC = () => {
             <BarChart3 className="h-4 w-4" />
           </button>
           <button
+            onClick={() => setShowAuctionBoard(true)}
+            className={`p-2 rounded-lg fin-panel border fin-divider transition-colors ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-amber-400/40`}
+            title="集合竞价榜(9:25定型,可看竞价过程)"
+          >
+            <Gavel className="h-4 w-4" />
+          </button>
+          <button
             onClick={() => setShowHotTrend(true)}
             className={`p-2 rounded-lg fin-panel border fin-divider transition-colors ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-orange-400/40`}
             title="全网热点"
@@ -1840,6 +1849,12 @@ const App: React.FC = () => {
       <LongHuBangDialog
         isOpen={showLongHuBang}
         onClose={() => setShowLongHuBang(false)}
+        watchlistSymbols={watchlist.map(stock => stock.symbol)}
+        onAddToWatchlist={handleAddFromLongHuBang}
+      />
+      <AuctionBoardDialog
+        isOpen={showAuctionBoard}
+        onClose={() => setShowAuctionBoard(false)}
         watchlistSymbols={watchlist.map(stock => stock.symbol)}
         onAddToWatchlist={handleAddFromLongHuBang}
       />
