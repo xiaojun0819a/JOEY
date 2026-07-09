@@ -3651,12 +3651,16 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         if (!auctionSeriesRef.current) {
           auctionSeriesRef.current = chart.addSeries(LineSeries, {
             color: '#f59e0b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
-            autoscaleInfoProvider: () => null,
           });
         }
+        // 竞价价 clamp 到分时线价格区间:避免竞价期虚挂/撤单的极端价把纵轴拉爆;
+        // 但仍让竞价段参与时间轴(不能用 autoscaleInfoProvider=null,否则会被 fitContent 排出可视区)
+        const closes = safeData.map(d => d.close).filter(v => v > 0);
+        const lo = closes.length ? Math.min(...closes) : 0;
+        const hi = closes.length ? Math.max(...closes) : Number.MAX_VALUE;
         const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
         const auctionData: LineData[] = datePrefix
-          ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
+          ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: Math.min(hi, Math.max(lo, t.price)) }))
           : [];
         auctionSeriesRef.current.setData(auctionData);
       } else if (auctionSeriesRef.current) {

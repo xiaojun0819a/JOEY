@@ -7,6 +7,21 @@
 </head>
 <body>
 <div id="root"></div>
+<script>
+// 开发调试桥:浏览器(vite dev)里没有 Wails 绑定,设 localStorage.jcp_dev_remote='{"url":"...","token":"..."}'
+// 即可让前端进入远程模式直连 NAS 调试。真实 app 里 Wails 绑定先注入,此段不生效。
+(function () {
+  try {
+    var cfg = localStorage.getItem('jcp_dev_remote');
+    if (!cfg) return;
+    var o = JSON.parse(cfg);
+    window.go = window.go || {}; window.go.main = window.go.main || {}; window.go.main.App = window.go.main.App || {};
+    if (!window.go.main.App.GetBackendMode) {
+      window.go.main.App.GetBackendMode = function () { return Promise.resolve({ mode: 'remote', url: o.url, token: o.token || '' }); };
+    }
+  } catch (e) { /* ignore */ }
+})();
+</script>
 <script src="./src/main.tsx" type="module"></script>
 </body>
 </html>
