@@ -80,7 +80,7 @@ export interface ChatMessage {
 // 消息类型
 export type MsgType = 'opening' | 'opinion' | 'summary';
 
-export type TimePeriod = '1m' | '5d' | '1d' | '1w' | '1mo';
+export type TimePeriod = '1m' | '5d' | '30m' | '60m' | '1d' | '1w' | '1mo';
 
 // 快讯数据结构
 export interface Telegraph {

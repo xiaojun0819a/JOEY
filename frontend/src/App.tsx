@@ -179,6 +179,7 @@ const isMinuteTrendPeriod = (period: TimePeriod) => period === '1m' || period ==
 
 const getKLineRequestLength = (period: TimePeriod) => {
   if (period === '5d') return 1250;
+  if (period === '30m' || period === '60m') return 320; // 分钟K:约40-80个交易日
   return period === '1m' ? 250 : 240;
 };
 

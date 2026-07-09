@@ -172,7 +172,8 @@ func (ms *MarketService) cleanExpiredCache() {
 // getKLineCacheTTL 返回不同周期的缓存策略
 func (ms *MarketService) getKLineCacheTTL(period string) time.Duration {
 	// 分时需要高时效，避免增量推送读取到过旧缓存
-	if period == "1m" || period == "5d" {
+	// 30/60分钟当前K仍在盘中生长,同样走短缓存
+	if period == "1m" || period == "5d" || period == "30m" || period == "60m" {
 		return klineCacheTTLIntraday
 	}
 	return ms.klineCacheTTL
@@ -565,6 +566,10 @@ func (ms *MarketService) periodToScale(period string) string {
 	switch period {
 	case "1m", "5d":
 		return "1" // 1分钟线（分时图 / 5日走势）
+	case "30m":
+		return "30" // 30分钟线
+	case "60m":
+		return "60" // 60分钟线
 	case "1d":
 		return "240" // 日线
 	case "1w":

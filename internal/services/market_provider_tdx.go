@@ -137,6 +137,10 @@ func (p *tdxMarketProvider) FetchKLineData(code string, period string, days int)
 	switch period {
 	case "1m", "5d":
 		resp, err = cli.GetKlineMinuteAll(code)
+	case "30m":
+		resp, err = cli.GetKline30MinuteAll(code)
+	case "60m":
+		resp, err = cli.GetKline60MinuteAll(code)
 	case "1d":
 		resp, err = cli.GetKlineDayAll(code)
 	case "1w":
@@ -160,7 +164,7 @@ func (p *tdxMarketProvider) FetchKLineData(code string, period string, days int)
 	klines := make([]models.KLineData, 0, len(resp.List))
 	for _, item := range resp.List {
 		timeValue := item.Time.Format("2006-01-02")
-		if period == "1m" || period == "5d" {
+		if period == "1m" || period == "5d" || period == "30m" || period == "60m" {
 			timeValue = item.Time.Format("2006-01-02 15:04:05")
 		}
 		klines = append(klines, models.KLineData{
@@ -302,6 +306,8 @@ func (p *tdxMarketProvider) getClient() (tdxClient, error) {
 type tdxClient interface {
 	GetQuote(codes ...string) (protocol.QuotesResp, error)
 	GetKlineMinuteAll(code string) (*protocol.KlineResp, error)
+	GetKline30MinuteAll(code string) (*protocol.KlineResp, error)
+	GetKline60MinuteAll(code string) (*protocol.KlineResp, error)
 	GetKlineDayAll(code string) (*protocol.KlineResp, error)
 	GetIndexDay(code string, start, count uint16) (*protocol.KlineResp, error)
 	GetKlineWeekAll(code string) (*protocol.KlineResp, error)

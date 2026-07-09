@@ -75,6 +75,8 @@ type QAItem = {
 const PERIOD_LABELS: Record<TimePeriod, string> = {
   '1m': '分时',
   '5d': '5日',
+  '30m': '30分',
+  '60m': '60分',
   '1d': '日K',
   '1w': '周K',
   '1mo': '月K',

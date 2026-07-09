@@ -2011,6 +2011,8 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const periods: { id: TimePeriod; label: string }[] = [
     { id: '1m', label: '分时' },
     { id: '5d', label: '5日' },
+    { id: '30m', label: '30分' },
+    { id: '60m', label: '60分' },
     { id: '1d', label: '日K' },
     { id: '1w', label: '周K' },
     { id: '1mo', label: '月K' },
