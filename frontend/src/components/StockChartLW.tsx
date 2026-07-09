@@ -69,6 +69,7 @@ interface StockChartProps {
   mainChartTemplate?: MainChartTemplate;
   onMainChartTemplateChange?: (template: MainChartTemplate) => void;
   showTemplateSelect?: boolean; // 在周期栏内显示主图模板切换(全屏图表用)
+  showAuction?: boolean; // 分时图前叠加当日集合竞价段(默认关,头部按钮开启)
   initialGridMode?: boolean;
   initialSubChartType?: SubChartType;
   initialSubType2?: SubChartType;
@@ -1757,6 +1758,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   mainChartTemplate: controlledMainChartTemplate,
   onMainChartTemplateChange,
   showTemplateSelect = false,
+  showAuction = false,
   initialGridMode,
   initialSubChartType,
   initialSubType2,
@@ -2167,9 +2169,9 @@ export const StockChartLW: React.FC<StockChartProps> = ({
 
   // 清除所有 series（不销毁图表实例）
   // 拉取当日集合竞价段(仅分时1m)。日期跟随分时数据首根;9:13-9:27 盘中竞价窗口内 15s 轮询看生长。
-  const auctionDateKey = period === '1m' ? String(safeData[0]?.time || '').slice(0, 10) : '';
+  const auctionDateKey = showAuction && period === '1m' ? String(safeData[0]?.time || '').slice(0, 10) : '';
   useEffect(() => {
-    if (period !== '1m' || !stock?.symbol || !auctionDateKey) {
+    if (!showAuction || period !== '1m' || !stock?.symbol || !auctionDateKey) {
       setAuctionTicks([]);
       return;
     }
@@ -2194,7 +2196,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       cancelled = true;
       if (timer) window.clearInterval(timer);
     };
-  }, [period, stock?.symbol, auctionDateKey]);
+  }, [period, stock?.symbol, auctionDateKey, showAuction]);
 
   const clearAllSeries = useCallback(() => {
     const chart = chartRef.current;
@@ -3621,16 +3623,20 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         maSeriesRefs.current[0].setData(avgData);
       }
 
-      // 分时(仅1m,5日不拼)前拼接当日集合竞价段:琥珀色细线,日期取自当前分时数据,避免跨日错拼
-      if (period === '1m' && auctionTicks.length >= 2) {
+      // 分时(仅1m,5日不拼)前拼接当日集合竞价段:琥珀色细线,日期取自当前分时数据,避免跨日错拼。
+      // 降采样到每分钟末笔(否则130+个tick把横轴挤掉三分之一);不参与纵轴缩放(竞价瞬时撤单价会拉爆价格轴)。
+      if (showAuction && period === '1m' && auctionTicks.length >= 2) {
         if (!auctionSeriesRef.current) {
           auctionSeriesRef.current = chart.addSeries(LineSeries, {
             color: '#f59e0b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            autoscaleInfoProvider: () => null,
           });
         }
+        const byMinute = new Map<string, { time: string; price: number }>();
+        for (const t of auctionTicks) byMinute.set(t.time.slice(0, 5), t);
         const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
         const auctionData: LineData[] = datePrefix
-          ? auctionTicks.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
+          ? Array.from(byMinute.values()).map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
           : [];
         auctionSeriesRef.current.setData(auctionData);
       } else if (auctionSeriesRef.current) {
@@ -3853,7 +3859,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       }
       hasFittedRef.current = true;
     }
-  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, auctionTicks]);
+  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, auctionTicks, showAuction]);
 
   // 副图指标独立于主图叠加开关，用户可自由切换 VOL/MACD/KDJ/RSI/CCI/WR（不再随设置回退）
 

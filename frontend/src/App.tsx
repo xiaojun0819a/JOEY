@@ -229,6 +229,14 @@ const App: React.FC = () => {
   const [showHotTrend, setShowHotTrend] = useState(false);
   const [showLongHuBang, setShowLongHuBang] = useState(false);
   const [showAuctionBoard, setShowAuctionBoard] = useState(false);
+  // 分时图叠加集合竞价段的开关(本机偏好,默认关)
+  const [showAuctionOverlay, setShowAuctionOverlay] = useState(() => localStorage.getItem('jcp_show_auction') === '1');
+  const toggleAuctionOverlay = useCallback(() => {
+    setShowAuctionOverlay(v => {
+      localStorage.setItem('jcp_show_auction', v ? '0' : '1');
+      return !v;
+    });
+  }, []);
   const [showMarketMoves, setShowMarketMoves] = useState(false);
   const [showLowBuyScanner, setShowLowBuyScanner] = useState(false);
   const [lowBuyStrategyMode, setLowBuyStrategyMode] = useState<LowBuyStrategyMode>('lowbuy');
@@ -1732,6 +1740,21 @@ const App: React.FC = () => {
                     日K主图生效
                   </span>
                 )}
+                <button
+                  type="button"
+                  onClick={toggleAuctionOverlay}
+                  className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-xs transition-colors ${
+                    showAuctionOverlay
+                      ? 'border-amber-400/70 text-amber-400 bg-amber-400/10'
+                      : colors.isDark
+                        ? 'border-slate-700 bg-slate-900/35 text-slate-400 hover:border-amber-400/50 hover:text-amber-300'
+                        : 'border-slate-300 bg-white/60 text-slate-500 hover:border-amber-400/60 hover:text-amber-600'
+                  }`}
+                  title="分时图前叠加当日集合竞价段(9:15-9:25);仅分时周期生效"
+                >
+                  <Gavel className="h-3 w-3" />
+                  竞价
+                </button>
               </div>
               <button
                 type="button"
@@ -1763,6 +1786,7 @@ const App: React.FC = () => {
                       dayKData={multiCycleKLines.daily}
                       mainChartTemplate={mainChartTemplate}
                       onMainChartTemplateChange={handleMainChartTemplateChange}
+                      showAuction={showAuctionOverlay}
                     />
                   </SafeBoundary>
                 </div>
@@ -1993,6 +2017,7 @@ const App: React.FC = () => {
                 dayKData={multiCycleKLines.daily}
                 mainChartTemplate={mainChartTemplate}
                 onMainChartTemplateChange={handleMainChartTemplateChange}
+                showAuction={showAuctionOverlay}
                 showTemplateSelect
                 initialGridMode={chartFullscreenMode === 'strategy' ? true : undefined}
                 initialSubChartType={chartFullscreenMode === 'strategy' ? 'vipAnomaly' : undefined}
