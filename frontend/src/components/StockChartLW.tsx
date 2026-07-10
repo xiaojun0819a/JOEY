@@ -1781,11 +1781,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const volumeChartRef = useRef<IChartApi | null>(null);
   const mainSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
-  // 分时图前拼接的当日集合竞价段(9:15-9:25,数据来自 NAS intraday 采集,无数据时隐藏)
-  const auctionSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
+  // 集合竞价独立窗(通达信样式):分时线前拼 whitespace 占位让时间轴含竞价时段、分时线右移空出左侧,
+  // overlay canvas 在该区自绘价格台阶+背景框。数据来自 NAS intraday 采集,无数据时隐藏。
+  const auctionOverlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const [auctionTicks, setAuctionTicks] = useState<{ time: string; price: number; volume: number }[]>([]);
-  // 竞价段:按"价格变化点"降采样,保留通达信那种台阶折线观感(相邻同价合并),点数远少于原始tick,
-  // 不会把分时横轴挤宽;时间保留到秒级(台阶发生在秒级)。
+  // 竞价段按"价格变化点"降采样(相邻同价合并),保留台阶观感、点数远少于原始tick;时间保留到秒级。
   const sampledAuction = useMemo(() => {
     const src = auctionTicks;
     if (src.length < 2) return [] as { time: string; price: number; volume: number }[];
@@ -1797,8 +1797,6 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     if (out[out.length - 1] !== last) out.push(last);
     return out;
   }, [auctionTicks]);
-  // 竞价折线的纵轴范围:锁到分时线区间,让竞价期极端虚挂价超出部分被裁掉(而非拉爆价格轴)
-  const auctionPriceRangeRef = useRef<{ lo: number; hi: number }>({ lo: 0, hi: 0 });
   const vipAxisSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const vipAxisPaneRefs = useRef<Array<ISeriesApi<SeriesType, Time> | null>>([null, null, null]);
   const maSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
@@ -2247,10 +2245,6 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       try { chart.removeSeries(mainSeriesRef.current); } catch { /* already removed */ }
       mainSeriesRef.current = null;
     }
-    if (auctionSeriesRef.current) {
-      try { chart.removeSeries(auctionSeriesRef.current); } catch { /* already removed */ }
-      auctionSeriesRef.current = null;
-    }
     clearSeriesArray(chart, maSeriesRefs);
     clearSeriesArray(chart, emaSeriesRefs);
     clearSeriesArray(chart, bollSeriesRefs);
@@ -2643,6 +2637,87 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       resizeObserver.disconnect();
     };
   }, [mainChartTemplate, isTrendLinePeriod, openEatFishMainSeries, chartViewport.width, chartViewport.height]);
+
+  // 集合竞价独立窗:在左侧竞价时段(whitespace 占位区)自绘 通达信式 台阶价折线 + 深灰背景 + 分隔竖线。
+  // y 用分时线 priceToCoordinate 精确对齐价格轴;x 用 timeToCoordinate(竞价 whitespace 点已在轴上)。
+  useEffect(() => {
+    const canvas = auctionOverlayCanvasRef.current;
+    const container = chartContainerRef.current;
+    const chart = chartRef.current;
+    const series = mainSeriesRef.current;
+    const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
+    const active = showAuction && period === '1m' && sampledAuction.length >= 2 && !!datePrefix;
+    if (!canvas || !container || !chart || !series || !active) {
+      if (canvas) { const ctx = canvas.getContext('2d'); ctx?.clearRect(0, 0, canvas.width, canvas.height); }
+      return;
+    }
+    const timeScale = chart.timeScale();
+    let frame = 0;
+    const draw = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width <= 0 || height <= 0) return;
+      const dpr = window.devicePixelRatio || 1;
+      const pw = Math.floor(width * dpr);
+      const ph = Math.floor(height * dpr);
+      if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph; }
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      const pts = sampledAuction.map(t => {
+        const x = timeScale.timeToCoordinate(parseTime(`${datePrefix} ${t.time}`));
+        const y = series.priceToCoordinate(t.price);
+        return (typeof x === 'number' && Number.isFinite(x) && typeof y === 'number' && Number.isFinite(y))
+          ? { x: x as number, y: y as number } : null;
+      }).filter((p): p is { x: number; y: number } => p !== null);
+      if (pts.length < 2) return;
+
+      const xRight = pts[pts.length - 1].x + 2;
+      // 价格区裁剪(排除右侧价格刻度带),竞价台阶极端价超出上下边界时被裁而非画出界
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, Math.max(0, width - PRICE_SCALE_MIN_WIDTH), height);
+      ctx.clip();
+
+      // 深灰背景框 + 右侧分隔竖线
+      ctx.fillStyle = 'rgba(30,41,59,0.4)';
+      ctx.fillRect(0, 0, Math.max(0, xRight), height);
+      ctx.strokeStyle = 'rgba(148,163,184,0.45)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(Math.round(xRight) + 0.5, 0);
+      ctx.lineTo(Math.round(xRight) + 0.5, height);
+      ctx.stroke();
+
+      // 台阶价折线(白色):先水平到当前 x(用前一点 y),再垂直到当前 y —— 通达信竞价台阶
+      ctx.strokeStyle = '#e2e8f0';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) {
+        ctx.lineTo(pts[i].x, pts[i - 1].y);
+        ctx.lineTo(pts[i].x, pts[i].y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    };
+    const scheduleDraw = () => { window.cancelAnimationFrame(frame); frame = window.requestAnimationFrame(draw); };
+    scheduleDraw();
+    const timeout = window.setTimeout(scheduleDraw, 120);
+    timeScale.subscribeVisibleLogicalRangeChange(scheduleDraw);
+    const ro = new ResizeObserver(scheduleDraw);
+    ro.observe(container);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+      timeScale.unsubscribeVisibleLogicalRangeChange(scheduleDraw);
+      ro.disconnect();
+    };
+  }, [showAuction, period, sampledAuction, safeData, chartColors, chartViewport.width, chartViewport.height]);
 
   useEffect(() => {
     const canvas = vipOverlayCanvasRef.current;
@@ -3660,9 +3735,15 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         });
       }
 
-      // 更新数据
+      // 更新数据。分时+竞价开启:前拼竞价 whitespace 占位点(只有 time 无 value),让时间轴含 9:15-9:25、
+      // 分时线右移空出左侧竞价窗;分时线本身不在竞价段绘制(whitespace),竞价台阶由 overlay canvas 画。
+      const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
+      const withAuction = showAuction && period === '1m' && sampledAuction.length >= 2 && datePrefix;
+      const auctionWhitespace = withAuction
+        ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`) } as LineData))
+        : [];
       const lineData: LineData[] = safeData.map(d => ({ time: parseTime(d.time), value: d.close }));
-      mainSeriesRef.current.setData(lineData);
+      mainSeriesRef.current.setData([...auctionWhitespace, ...lineData]);
       if (!signalMarkersRef.current) {
         signalMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, signalMarkerData, { zOrder: 'top' });
       } else {
@@ -3672,34 +3753,6 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       if (maSeriesRefs.current.length > 0) {
         const avgData: LineData[] = safeData.filter(d => d.avg).map(d => ({ time: parseTime(d.time), value: d.avg! }));
         maSeriesRefs.current[0].setData(avgData);
-      }
-
-      // 分时(仅1m,5日不拼)前拼接当日集合竞价段:琥珀色细线,日期取自当前分时数据,避免跨日错拼。
-      // 降采样到每分钟末笔(否则130+个tick把横轴挤掉三分之一);不参与纵轴缩放(竞价瞬时撤单价会拉爆价格轴)。
-      if (showAuction && period === '1m' && sampledAuction.length >= 2) {
-        // 纵轴锁到分时线区间:竞价真实价格(含虚挂台阶)照画,超出分时区间的极端点被裁,不拉爆价格轴。
-        // autoscaleInfoProvider 返回非 null,竞价段仍参与时间轴(返回 null 会被 fitContent 排出可视区)。
-        const closes = safeData.map(d => d.close).filter(v => v > 0);
-        auctionPriceRangeRef.current = {
-          lo: closes.length ? Math.min(...closes) : 0,
-          hi: closes.length ? Math.max(...closes) : 0,
-        };
-        if (!auctionSeriesRef.current) {
-          auctionSeriesRef.current = chart.addSeries(LineSeries, {
-            color: '#e2e8f0', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
-            autoscaleInfoProvider: () => {
-              const r = auctionPriceRangeRef.current;
-              return r.lo > 0 && r.hi > r.lo ? { priceRange: { minValue: r.lo, maxValue: r.hi } } : null;
-            },
-          });
-        }
-        const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
-        const auctionData: LineData[] = datePrefix
-          ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price }))
-          : [];
-        auctionSeriesRef.current.setData(auctionData);
-      } else if (auctionSeriesRef.current) {
-        auctionSeriesRef.current.setData([]);
       }
     }
     // ---------- K线图 ----------
@@ -4559,6 +4612,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         <canvas
           ref={mainOverlayCanvasRef}
           className={`absolute inset-0 z-10 pointer-events-none ${mainChartTemplate === 'openEatFish' && !isTrendLinePeriod ? 'block' : 'hidden'}`}
+        />
+        {/* 集合竞价独立窗:分时(1m)+竞价开关时,在左侧竞价时段自绘台阶价+背景框(通达信样式) */}
+        <canvas
+          ref={auctionOverlayCanvasRef}
+          className={`absolute inset-0 z-10 pointer-events-none ${showAuction && period === '1m' ? 'block' : 'hidden'}`}
         />
         {!isTrendLinePeriod && mainChartTemplate === 'standard' && renderBottomLegend(mainIndicatorLegend, 'bottom-1.5')}
         {!isTrendLinePeriod && typeof mainChartTemplate === 'string' && mainChartTemplate.startsWith('tdx:') && tdxMainHint && (
