@@ -16,6 +16,9 @@ docs
 .workflow
 flowforge
 *.bak
+# 换 logo/图标时脚本留下的原图备份(*.bak 规则匹配不到这个后缀)
+*.joey-bak
+.DS_Store
 *.log
 deploy_remote_access.sh
 tmp
