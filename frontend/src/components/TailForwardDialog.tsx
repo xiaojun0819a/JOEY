@@ -41,8 +41,8 @@ export const TailForwardDialog: React.FC<Props> = ({ isOpen, onClose }) => {
           <div className="flex items-center gap-2">
             <Radar className="h-5 w-5 text-cyan-400" />
             <div>
-              <div className="text-sm font-semibold fin-text-primary">尾盘 2:30 多策略自动选股</div>
-              <div className="text-[11px] fin-text-tertiary">实时盘口判"封死涨停买不进"，只记可成交的票 · 用真实数据验证 2:30 入场到底行不行</div>
+              <div className="text-sm font-semibold fin-text-primary">尾盘 2:50 多策略自动选股</div>
+              <div className="text-[11px] fin-text-tertiary">实时盘口判"封死涨停买不进"，只记可成交的票 · 用真实数据验证 2:50 入场到底行不行</div>
             </div>
           </div>
           <button onClick={onClose} className="p-1.5 rounded fin-hover"><X className="h-4 w-4 fin-text-secondary" /></button>

@@ -9,5 +9,11 @@
   "author": {
     "name": "syskey",
     "email": "syskeykala@gmail.com"
+  },
+  "info": {
+    "productName": "观鲸测浪",
+    "productVersion": "1.0.0",
+    "copyright": "© 观鲸测浪",
+    "comments": "观鲸测浪 · A股智能交易台"
   }
 }

@@ -75,6 +75,7 @@ export interface StrategyReviewResult {
   optimization: string[];
   warning?: string;
   dataSourceNotes?: string[];
+  reviewPending?: boolean; // 复盘日尚无行情:收益类数字无意义,显示待复盘
 }
 
 type GoBridge = {

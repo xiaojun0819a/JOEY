@@ -27,8 +27,8 @@ func (f *ToutiaoFetcher) PlatformCN() string { return "头条热榜" }
 // toutiaoResponse 头条API响应结构
 type toutiaoResponse struct {
 	Data []struct {
-		Title    string `json:"Title"`
-		HotValue string `json:"HotValue"`
+		Title     string `json:"Title"`
+		HotValue  string `json:"HotValue"`
 		ClusterID string `json:"ClusterIdStr"`
 	} `json:"data"`
 }

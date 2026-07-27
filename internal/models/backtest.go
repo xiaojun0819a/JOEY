@@ -29,6 +29,8 @@ type WaveCandidate struct {
 	MidBull           bool     `json:"midBull"`           // 中期红
 	ShortBull         bool     `json:"shortBull"`         // 短期红
 	GZ                bool     `json:"gz"`                // 五灯共振
+	KeyLayout         bool     `json:"keyLayout"`         // 重点布局:日K+30分+60分三周期五维全红买+多头共振
+	KeyLayoutTF       []string `json:"keyLayoutTF"`       // 已确认共振的周期(日K/30分/60分)
 	Reasons           []string `json:"reasons"`           // 入选理由
 	Risks             []string `json:"risks"`             // 风险/减仓提示
 }

@@ -56,9 +56,13 @@ func (ms *MarketService) fetchStockDataWithFallback(codes ...string) ([]StockWit
 func (ms *MarketService) fetchKLineDataWithFallback(code string, period string, days int) ([]models.KLineData, error) {
 	// 日线优先腾讯（又快又稳，~0.4s），避免主源(通达信)超时后硬走慢新浪(~10s/只)
 	if period == "1d" {
-		if data, err := ms.fetchKLineDataFromTencent(code, period, days); err == nil && len(data) > 0 {
+		data, err := ms.fetchKLineDataFromTencent(code, period, days)
+		if err == nil && len(data) > 0 {
 			return data, nil
 		}
+		// 必须留痕:这里静默吞错曾让"指数日K间歇性变垃圾"潜伏很久——腾讯偶发失败(5s超时/WAF 501)
+		// 就无声掉进 TDX 分支,而当时 TDX 对指数的解析是错的。没有这行日志就查不出为何时好时坏。
+		log.Warn("腾讯日K获取失败,回落 TDX/新浪: %s err=%v len=%d", code, err, len(data))
 	}
 	// 分时(今日)优先腾讯(~0.2s):主源 TDX 的 GetKlineMinuteAll 慢(~8s)、新浪备源被限流(456)。
 	if period == "1m" {

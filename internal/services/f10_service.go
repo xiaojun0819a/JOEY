@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -1437,7 +1438,7 @@ func (s *F10Service) GetValuation(code normalizedCode) (models.StockValuation, e
 
 	query := url.Values{}
 	query.Set("secid", code.SecID)
-	query.Set("fields", "f43,f44,f45,f47,f60,f84,f85,f116,f117,f162,f163")
+	query.Set("fields", "f43,f44,f45,f47,f59,f60,f84,f85,f116,f117,f164,f167")
 	urlStr := quoteDataURL + "?" + query.Encode()
 	raw, err := s.fetchJSON(urlStr, map[string]string{
 		"Referer": "https://quote.eastmoney.com/",
@@ -1456,10 +1457,11 @@ func (s *F10Service) GetValuation(code normalizedCode) (models.StockValuation, e
 		return models.StockValuation{}, fmt.Errorf("估值数据为空")
 	}
 
-	price := scaleQuotePrice(toFloat(data["f43"]))
-	high := scaleQuotePrice(toFloat(data["f44"]))
-	low := scaleQuotePrice(toFloat(data["f45"]))
-	preClose := scaleQuotePrice(toFloat(data["f60"]))
+	dec := quoteDecimals(data["f59"])
+	price := scaleQuotePrice(toFloat(data["f43"]), dec)
+	high := scaleQuotePrice(toFloat(data["f44"]), dec)
+	low := scaleQuotePrice(toFloat(data["f45"]), dec)
+	preClose := scaleQuotePrice(toFloat(data["f60"]), dec)
 	volume := toFloat(data["f47"])
 	totalShares := toFloat(data["f84"])
 	floatShares := toFloat(data["f85"])
@@ -1478,9 +1480,16 @@ func (s *F10Service) GetValuation(code normalizedCode) (models.StockValuation, e
 	}
 
 	valuation := models.StockValuation{
-		Price:          price,
-		PETTM:          scaleQuoteValue(toFloat(data["f162"]), 0.01),
-		PB:             scaleQuoteValue(toFloat(data["f163"]), 0.001),
+		Price: price,
+		// PE-TTM 用 f164(×0.01)。⚠️原先用 f162 是"动态PE"(按最近季报年化推算),名不副实:
+		// 实测对档案 tushare 真实 PE_TTM —— 平安银行应4.86,f164 给 4.86(精确吻合)、f162 给 3.60;
+		// 茅台应≈17.43,f164 给 18.94、f162 给 14.37。字段含义见本文件另一处映射表(f162=PE_DYNAMIC/
+		// f163=PE_STATIC/f164=PE_TTM/f167=PB),那张表一直是对的,是 GetValuation 这里取错了。
+		PETTM: scaleQuoteValue(toFloat(data["f164"]), 0.01),
+		// PB 用 f167(×0.01)。⚠️原先用 f163(×0.001) 是错字段:实测对档案库 tushare 真实PB —
+		// 茅台应≈6.91 而 f163 给 1.903(差3.6倍)、双成应≈10.05 而 f163 给 20.6(差2倍);
+		// 平安银行恰好 0.491≈0.471 所以长期没被发现。f167 三只票全部吻合。
+		PB:             scaleQuoteValue(toFloat(data["f167"]), 0.01),
 		TotalMarketCap: toFloat(data["f116"]),
 		FloatMarketCap: toFloat(data["f117"]),
 		TurnoverRate:   turnoverRate,
@@ -3073,14 +3082,25 @@ func toFloat(value any) float64 {
 	return 0
 }
 
-func scaleQuotePrice(value float64) float64 {
+// quoteDecimals 取东财 f59(该标的的小数位数);缺失/异常按 A股惯例 2 位兜底。
+func quoteDecimals(v any) int {
+	d := int(toFloat(v))
+	if d <= 0 || d > 8 {
+		return 2
+	}
+	return d
+}
+
+// scaleQuotePrice 东财 push2 的价格字段是"实际价 × 10^f59"的整数,必须按接口给出的小数位数还原。
+// ⚠️历史坑(2026-07-17 修):曾用 `value > 1000 才 /100` 的启发式猜倍数 —— 10元以上的股票蒙对,
+// **10元以下的全部返回100倍错价**(双成药业 f43=947 → 返回 947 而非 9.47;*ST美丽 1.72 → 返回 173)。
+// 更阴的是股价在 10 元附近时 high(>1000)被除、low(<1000)没被除,振幅算出巨大负数。
+// 倍数由 f59 明确给出,不要猜。
+func scaleQuotePrice(value float64, decimals int) float64 {
 	if value == 0 {
 		return 0
 	}
-	if value > 1000 {
-		return value / 100
-	}
-	return value
+	return value / math.Pow10(decimals)
 }
 
 func scaleQuoteValue(value float64, factor float64) float64 {

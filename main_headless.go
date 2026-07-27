@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"html"
 	"io"
 	stdlog "log"
@@ -19,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,6 +133,76 @@ func main() {
 		_, _ = w.Write([]byte(adminPageHTML))
 	})))
 
+	// /tip 荐股跟单录入页(手机用)。9:30 收到荐股短信,在手机上粘贴代码即建仓,不必守着电脑。
+	// 仅主人可用(访客不该往主人的模拟盘里塞仓位)。no-store:带 token 的页面绝不能被 CF 边缘缓存
+	// (2026-07-04 踩过——CF 按扩展名缓存把鉴权架空)。
+	mux.Handle("/tip", auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if role, _ := r.Context().Value(ctxKeyRole{}).(string); token != "" && role != "admin" {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "仅管理员可访问"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "private, no-store")
+		_, _ = w.Write([]byte(tipPageHTML))
+	})))
+
+	// /tip/submit 给 iOS 快捷指令用:**请求体就是消息原文纯文本**,响应是人话纯文本。
+	//
+	// 为什么不让快捷指令直接调 /rpc/AddTipPicks:那个要 JSON 数组体,而荐股原文里有换行和引号,
+	// 得在快捷指令 UI 里用「替换文本」逐个转义才能拼出合法 JSON——又脆又难调。
+	// 收纯文本则零转义。响应也回纯文本,快捷指令拿到直接弹通知,不用解析 JSON。
+	// 参数走 query(amount/note,非敏感);令牌仍走 X-JCP-Token 头,不进 URL。
+	mux.Handle("/tip/submit", auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "private, no-store")
+		if role, _ := r.Context().Value(ctxKeyRole{}).(string); token != "" && role != "admin" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("仅管理员可用"))
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte("请用 POST,请求体填荐股原文"))
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("读取请求体失败:" + err.Error()))
+			return
+		}
+		amount := 30000.0
+		if v, e := strconv.ParseFloat(r.URL.Query().Get("amount"), 64); e == nil && v > 0 {
+			amount = v
+		}
+		note := r.URL.Query().Get("note")
+		if strings.TrimSpace(note) == "" {
+			note = "天鼎早盘"
+		}
+		res, err := app.AddTipPicks(string(body), amount, note)
+		if err != nil {
+			// 200 而非 4xx:快捷指令对非 2xx 会直接报网络错误,把原因吞掉。
+			// 这里的"失败"多半是纪律拒绝(非交易时段/涨停封死),用户必须看见原因。
+			_, _ = w.Write([]byte("❌ " + err.Error()))
+			return
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "✅ 记入 %d 只，跳过 %d 只  %s\n", res.Added, res.Skipped, res.At)
+		for _, row := range res.Rows {
+			if row.Skipped != "" {
+				fmt.Fprintf(&b, "✗ %s %s\n", row.Name, row.Skipped)
+				continue
+			}
+			fmt.Fprintf(&b, "· %s %.2f×%d股=%.1f万", row.Name, row.Price, row.Shares, row.Amount/10000)
+			if row.DayOpen > 0 {
+				fmt.Fprintf(&b, "（较开盘%+.2f%%）", (row.Price/row.DayOpen-1)*100)
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("记账价=此刻实时价，卖出自行操作")
+		_, _ = w.Write([]byte(b.String()))
+	})))
+
 	srv := &http.Server{Addr: addr, Handler: withCORS(mux)}
 
 	// 优雅退出
@@ -165,23 +237,23 @@ type ctxKeyUser struct{}
 // guestBlockedMethods 访客禁用的方法：配置/密钥/账号类变更,以及主人共享资产(策略/专家)的写操作。
 // 其余(行情/自选/台账/AI问答等)照常——这些已按用户隔离,各改各的。
 var guestBlockedMethods = map[string]bool{
-	"UpdateConfig":      true,
-	"SetTailForwardConfig": true,
-	"RunBackupNow":      true,
-	"GetBackupStatus":   true,
-	"AddAgentConfig":    true,
-	"UpdateAgentConfig": true,
-	"DeleteAgentConfig": true,
-	"AddMCPServer":      true,
-	"UpdateMCPServer":   true,
-	"DeleteMCPServer":   true,
-	"TestMCPConnection": true,
-	"TestAIConnection":  true,
-	"SetRemoteUser":     true,
-	"DeleteRemoteUser":  true,
-	"ListRemoteUsers":   true,
-	"GetAuditLogs":      true,
-	"GetAuditUsers":     true,
+	"UpdateConfig":          true,
+	"SetTailForwardConfig":  true,
+	"RunBackupNow":          true,
+	"GetBackupStatus":       true,
+	"AddAgentConfig":        true,
+	"UpdateAgentConfig":     true,
+	"DeleteAgentConfig":     true,
+	"AddMCPServer":          true,
+	"UpdateMCPServer":       true,
+	"DeleteMCPServer":       true,
+	"TestMCPConnection":     true,
+	"TestAIConnection":      true,
+	"SetRemoteUser":         true,
+	"DeleteRemoteUser":      true,
+	"ListRemoteUsers":       true,
+	"GetAuditLogs":          true,
+	"GetAuditUsers":         true,
 	"SetRegisterInviteCode": true,
 	// 策略/专家配置是共享资产,访客只读
 	"SetActiveStrategy": true,
@@ -209,6 +281,7 @@ var guestResourceMethods = map[string]bool{
 	"CollectDailyHistory":      true,
 	"BackfillHistory":          true,
 	"BackfillAllHistory":       true,
+	"BackfillMissingOHLC":      true,
 	"EnrichBacktestData":       true,
 	"UpdateHistoryAutoCollect": true,
 }
@@ -245,12 +318,12 @@ func guestAppFor(owner *App, username string) (*App, error) {
 // Login/Register 无论成败都记(只记用户名,不碰密码)。主人(admin)流量不记。
 
 var auditSkip = map[string]bool{
-	"GetMarketIndices":  true,
-	"GetTelegraphList":  true,
+	"GetMarketIndices":   true,
+	"GetTelegraphList":   true,
 	"GetSessionMessages": true,
-	"GetBackendMode":    true,
-	"GetConfig":         true,
-	"GetConfigMasked":   true,
+	"GetBackendMode":     true,
+	"GetConfig":          true,
+	"GetConfigMasked":    true,
 }
 
 var auditDedupe = map[string]bool{
@@ -363,12 +436,6 @@ func newRPCHandler(app *App, appCtx context.Context) http.HandlerFunc {
 			}
 			target = g
 		}
-		method := reflect.ValueOf(target).MethodByName(name)
-		if !method.IsValid() {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown method: " + name})
-			return
-		}
-
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 32<<20))
 		var rawArgs []json.RawMessage
 		if len(strings.TrimSpace(string(body))) > 0 {
@@ -376,6 +443,34 @@ func newRPCHandler(app *App, appCtx context.Context) http.HandlerFunc {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "args must be a JSON array: " + err.Error()})
 				return
 			}
+		}
+
+		// 断线找回查询(伪方法,必须在 MethodByName 之前处理):长扫描请求常被公网隧道中途掐断,
+		// 但服务端会照常算完并缓存;前端网络错误后轮询此伪方法把结果捞回来。
+		if name == "__heavyStatus" {
+			var qm, qh string
+			if len(rawArgs) >= 2 {
+				_ = json.Unmarshal(rawArgs[0], &qm)
+				_ = json.Unmarshal(rawArgs[1], &qh)
+			}
+			writeJSON(w, http.StatusOK, heavyStatus(heavyUserTag(role, guestUser), qm, qh))
+			return
+		}
+
+		// 共享扫描查询(伪方法):按方法名取任意账号最新一次扫描结果,弹窗打开即显示+10秒轮询换新
+		if name == "__sharedResult" {
+			var qm string
+			if len(rawArgs) >= 1 {
+				_ = json.Unmarshal(rawArgs[0], &qm)
+			}
+			writeJSON(w, http.StatusOK, sharedScanLatest(qm))
+			return
+		}
+
+		method := reflect.ValueOf(target).MethodByName(name)
+		if !method.IsValid() {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown method: " + name})
+			return
 		}
 
 		auditRPC(role, guestUser, name, rawArgs, r)
@@ -406,6 +501,15 @@ func newRPCHandler(app *App, appCtx context.Context) http.HandlerFunc {
 			argIdx++
 		}
 
+		// 重方法登记(供断线找回):键=用户|方法|参数指纹,连接被掐后结果仍缓存可查
+		isHeavy := heavyMethodRe.MatchString(name)
+		hkey := ""
+		if isHeavy {
+			hkey = heavyKey(heavyUserTag(role, guestUser), name, body)
+			heavyMarkRunning(hkey, +1)
+			defer heavyMarkRunning(hkey, -1)
+		}
+
 		var results []reflect.Value
 		func() {
 			defer func() {
@@ -434,8 +538,198 @@ func newRPCHandler(app *App, appCtx context.Context) http.HandlerFunc {
 				payload = rv.Interface()
 			}
 		}
+		if isHeavy || sharedScanRe.MatchString(name) {
+			if b, err := json.Marshal(payload); err == nil {
+				if sharedScanRe.MatchString(name) {
+					sharedScanPut(name, body, b, sharedScanUser(role, guestUser))
+				}
+				if isHeavy {
+					heavyStore(hkey, b)
+				}
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(b)
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, payload)
 	}
+}
+
+// ===== 重方法断线找回:结果缓存(用户|方法|参数指纹 → 最近一次成功结果) =====
+// 背景:公网隧道(Cloudflare)对长请求不友好,几分钟一抖就掐线;扫描类 RPC 动辄1-3分钟,
+// 客户端 "Failed to fetch/Load failed" 而服务端其实算完了。缓存住,前端轮询 __heavyStatus 找回。
+var heavyMethodRe = regexp.MustCompile(`Scanner|Scan[A-Z]|RunWave|Replay|Backfill|Rebuild|Review|Digest|Report|Meeting|GenerateStrategy|Diagnos`)
+
+type heavyEntry struct {
+	data []byte
+	at   time.Time
+}
+
+var (
+	heavyMu      sync.Mutex
+	heavyRunning = map[string]int{}
+	heavyResults = map[string]heavyEntry{}
+)
+
+func heavyUserTag(role, guestUser string) string {
+	if role == "guest" {
+		return "g:" + guestUser
+	}
+	return "owner"
+}
+
+func heavyKey(user, name string, body []byte) string {
+	h := fnv.New32a()
+	_, _ = h.Write(body)
+	return user + "|" + name + "|" + strconv.FormatUint(uint64(h.Sum32()), 16)
+}
+
+// ===== 策略扫描结果跨账号共享 =====
+// 全市场选股结果与账号无关:任一账号扫完,结果进共享池,推给所有账号——弹窗打开即显示
+// 上一次结果(不重跑);点「扫描」永远真跑,跑完共享副本刷新,其他账号开着的弹窗10秒内自动换新。
+// 前端经 __sharedResult 伪方法按方法名取最新。不落盘:重启(发版=规则可能变了)自动作废。
+var sharedScanRe = regexp.MustCompile(`^(RunWaveScanner|RunWaveScannerWithGate|RunLowBuyScannerV1|RunTailLazyScannerV2|RunLimitPullbackScanner|RunTripleVolumeScannerV5|RunTailBuyScannerV6|RunHotMoneyBreakoutScannerV7|RunDipEntryScannerV8|RunMonsterScannerV9|RunMonsterScannerV10|RunOversoldIgniteScanner|RunLimitupRetraceScanner|RunCaoYuanStandardScanner4A|RunCaoYuanZhuangScanner4B|RunLateDayChaseScanner|GetAuctionPicksG|GetAuctionPicksC)$`)
+
+type sharedScanEntry struct {
+	body []byte
+	at   time.Time
+	user string
+}
+
+var (
+	sharedScanMu sync.Mutex
+	sharedScans  = map[string]sharedScanEntry{}
+)
+
+func sharedScanKey(name string, reqBody []byte) string {
+	h := fnv.New32a()
+	_, _ = h.Write(reqBody)
+	return name + "|" + strconv.FormatUint(uint64(h.Sum32()), 16)
+}
+
+// sharedScanLatest 返回该方法最新一次共享扫描(不限参数指纹,取时间最新;found=false 表示还没人扫过)。
+func sharedScanLatest(name string) map[string]any {
+	sharedScanMu.Lock()
+	defer sharedScanMu.Unlock()
+	var best *sharedScanEntry
+	for k := range sharedScans {
+		if !strings.HasPrefix(k, name+"|") {
+			continue
+		}
+		e := sharedScans[k]
+		if best == nil || e.at.After(best.at) {
+			best = &e
+		}
+	}
+	if best == nil {
+		return map[string]any{"found": false}
+	}
+	return map[string]any{
+		"found":  true,
+		"at":     best.at.Format("2006-01-02 15:04:05"),
+		"user":   best.user,
+		"result": json.RawMessage(best.body),
+	}
+}
+
+func sharedScanPut(name string, reqBody, resp []byte, user string) {
+	if !sharedScanReal(resp) {
+		return // 占位/未真跑的结果(撞单飞锁"进行中"、服务未初始化、竞价数据未出)不进共享
+	}
+	marked := sharedScanMark(name, resp, user)
+	sharedScanMu.Lock()
+	defer sharedScanMu.Unlock()
+	if len(sharedScans) > 64 { // 兜底防膨胀(按日使用,正常远到不了)
+		sharedScans = map[string]sharedScanEntry{}
+	}
+	sharedScans[sharedScanKey(name, reqBody)] = sharedScanEntry{body: marked, at: time.Now(), user: user}
+}
+
+// sharedScanReal 判定响应是不是一次真实完成的扫描:
+// 对象类结果(波段/低吸系/尾盘追涨)看 universeCount>0 或 asOf 非空——撞单飞锁的"进行中"占位、
+// "服务未初始化"错误占位这两个字段都是零值;数组类结果(竞价公式)非空才算(空=当日竞价数据未出)。
+func sharedScanReal(resp []byte) bool {
+	t := strings.TrimSpace(string(resp))
+	if strings.HasPrefix(t, "[") {
+		return t != "[]" && t != "[ ]"
+	}
+	var m map[string]any
+	if err := json.Unmarshal(resp, &m); err != nil || m == nil {
+		return false
+	}
+	if v, ok := m["universeCount"].(float64); ok && v > 0 {
+		return true
+	}
+	if s, ok := m["asOf"].(string); ok && s != "" {
+		return true
+	}
+	return false
+}
+
+// sharedScanMark 给共享副本注入来源标记(message/dataSource 追加,界面免改直接可见);
+// 数组类响应(竞价公式)原样共享不打标。真扫描发起者本人看到的是未打标的原始响应。
+func sharedScanMark(name string, resp []byte, user string) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(resp, &m); err != nil || m == nil {
+		return resp
+	}
+	note := fmt.Sprintf("♻️已同步「%s」%s的扫描结果", user, time.Now().Format("15:04"))
+	m["sharedFrom"] = note
+	// 波段窗口显示 message,低吸系/尾盘追涨窗口显示 warning;asOf 被复盘当日期用,不能动
+	for _, f := range []string{"message", "dataSource", "warning"} {
+		if s, ok := m[f].(string); ok && s != "" {
+			m[f] = s + " · " + note
+		} else {
+			m[f] = note
+		}
+	}
+	if b, err := json.Marshal(m); err == nil {
+		return b
+	}
+	return resp
+}
+
+func sharedScanUser(role, guestUser string) string {
+	if role == "guest" && guestUser != "" {
+		return guestUser
+	}
+	return "主人"
+}
+
+func heavyMarkRunning(key string, delta int) {
+	heavyMu.Lock()
+	defer heavyMu.Unlock()
+	heavyRunning[key] += delta
+	if heavyRunning[key] <= 0 {
+		delete(heavyRunning, key)
+	}
+}
+
+func heavyStore(key string, data []byte) {
+	heavyMu.Lock()
+	defer heavyMu.Unlock()
+	if len(heavyResults) > 60 { // 限容:清掉超过1小时的旧结果,防内存涨
+		cutoff := time.Now().Add(-time.Hour)
+		for k, v := range heavyResults {
+			if v.at.Before(cutoff) {
+				delete(heavyResults, k)
+			}
+		}
+	}
+	heavyResults[key] = heavyEntry{data: data, at: time.Now()}
+}
+
+func heavyStatus(user, method, hash string) map[string]any {
+	key := user + "|" + method + "|" + hash
+	heavyMu.Lock()
+	defer heavyMu.Unlock()
+	out := map[string]any{"running": heavyRunning[key] > 0, "ageSec": -1}
+	if e, ok := heavyResults[key]; ok {
+		out["ageSec"] = int(time.Since(e.at).Seconds())
+		out["result"] = json.RawMessage(e.data)
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -912,6 +1206,97 @@ document.getElementById('fUser').onchange = reload;
 document.getElementById('fMethod').onkeydown = e=>{ if(e.key==='Enter') reload(); };
 loadUsers(); reload();
 setInterval(()=>{ if(offset<=LIMIT){ loadUsers(); reload(); } }, 30000);
+</script>
+</body>
+</html>`
+
+// tipPageHTML 荐股跟单录入页(手机优先)。刻意做得极简:9:30 开盘那几十秒里,
+// 用户只想干一件事——把短信里的代码粘进来、按一下。所以只有一个大输入框和一个大按钮。
+//
+// 记账纪律写在页面上而不是只写在代码里:用户每次用都会看见"按提交时刻实时价记账",
+// 免得日后看数据时以为是开盘价,把口径记岔。
+const tipPageHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>荐股跟单录入</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:#060d1a;color:#e2e8f0;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:16px;}
+  .wrap{max-width:560px;margin:0 auto;padding:18px 16px 48px;}
+  h1{font-size:19px;margin:0 0 2px;}
+  .sub{color:#94a3b8;font-size:12px;line-height:1.6;margin-bottom:14px;}
+  label{display:block;font-size:13px;color:#7dd3fc;margin:14px 0 6px;font-weight:700;}
+  textarea,input{width:100%;padding:12px;border-radius:10px;border:1px solid rgba(148,163,184,.3);background:#0b1524;color:#e2e8f0;font-size:16px;outline:none;font-family:inherit;}
+  textarea{min-height:150px;resize:vertical;line-height:1.7;}
+  .row{display:flex;gap:10px}.row>div{flex:1}
+  button{width:100%;margin-top:18px;padding:16px;border-radius:12px;border:none;background:#0ea5e9;color:#fff;font-size:17px;font-weight:700;cursor:pointer;}
+  button:disabled{background:#334155;color:#94a3b8;}
+  .note{margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.3);color:#fcd34d;font-size:12px;line-height:1.65;}
+  .res{margin-top:18px;}
+  .item{padding:10px 12px;border-radius:9px;margin-bottom:8px;border:1px solid rgba(148,163,184,.2);background:#0b1524;font-size:14px;}
+  .ok{border-color:rgba(34,197,94,.4);} .skip{border-color:rgba(248,113,113,.35);opacity:.85}
+  .item .t{font-weight:700} .item .d{color:#94a3b8;font-size:12px;margin-top:3px;line-height:1.6}
+  .err{padding:12px;border-radius:9px;background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.4);color:#fca5a5;font-size:14px;line-height:1.6;margin-top:14px;}
+</style>
+</head>
+<body><div class="wrap">
+<h1>荐股跟单录入</h1>
+<div class="sub">粘贴短信原文即可，只认里面的 6 位代码，名字/日期/广告词都会被忽略。</div>
+
+<label>荐股原文 / 代码</label>
+<textarea id="raw" placeholder="例如：&#10;通富微电 002156&#10;金牛化工 600722&#10;浪潮信息 000977"></textarea>
+
+<div class="row">
+  <div><label>每只金额(元)</label><input id="amt" type="number" inputmode="numeric" value="30000"></div>
+  <div><label>备注(哪家推的)</label><input id="note" value="天鼎早盘"></div>
+</div>
+
+<button id="go">按当前实时价建仓</button>
+
+<div class="note">
+  <b>记账口径</b>：成交价 = <b>你按下按钮这一刻的实时价</b>，不是当日开盘价。<br>
+  按开盘价记会白捡开盘到现在的涨跌，那是自欺。结果里会同时显示当日开盘价供你对照。<br>
+  本来源<b>风控引擎一律不接管</b>，卖出全靠你自己操作——这样才测得出你「冲高就卖」的真实水平。
+</div>
+
+<div class="res" id="res"></div>
+</div>
+<script>
+const tk = new URLSearchParams(location.search).get('token') || '';
+const $ = id => document.getElementById(id);
+$('go').onclick = async () => {
+  const raw = $('raw').value.trim();
+  if (!raw) { alert('先粘贴荐股内容'); return; }
+  const btn = $('go'); btn.disabled = true; btn.textContent = '建仓中…';
+  $('res').innerHTML = '';
+  try {
+    const r = await fetch('/rpc/AddTipPicks', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-JCP-Token':tk},
+      body: JSON.stringify([raw, Number($('amt').value) || 30000, $('note').value])
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) { $('res').innerHTML = '<div class="err">'+ (d.error || ('HTTP '+r.status)) +'</div>'; return; }
+    let h = '<div class="sub">'+ d.at +' · 记入 <b>'+ d.added +'</b> 只，跳过 '+ d.skipped +' 只</div>';
+    for (const x of (d.rows||[])) {
+      if (x.skipped) {
+        h += '<div class="item skip"><div class="t">'+ (x.name||x.symbol) +' <span style="color:#94a3b8">'+ x.symbol +'</span></div><div class="d">✗ '+ x.skipped +'</div></div>';
+      } else {
+        const gap = x.dayOpen > 0 ? ((x.price/x.dayOpen-1)*100).toFixed(2) : null;
+        h += '<div class="item ok"><div class="t">'+ x.name +' <span style="color:#94a3b8">'+ x.symbol +'</span></div>'
+           + '<div class="d">成交 '+ x.price.toFixed(2) +' × '+ x.shares +'股 = '+ Math.round(x.amount).toLocaleString() +' 元'
+           + (gap !== null ? '<br>当日开盘 '+ x.dayOpen.toFixed(2) +'（比开盘价 '+ (gap>=0?'+':'') + gap +'%）' : '')
+           + '</div></div>';
+      }
+    }
+    $('res').innerHTML = h;
+    $('raw').value = '';
+  } catch (e) {
+    $('res').innerHTML = '<div class="err">请求失败：'+ e +'</div>';
+  } finally { btn.disabled = false; btn.textContent = '按当前实时价建仓'; }
+};
 </script>
 </body>
 </html>`

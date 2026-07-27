@@ -1,4 +1,5 @@
 import { isWailsGoReady } from '../utils/wailsEnv';
+import { exitReasonLabel } from '../utils/exitReason';
 
 export interface AccountHolding {
   symbol: string;
@@ -73,11 +74,6 @@ export const runPaperStrategyAccount = async (source: string): Promise<StrategyA
   try { return await b().RunPaperStrategyAccount!(source); } catch { return null; }
 };
 
-export const EXIT_REASON_CN = (r?: string): string => {
-  if (!r) return '';
-  const half = r.startsWith('half_');
-  const key = half ? r.slice(5) : r;
-  const m: Record<string, string> = { stop_loss: '止损-5%', ma10: '破10线', turnover: '换手>12%', time_stop: '5日<3%', take_profit: '止盈+15%', window_end: '到期', manual: '手动平仓' };
-  const base = m[key] || key;
-  return half ? `减半·${base}` : base;
-};
+// 策略账户成交记录的离场原因。这里空 = 无(手动平仓在库里是字面量 "manual",见 app.go 的
+// chooseFirstNonEmpty(p.ExitReason, "manual")),所以不套模拟持仓那套"空=手动"的默认值。
+export const EXIT_REASON_CN = (r?: string): string => (r ? exitReasonLabel(r) : '');

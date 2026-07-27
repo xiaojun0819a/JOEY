@@ -3,7 +3,7 @@ import { Wallet, X, Loader2, RefreshCw } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 import { runStrategyAccount, runPaperStrategyAccount, EXIT_REASON_CN, type StrategyAccountResult } from '../services/accountService';
 import { getPaperStats } from '../services/paperService';
-import { STRATEGY_SOURCE_LABELS } from '../utils/strategySource';
+import { STRATEGY_SOURCE_LABELS, STRATEGY_SOURCE_FILTERS, sourceMatchesStrategyKey } from '../utils/strategySource';
 
 interface Props { isOpen: boolean; onClose: () => void; }
 
@@ -67,6 +67,9 @@ export const StrategyAccountDialog: React.FC<Props> = ({ isOpen, onClose }) => {
       if (!alive) return;
       const list = (stats?.bySource || [])
         .filter(s => s.total > 0)
+        // 只留策展列表(STRATEGY_SOURCE_FILTERS)认可的来源,与模拟持仓窗口的筛选标签口径一致——
+        // 已停用策略(如草元系)的历史残留笔数不再在这里冒出来
+        .filter(s => STRATEGY_SOURCE_FILTERS.some(f => f.key !== 'all' && sourceMatchesStrategyKey(s.source, f.key)))
         .map(s => ({ key: s.source, label: STRATEGY_SOURCE_LABELS[s.source] || s.source }));
       setPaperStrats(list);
       if (list.length === 0) {

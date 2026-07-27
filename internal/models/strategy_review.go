@@ -98,4 +98,5 @@ type StrategyReviewResult struct {
 	Optimization    []string             `json:"optimization"`
 	Warning         string               `json:"warning,omitempty"`
 	DataSourceNotes []string             `json:"dataSourceNotes,omitempty"`
+	ReviewPending   bool                 `json:"reviewPending,omitempty"` // 复盘日尚无行情(未开盘/未收盘):收益类数字无意义,前端显示待复盘
 }

@@ -12,6 +12,29 @@ import (
 	"github.com/run-bigpig/jcp/internal/models"
 )
 
+// StrategyReplayFunc 策略历史重算函数:给定信号日与topN,按与线上扫描同口径的规则从本地历史库重算入选名单。
+// 返回 (picks, note):note 非空表示重算已执行(即使 picks 为空——空=真·当日未符合);两者都空=该策略不支持重算。
+type StrategyReplayFunc func(signalDate string, topN int) ([]models.StrategyPickSnapshot, string)
+
+// SetStrategyReplay 注册某策略的历史重算器(app 层在启动时注入,复盘缺留痕时自动调用)。
+func (s *HistoryService) SetStrategyReplay(strategyID string, fn StrategyReplayFunc) {
+	if s == nil || fn == nil || strategyID == "" {
+		return
+	}
+	if s.strategyReplays == nil {
+		s.strategyReplays = map[string]StrategyReplayFunc{}
+	}
+	s.strategyReplays[strategyID] = fn
+}
+
+// markPicksReplayed 把某策略某日的留痕标记为重算补写(排除出留痕系统上线日判定)。
+func (s *HistoryService) markPicksReplayed(strategyID string, signalDate string) {
+	if s == nil || s.db == nil {
+		return
+	}
+	_, _ = s.db.Exec(`UPDATE strategy_scan_picks SET replayed=1 WHERE strategy_id=? AND signal_date=?`, strategyID, signalDate)
+}
+
 func (s *HistoryService) SaveStrategyPicks(strategyID string, strategyName string, signalDate string, scannedAt string, picks []models.StrategyPickSnapshot) error {
 	if s == nil || s.db == nil || strings.TrimSpace(strategyID) == "" || len(picks) == 0 {
 		return nil
@@ -25,6 +48,16 @@ func (s *HistoryService) SaveStrategyPicks(strategyID string, strategyName strin
 		return err
 	}
 	defer tx.Rollback()
+	// 该日名单若曾是"重算补写"(replayed=1),重写后必须保留标记——复盘的字段补齐步骤会整日重写,
+	// 标记一旦丢失,"留痕最早日"被重算数据拉前,其他策略的老日期又被误报"当日未符合"(2026-07-22 实测踩坑)。
+	wasReplayed := 0
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(replayed),0) FROM strategy_scan_picks WHERE strategy_id=? AND signal_date=?`, strategyID, signalDate).Scan(&wasReplayed)
+	// 留痕语义=「当日最后一次扫描的名单」:先清掉当天旧集合再写。
+	// 否则同日多次扫描会并集累积(掉榜的旧票不删),复盘"入选N"虚高、胜率样本被盘中噪声污染
+	// (实测:某日多次扫描各出10只,留痕并成22只)。
+	if _, err := tx.Exec(`DELETE FROM strategy_scan_picks WHERE strategy_id=? AND signal_date=?`, strategyID, signalDate); err != nil {
+		return err
+	}
 	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO strategy_scan_picks
 		(strategy_id, strategy_name, signal_date, scanned_at, stock_code, stock_name, rank, price, change_pct, score, industry, amount, turnover, main_net, main_pct, main_source, triggers_json, reasons_json, risks_json, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -71,6 +104,69 @@ func (s *HistoryService) SaveStrategyPicks(strategyID string, strategyName strin
 			now,
 		); err != nil {
 			return err
+		}
+	}
+	if wasReplayed == 1 {
+		if _, err := tx.Exec(`UPDATE strategy_scan_picks SET replayed=1 WHERE strategy_id=? AND signal_date=?`, strategyID, signalDate); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// UpdateStrategyPicksInPlace 逐行更新已有留痕的补齐字段(评分/名称/行业/价量/资金),行不存在则 INSERT OR IGNORE 补插;
+// 全程不动同日其他行——专供复盘补齐回写(它拿到的常是"模拟仓当天新增"过滤后的子集,整日重写=毁真实留痕)。
+func (s *HistoryService) UpdateStrategyPicksInPlace(strategyID, strategyName, signalDate string, picks []models.StrategyPickSnapshot) error {
+	if s == nil || s.db == nil || strings.TrimSpace(strategyID) == "" || len(picks) == 0 {
+		return nil
+	}
+	signalDate = normalizeReviewDate(signalDate, time.Now().Format("2006-01-02"))
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	upd, err := tx.Prepare(`UPDATE strategy_scan_picks SET
+		strategy_name=COALESCE(NULLIF(?,''),strategy_name), stock_name=COALESCE(NULLIF(?,''),stock_name),
+		price=?, change_pct=?, score=?, industry=COALESCE(NULLIF(?,''),industry),
+		amount=?, turnover=?, main_net=?, main_pct=?, main_source=COALESCE(NULLIF(?,''),main_source),
+		triggers_json=?, reasons_json=?, risks_json=?
+		WHERE strategy_id=? AND signal_date=? AND stock_code=?`)
+	if err != nil {
+		return err
+	}
+	defer upd.Close()
+	now := time.Now().Format("2006-01-02 15:04:05")
+	for idx, pick := range picks {
+		code := normalizeReviewSymbol(pick.Symbol)
+		if code == "" {
+			continue
+		}
+		res, err := upd.Exec(
+			chooseText(strategyName, pick.StrategyName), pick.Name,
+			safeReviewFloat(pick.Price), safeReviewFloat(pick.ChangePercent), safeReviewFloat(pick.Score), pick.Industry,
+			safeReviewFloat(pick.Amount), safeReviewFloat(pick.TurnoverRate), safeReviewFloat(pick.MainNetInflow), safeReviewFloat(pick.MainNetInflowPct), pick.MainFlowSource,
+			marshalStringSlice(pick.Triggers), marshalStringSlice(pick.Reasons), marshalStringSlice(pick.RiskFlags),
+			strategyID, signalDate, code,
+		)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 { // 行不存在(纯模拟仓倒灌票)→补插,不影响他行
+			rank := pick.Rank
+			if rank <= 0 {
+				rank = idx + 1
+			}
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO strategy_scan_picks
+				(strategy_id, strategy_name, signal_date, scanned_at, stock_code, stock_name, rank, price, change_pct, score, industry, amount, turnover, main_net, main_pct, main_source, triggers_json, reasons_json, risks_json, created_at)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				strategyID, chooseText(strategyName, pick.StrategyName), signalDate, signalDate, code, pick.Name, rank,
+				safeReviewFloat(pick.Price), safeReviewFloat(pick.ChangePercent), safeReviewFloat(pick.Score), pick.Industry,
+				safeReviewFloat(pick.Amount), safeReviewFloat(pick.TurnoverRate), safeReviewFloat(pick.MainNetInflow), safeReviewFloat(pick.MainNetInflowPct), pick.MainFlowSource,
+				marshalStringSlice(pick.Triggers), marshalStringSlice(pick.Reasons), marshalStringSlice(pick.RiskFlags), now,
+			); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -182,10 +278,73 @@ func (s *HistoryService) BuildStrategyNextDayReview(req models.StrategyReviewReq
 	result.SignalDate = signalDate
 	result.ReviewDate = reviewDate
 
+	// 复盘日必须是交易日:前端默认"选股日+1自然日"会落在周末/节假日(如周五选股→周六复盘),
+	// 该日无行情,收益全空。非交易日一律纠为选股日的次一交易日,并在警示中注明。
+	if reviewDate != "" {
+		var cnt int
+		_ = s.db.QueryRow(`SELECT COUNT(1) FROM (SELECT 1 FROM stock_daily WHERE trade_date=? LIMIT 1)`, reviewDate).Scan(&cnt)
+		today := time.Now().Format("2006-01-02")
+		if cnt == 0 && reviewDate < today { // 今天/未来日无行情属正常(尚未收盘),只纠历史上的非交易日
+			if nd := s.nextTradeDateAfter(signalDate); nd != "" && nd != reviewDate {
+				result.Warning = combineReviewWarnings(result.Warning,
+					fmt.Sprintf("复盘日 %s 不是交易日(周末/节假日),已自动调整为选股日的次一交易日 %s", reviewDate, nd))
+				reviewDate = nd
+				result.ReviewDate = nd
+			}
+		}
+	}
+
 	picks, err := s.loadStrategyPicks(strategyID, signalDate)
 	if err != nil {
 		result.Warning = "读取策略扫描留痕失败：" + err.Error()
 		return result
+	}
+	replayAttempted := false
+	// 留痕若全是"模拟仓倒灌"(app层在服务前按当日模拟仓补的占位),说明当日真实扫描名单缺失——
+	// 支持重算的策略先把全量真实信号算出来存档(学习库/全量复盘要用),倒灌票不在名单内的追加保留。
+	// 否则倒灌抢占后重算永不触发,当日只剩你手动入手那几只(2026-07-24 超跌起爆11 4/17 实测)。
+	if len(picks) > 0 {
+		isPaperBackfill := func(p models.StrategyPickSnapshot) bool {
+			for _, t := range p.Triggers {
+				if t == "模拟持仓留痕" {
+					return true
+				}
+			}
+			return p.MainFlowSource == "paper-position" // 兜底:补齐回写可能已把 main_source 覆写成行情源
+		}
+		allPaper := true
+		for _, p := range picks {
+			if !isPaperBackfill(p) {
+				allPaper = false
+				break
+			}
+		}
+		if allPaper {
+			if fn := s.strategyReplays[strategyID]; fn != nil {
+				full, note := fn(signalDate, 30)
+				if len(full) > 0 {
+					if s.SaveStrategyPicks(strategyID, result.StrategyName, signalDate, now, full) == nil {
+						s.markPicksReplayed(strategyID, signalDate)
+					}
+					inFull := map[string]bool{}
+					for _, f := range full {
+						inFull[strings.ToLower(f.Symbol)] = true
+					}
+					merged := full
+					for _, p := range picks {
+						if !inFull[strings.ToLower(p.Symbol)] {
+							merged = append(merged, p)
+						}
+					}
+					picks = merged
+					result.DataSourceNotes = append(result.DataSourceNotes, fmt.Sprintf("当日仅有模拟仓倒灌留痕,已用历史重算恢复全量信号 %d 只(倒灌票不在名单内的已并入)", len(full)))
+				}
+				if note != "" {
+					result.DataSourceNotes = append(result.DataSourceNotes, note)
+				}
+				replayAttempted = true
+			}
+		}
 	}
 	if len(picks) == 0 {
 		rebuilt, note := s.rebuildStrategyPicksForReview(strategyID, result.StrategyName, signalDate)
@@ -194,18 +353,41 @@ func (s *HistoryService) BuildStrategyNextDayReview(req models.StrategyReviewReq
 		}
 		if len(rebuilt) > 0 {
 			picks = rebuilt
-			_ = s.SaveStrategyPicks(strategyID, result.StrategyName, signalDate, now, rebuilt)
-		}
-	}
-	if len(picks) == 0 && requestedSignalDate != "" {
-		fallbackDate := s.latestSignalDateBefore(strategyID, reviewDate)
-		if fallbackDate != "" && fallbackDate != signalDate {
-			fallbackPicks, fallbackErr := s.loadStrategyPicks(strategyID, fallbackDate)
-			if fallbackErr == nil && len(fallbackPicks) > 0 {
-				result.SignalDate = fallbackDate
-				result.Warning = combineReviewWarnings(result.Warning, fmt.Sprintf("%s 没有找到 %s 的入选记录，已切换到最近一次留痕 %s", result.StrategyName, signalDate, fallbackDate))
-				picks = fallbackPicks
+			if s.SaveStrategyPicks(strategyID, result.StrategyName, signalDate, now, rebuilt) == nil {
+				s.markPicksReplayed(strategyID, signalDate) // 重算补写≠实盘留痕,排除出上线日判定
 			}
+		}
+		replayAttempted = note != "" || len(rebuilt) > 0
+	}
+	// 用户明确选了日期却无留痕:**不再自动跳到别的日子**(用户连续两次被"选7-1跳6-25"硌到)。
+	// 严进策略空仓很常见,空仓也是信息——如实报空仓,并列出前后最近有票的日期供改选。
+	if len(picks) == 0 && requestedSignalDate != "" {
+		// 留痕上线(2026-06-08)之前的日期根本没有扫描记录——那是"无从判定",不是"未符合"。
+		// 说成"未符合"会误导用户以为策略扫过没中(2026-07-21 三倍量5 五月实例)。仅波段能用历史库重算(上面已试过)。
+		if trailStart := s.earliestTrailDate(); !replayAttempted && trailStart != "" && signalDate < trailStart {
+			msg := fmt.Sprintf("%s:选股留痕系统 %s 起才有记录,%s 早于此——当日无扫描记录,无法判定是否符合(不是「未符合」)", result.StrategyName, trailStart, signalDate)
+			if first := s.firstSignalDateOf(strategyID); first != "" {
+				msg += fmt.Sprintf(";该策略最早可复盘日期: %s", first)
+			}
+			result.Warning = combineReviewWarnings(result.Warning, msg)
+			return result
+		}
+		prev := s.latestSignalDateBefore(strategyID, signalDate)
+		next := s.nextSignalDateAfter(strategyID, signalDate)
+		msg := fmt.Sprintf("%s %s 当日未符合(无股票入选)", result.StrategyName, signalDate)
+		if prev != "" && prev < signalDate {
+			msg += fmt.Sprintf("；上一次入选: %s", prev)
+		}
+		if next != "" {
+			msg += fmt.Sprintf("；下一次入选: %s", next)
+		}
+		result.Warning = combineReviewWarnings(result.Warning, msg)
+		return result
+	}
+	// 波段策略:旧留痕不带「重点布局」标时,按"截至选股日"的数据补算(30/60分靠行情源近40个交易日窗口,更早的补不了)
+	if strategyID == "wave-v1" && len(picks) > 0 {
+		if added := s.BackfillKeyLayoutMarks(result.SignalDate, picks); added > 0 {
+			result.DataSourceNotes = append(result.DataSourceNotes, fmt.Sprintf("重点布局为按选股日历史数据补算(%d只):日K本地截断+30/60分行情源截断,与实时扫描同一套判定", added))
 		}
 	}
 	if len(picks) == 0 {
@@ -235,11 +417,31 @@ func (s *HistoryService) BuildStrategyNextDayReview(req models.StrategyReviewReq
 		result.StrategyName = picks[0].StrategyName
 	}
 
-	snapshotMap, snapshotWarn := s.loadReviewSnapshotMap()
+	snapshotMap, snapshotWarn := s.loadReviewSnapshotMap(reviewDate)
 	if snapshotWarn != "" {
 		result.DataSourceNotes = append(result.DataSourceNotes, snapshotWarn)
 	}
 	result.Market = s.buildReviewMarket(reviewDate, snapshotMap)
+
+	// 复盘日行情可用性检查:复盘日还没开盘/收盘时(如凌晨看当天),各票会回落用最近数据,
+	// 收益退化成假 0%——必须明确警示,否则看起来像"胜率0%"的假统计。
+	// 判定:本地历史无该日行 且 实时快照也不是该日的 → 该日尚无行情。
+	var reviewDayRows int
+	_ = s.db.QueryRow(`SELECT COUNT(1) FROM (SELECT 1 FROM stock_daily WHERE trade_date=? LIMIT 200)`, reviewDate).Scan(&reviewDayRows)
+	if reviewDayRows < 100 {
+		snapIsReviewDay := false
+		for _, row := range snapshotMap {
+			if len(row.UpdateTime) >= 10 && row.UpdateTime[:10] == reviewDate {
+				snapIsReviewDay = true
+			}
+			break
+		}
+		if !snapIsReviewDay {
+			result.Warning = combineReviewWarnings(result.Warning,
+				fmt.Sprintf("⚠️复盘日 %s 尚无行情(未开盘或未收盘),下方收益/胜率暂无意义,请该日收盘后再看", reviewDate))
+			result.ReviewPending = true
+		}
+	}
 
 	totalClose := 0.0
 	totalHigh := 0.0
@@ -373,7 +575,9 @@ func (s *HistoryService) enrichStrategyPicksForReview(strategyID string, strateg
 		notes = append(notes, fmt.Sprintf("%d只模拟仓倒灌记录缺少原始扫描分，且当前本地历史无法按该策略还原；已保留为评分暂缺，不伪造分数", scoreMissing))
 	}
 	if changed {
-		if err := s.SaveStrategyPicks(strategyID, strategyName, signalDate, signalDate, picks); err != nil {
+		// ⚠️必须逐行 UPDATE,绝不能整日 DELETE+重写:复盘常在"模拟仓当天新增"规则下只拿到子集,
+		// 整日重写会把真实扫描留痕吃掉(2026-07-24 实测:14:47 的17只被4只子集覆盖,学习库同毁)。
+		if err := s.UpdateStrategyPicksInPlace(strategyID, strategyName, signalDate, picks); err != nil {
 			notes = append(notes, "复盘留痕补齐后回写失败："+err.Error())
 		}
 	}
@@ -684,8 +888,25 @@ func (s *HistoryService) rebuildStrategyPicksForReview(strategyID string, strate
 		}
 		return picks, fmt.Sprintf("%s 没有找到 %s 的原始扫描留痕，已用本地历史库按该日补算 %d 只", chooseText(strategyName, "波段策略 1.0"), signalDate, len(picks))
 	default:
+		if fn := s.strategyReplays[strategyID]; fn != nil {
+			return fn(signalDate, 10)
+		}
 		return nil, ""
 	}
+}
+
+// earliestTrailDate 全部策略里最早的一条留痕日期=留痕系统实际上线日(之前的日期天然无记录)。
+func (s *HistoryService) earliestTrailDate() string {
+	var date string
+	_ = s.db.QueryRow(`SELECT MIN(signal_date) FROM strategy_scan_picks WHERE COALESCE(replayed,0)=0`).Scan(&date)
+	return date
+}
+
+// firstSignalDateOf 某策略最早一条留痕日期(无则空串)。
+func (s *HistoryService) firstSignalDateOf(strategyID string) string {
+	var date string
+	_ = s.db.QueryRow(`SELECT MIN(signal_date) FROM strategy_scan_picks WHERE strategy_id=?`, strategyID).Scan(&date)
+	return date
 }
 
 func (s *HistoryService) latestSignalDateBefore(strategyID string, reviewDate string) string {
@@ -694,6 +915,13 @@ func (s *HistoryService) latestSignalDateBefore(strategyID string, reviewDate st
 	if date == "" {
 		_ = s.db.QueryRow(`SELECT MAX(signal_date) FROM strategy_scan_picks WHERE strategy_id=?`, strategyID).Scan(&date)
 	}
+	return date
+}
+
+// nextSignalDateAfter 该策略在指定日之后最近一次留痕日期(无则空串)。
+func (s *HistoryService) nextSignalDateAfter(strategyID string, signalDate string) string {
+	var date string
+	_ = s.db.QueryRow(`SELECT MIN(signal_date) FROM strategy_scan_picks WHERE strategy_id=? AND signal_date > ?`, strategyID, signalDate).Scan(&date)
 	return date
 }
 
@@ -724,8 +952,27 @@ func (s *HistoryService) loadStrategyPicks(strategyID string, signalDate string)
 	return out, rows.Err()
 }
 
-func (s *HistoryService) loadReviewSnapshotMap() (map[string]ScanSnapshotRow, string) {
+// loadReviewSnapshotMap 取"复盘日当天"的行情快照。
+// ⚠️实时快照永远是**今天**的数据:复盘历史日时绝不能用它,否则换手/成交额/主力资金/涨跌停家数
+// 全是今天的,而收盘价却是复盘日的 —— 同一张卡混两个日期,"换手偏高、资金流出"这种结论
+// 就建立在错误日期的数据上。历史日一律返回空,让调用方走日线库(fillReviewItemFromDaily)。
+// nextTradeDateAfter 返回 date 之后的第一个交易日(以本地日线库有行情的日期为准;无则空串)。
+func (s *HistoryService) nextTradeDateAfter(date string) string {
+	if s == nil || s.db == nil || date == "" {
+		return ""
+	}
+	var nd sql.NullString
+	if err := s.db.QueryRow(`SELECT MIN(trade_date) FROM stock_daily WHERE trade_date > ?`, date).Scan(&nd); err != nil || !nd.Valid {
+		return ""
+	}
+	return nd.String
+}
+
+func (s *HistoryService) loadReviewSnapshotMap(reviewDate string) (map[string]ScanSnapshotRow, string) {
 	out := map[string]ScanSnapshotRow{}
+	if reviewDate != "" && reviewDate != time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02") {
+		return out, "" // 复盘历史日:全部字段取当日日线库,不碰实时快照
+	}
 	if s == nil || s.marketService == nil {
 		return out, "行情服务不可用，资金字段仅能依赖本地历史采集"
 	}
@@ -741,6 +988,11 @@ func (s *HistoryService) loadReviewSnapshotMap() (map[string]ScanSnapshotRow, st
 
 func (s *HistoryService) buildReviewMarket(reviewDate string, snapshots map[string]ScanSnapshotRow) models.StrategyReviewMarket {
 	market := models.StrategyReviewMarket{ReviewDate: reviewDate}
+	// 复盘历史日:实时指数/实时快照都是"今天"的,用它们等于拿今天的大盘去评价那天的选股。
+	if len(snapshots) == 0 && reviewDate != "" {
+		s.fillReviewMarketFromDaily(&market, reviewDate)
+		return market
+	}
 	if s != nil && s.marketService != nil {
 		if indices, err := s.marketService.GetMarketIndices(); err == nil {
 			for _, idx := range indices {
@@ -772,6 +1024,38 @@ func (s *HistoryService) buildReviewMarket(reviewDate string, snapshots map[stri
 		market.Summary = "大盘快照不足，无法完整评估市场环境"
 	}
 	return market
+}
+
+// fillReviewMarketFromDaily 用当日日线库还原复盘日的大盘环境(涨跌停家数/两市成交额/上证涨跌)。
+func (s *HistoryService) fillReviewMarketFromDaily(market *models.StrategyReviewMarket, reviewDate string) {
+	if s == nil || s.db == nil || market == nil {
+		return
+	}
+	var total, up, down sql.NullFloat64
+	err := s.db.QueryRow(`SELECT SUM(amount),
+		SUM(CASE WHEN pct_change>=9.8 THEN 1 ELSE 0 END),
+		SUM(CASE WHEN pct_change<=-9.8 THEN 1 ELSE 0 END)
+		FROM stock_daily WHERE trade_date=?`, reviewDate).Scan(&total, &up, &down)
+	if err == nil {
+		market.TotalAmount = total.Float64
+		market.LimitUpCount = int(up.Float64)
+		market.LimitDownCount = int(down.Float64)
+	}
+	// 上证指数:复盘历史日拿不到 —— 本地 stock_daily/archive 都只存个股不含指数,
+	// 而 GetKLineData("sh000001") 的返回是坏的(实测日期跑到 429082 年、收盘出现负数)。
+	// 实时指数又只代表今天。所以这里**留空**(前端显示 --),不编一个 0% 冒充当日大盘。
+	// 好在闸门与结论都不依赖上证:下面的涨跌停家数/两市成交额由当日 stock_daily 聚合而来,
+	// 与波段扫描判大盘用的是同一套口径(见 loadMarketStates)。
+	switch {
+	case market.LimitDownCount >= 50:
+		market.Summary = fmt.Sprintf("复盘日大盘偏弱，跌停约%d家；策略信号需要降仓位验证", market.LimitDownCount)
+	case market.LimitUpCount >= 60 && market.ShChangePercent >= 0:
+		market.Summary = fmt.Sprintf("复盘日情绪偏强，涨停约%d家；适合观察强势延续", market.LimitUpCount)
+	case market.TotalAmount > 0:
+		market.Summary = fmt.Sprintf("复盘日成交额约%.0f亿，涨停%d家/跌停%d家", market.TotalAmount/1e8, market.LimitUpCount, market.LimitDownCount)
+	default:
+		market.Summary = "复盘日大盘数据不足(该日行情尚未采集)"
+	}
 }
 
 func (s *HistoryService) buildReviewItem(pick models.StrategyPickSnapshot, reviewDate string, snapshots map[string]ScanSnapshotRow, news []models.StrategyReviewNews) models.StrategyReviewItem {
@@ -838,7 +1122,21 @@ func (s *HistoryService) buildReviewItem(pick models.StrategyPickSnapshot, revie
 }
 
 func (s *HistoryService) loadReviewKLines(symbol string, reviewDate string) []models.KLineData {
-	if s == nil || s.marketService == nil {
+	if s == nil {
+		return nil
+	}
+	// 历史复盘日:必须用本地日K截取到 reviewDate。实时45根窗口从今天往回数,复盘日早于窗口时
+	// 匹配不到任何bar,曾静默回落用"今天的bar"冒充复盘日行情——收益变成"至今收益"却标成"次日收益"
+	// (2026-07-22 锦富技术 -45.13% 幻影实例)。本地也没有的票宁可空着,绝不拿今天的数据顶。
+	today := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+	if reviewDate != "" && reviewDate < today {
+		ks, err := s.LoadKLineDataUntil(symbol, reviewDate, 45)
+		if err != nil || len(ks) == 0 {
+			return nil
+		}
+		return ks // LoadKLineDataUntil 已按日期升序且全部 ≤ reviewDate
+	}
+	if s.marketService == nil {
 		return nil
 	}
 	klines, err := s.marketService.GetKLineData(symbol, "1d", 45)

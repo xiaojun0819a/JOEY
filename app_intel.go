@@ -10,7 +10,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -113,6 +116,10 @@ func (a *App) AddIntelNote(text string, codes []string, source string) (*IntelNo
 	if err != nil {
 		return nil, err
 	}
+	// 链接抓取:文本里的 URL 自动抓标题+正文摘要拼进笔记(晨报才有内容可引;抓不到则原样保留网址)
+	text = enrichIntelLinks(text)
+	// 自动关联:从正文里识别股票代码(sh600519/600519)和股票名称,合并进手填的 codes
+	codes = mergeIntelCodes(codes, detectIntelCodes(text))
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	codeStr := codesToStr(codes)
 	res, err := db.Exec("INSERT INTO intel_note(ts, text, source, codes) VALUES(?,?,?,?)", ts, text, source, codeStr)
@@ -306,4 +313,130 @@ func oneLine(s string, max int) string {
 		return string(r[:max]) + "…"
 	}
 	return s
+}
+
+// ===== 链接抓取 + 股票自动关联 =====
+
+var intelURLRe = regexp.MustCompile(`https?://[^\s\x{3000}-\x{303F}\x{FF00}-\x{FFEF}"'<>()]+`)
+var intelCodeRe = regexp.MustCompile(`(?i)\b(?:(sh|sz|bj)\s*)?([0-9]{6})\b`)
+
+// enrichIntelLinks 抓取文本里的链接(最多2条),把「标题+正文摘要」追加进笔记。抓取失败原样保留。
+func enrichIntelLinks(text string) string {
+	urls := intelURLRe.FindAllString(text, 2)
+	if len(urls) == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.WriteString(text)
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, u := range urls {
+		title, body := fetchIntelPage(client, u)
+		if title == "" && body == "" {
+			b.WriteString("\n\n【链接未能抓取,仅存原地址】" + u)
+			continue
+		}
+		b.WriteString("\n\n【链接抓取】" + title + "\n")
+		if body != "" {
+			b.WriteString(body)
+		}
+		b.WriteString("\n(来源: " + u + ")")
+	}
+	return b.String()
+}
+
+// fetchIntelPage 抓一页,粗提 <title> 和可见正文前约800字。只处理 text/html。
+func fetchIntelPage(client *http.Client, url string) (title, body string) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return "", ""
+	}
+	html := string(raw)
+	if m := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`).FindStringSubmatch(html); len(m) > 1 {
+		title = strings.TrimSpace(m[1])
+	}
+	// 去 script/style 再剥标签,压空白
+	html = regexp.MustCompile(`(?is)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)>`).ReplaceAllString(html, " ")
+	html = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(html, " ")
+	html = strings.NewReplacer("&nbsp;", " ", "&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", `"`, "&#39;", "'").Replace(html)
+	fields := strings.Fields(html)
+	text := strings.Join(fields, " ")
+	rs := []rune(text)
+	if len(rs) > 800 {
+		rs = rs[:800]
+		text = string(rs) + "…"
+	} else {
+		text = string(rs)
+	}
+	return title, strings.TrimSpace(text)
+}
+
+// detectIntelCodes 从正文识别关联股票:带/不带前缀的6位代码 + 全市场股票名称精确包含。
+func detectIntelCodes(text string) []string {
+	found := make([]string, 0, 8)
+	seen := map[string]bool{}
+	add := func(sym string) {
+		sym = strings.ToLower(strings.TrimSpace(sym))
+		if sym == "" || seen[sym] || len(found) >= 10 {
+			return
+		}
+		seen[sym] = true
+		found = append(found, sym)
+	}
+	// ① 代码:sh600519 / SZ000725 / 裸六位(按首位归交易所)
+	for _, m := range intelCodeRe.FindAllStringSubmatch(text, 12) {
+		prefix, num := strings.ToLower(m[1]), m[2]
+		if prefix == "" {
+			switch {
+			case strings.HasPrefix(num, "6") || strings.HasPrefix(num, "5") || strings.HasPrefix(num, "9"):
+				prefix = "sh"
+			case strings.HasPrefix(num, "8") || strings.HasPrefix(num, "4"):
+				prefix = "bj"
+			default:
+				prefix = "sz"
+			}
+		}
+		add(prefix + num)
+	}
+	// ② 名称:全市场目录精确包含(名称已去空格;≥3字才匹配,避免两字名误伤日常用语)
+	compact := strings.ReplaceAll(text, " ", "")
+	for _, ns := range services.AllStockNameSymbols() {
+		if len([]rune(ns.Name)) < 3 {
+			continue
+		}
+		if strings.Contains(compact, ns.Name) {
+			add(ns.Symbol)
+			if len(found) >= 10 {
+				break
+			}
+		}
+	}
+	return found
+}
+
+// mergeIntelCodes 手填优先,自动识别的补在后面,去重。
+func mergeIntelCodes(manual, detected []string) []string {
+	out := make([]string, 0, len(manual)+len(detected))
+	seen := map[string]bool{}
+	for _, c := range append(append([]string{}, manual...), detected...) {
+		c = strings.ToLower(strings.TrimSpace(c))
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
 }

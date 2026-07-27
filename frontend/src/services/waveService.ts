@@ -28,6 +28,8 @@ export type WaveCandidate = {
   midBull: boolean;
   shortBull: boolean;
   gz: boolean;
+  keyLayout?: boolean;        // 重点布局:日K+30分+60分三周期共振
+  keyLayoutTF?: string[] | null; // 已确认共振周期
   reasons?: string[] | null;
   risks?: string[] | null;
 };
@@ -48,9 +50,16 @@ export type WaveScanResult = {
   message: string;
 };
 
+export type WaveScanStatus = {
+  running: boolean;
+  ageSec: number; // 最近一次完成距今秒数,-1=从未完成
+  result?: WaveScanResult | null;
+};
+
 type GoBridge = {
   RunWaveScanner?: () => Promise<WaveScanResult>;
   RunWaveScannerWithGate?: (useGate: boolean) => Promise<WaveScanResult>;
+  GetWaveScanStatus?: () => Promise<WaveScanStatus>;
 };
 
 const getGoBridge = (): GoBridge => {
@@ -83,4 +92,12 @@ export const runWaveScannerWithGate = async (useGate: boolean): Promise<WaveScan
     return await bridge.RunWaveScanner();
   }
   throw new Error('当前版本未暴露临时闸门接口，请重启 Wails 开发服务');
+};
+
+// 查询扫描状态(轻量):断线找回用——长扫描请求被隧道掐断后,服务端仍会完成并缓存结果
+export const getWaveScanStatus = async (): Promise<WaveScanStatus | null> => {
+  if (!isWailsGoReady()) return null;
+  const bridge = getGoBridge();
+  if (!bridge.GetWaveScanStatus) return null;
+  try { return await bridge.GetWaveScanStatus(); } catch { return null; }
 };

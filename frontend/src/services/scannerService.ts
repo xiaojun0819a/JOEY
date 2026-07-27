@@ -16,6 +16,11 @@ type GoBridge = {
   RunLowBuyScannerV1?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
   RunLimitPullbackScanner?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
   RunTripleVolumeScannerV5?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
+  RunOversoldIgniteScanner?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
+  RunLimitupRetraceScanner?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
+  GetOversoldLearnReport?: () => Promise<string>;
+  GetStrategyLearnReport?: (strategyId: string) => Promise<string>;
+  BackfillOversoldLearn?: (months: number) => Promise<string>;
   RunTailBuyScannerV6?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
   RunHotMoneyBreakoutScannerV7?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
   RunDipEntryScannerV8?: (req: LowBuyScannerRequest) => Promise<LowBuyScannerResult>;
@@ -102,10 +107,59 @@ export const runLimitPullbackScanner = async (req: LowBuyScannerRequest): Promis
   return await bridge.RunLimitPullbackScanner(req);
 };
 
+// 任一策略·学习日报(全策略共享自学习:入选×次日结果分桶统计,扣费超额口径)。
+export const getStrategyLearnReport = async (strategyId: string): Promise<string> => {
+  if (!isWailsGoReady()) return '后端未就绪';
+  const bridge = getGoBridge();
+  if (!bridge.GetStrategyLearnReport) return '当前版本未暴露学习日报接口,请更新后端';
+  return await bridge.GetStrategyLearnReport(strategyId);
+};
+
+// 超跌起爆11·学习日报(每日自动学习:入选×次日结果分桶统计)。
+export const getOversoldLearnReport = async (): Promise<string> => {
+  if (!isWailsGoReady()) return '仅桌面/远程模式可用';
+  const bridge = getGoBridge();
+  if (!bridge.GetOversoldLearnReport) return '当前版本未暴露学习日报接口';
+  return await bridge.GetOversoldLearnReport();
+};
+
+export const backfillOversoldLearn = async (months: number): Promise<string> => {
+  if (!isWailsGoReady()) return '仅桌面/远程模式可用';
+  const bridge = getGoBridge();
+  if (!bridge.BackfillOversoldLearn) return '当前版本未暴露学习回放接口';
+  return await bridge.BackfillOversoldLearn(months);
+};
+
+// 超跌鱼身起爆11:250日深回撤 + 地量沉寂 + 爆量大阳收复短均 + 波段鱼身引擎共振。
+export const runOversoldIgniteScanner = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
+  if (!isWailsGoReady()) {
+    warnWailsUnavailable('超跌起爆扫描', 'go');
+    return null;
+  }
+  const bridge = getGoBridge();
+  if (!bridge.RunOversoldIgniteScanner) {
+    throw new Error('当前版本未暴露 RunOversoldIgniteScanner 接口，请重启 Wails 开发服务');
+  }
+  return await bridge.RunOversoldIgniteScanner(req);
+};
+
+// 涨停回踩12：主板10cm 三日序列(首板→温和放量→缩量35~65%回踩长下影)，100分模块制含分时承接。
+export const runLimitupRetraceScanner = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
+  if (!isWailsGoReady()) {
+    warnWailsUnavailable('涨停回踩12扫描', 'go');
+    return null;
+  }
+  const bridge = getGoBridge();
+  if (!bridge.RunLimitupRetraceScanner) {
+    throw new Error('当前版本未暴露 RunLimitupRetraceScanner 接口，请重装最新 app');
+  }
+  return await bridge.RunLimitupRetraceScanner(req);
+};
+
 // 三倍量策略5：未涨停阳线 + 成交量>=前一日3倍 + 一阳穿MA5/10/20/30。
 export const runTripleVolumeScannerV5 = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
   if (!isWailsGoReady()) {
-    warnWailsUnavailable('三倍量策略5扫描', 'go');
+    warnWailsUnavailable('三倍量策略扫描', 'go');
     return null;
   }
   const bridge = getGoBridge();
@@ -117,7 +171,7 @@ export const runTripleVolumeScannerV5 = async (req: LowBuyScannerRequest): Promi
 
 export const runTailBuyScannerV6 = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
   if (!isWailsGoReady()) {
-    warnWailsUnavailable('尾盘买入策略6扫描', 'go');
+    warnWailsUnavailable('尾盘买入策略扫描', 'go');
     return null;
   }
   const bridge = getGoBridge();
@@ -129,7 +183,7 @@ export const runTailBuyScannerV6 = async (req: LowBuyScannerRequest): Promise<Lo
 
 export const runHotMoneyBreakoutScannerV7 = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
   if (!isWailsGoReady()) {
-    warnWailsUnavailable('游资突破策略7扫描', 'go');
+    warnWailsUnavailable('游资突破策略扫描', 'go');
     return null;
   }
   const bridge = getGoBridge();
@@ -141,7 +195,7 @@ export const runHotMoneyBreakoutScannerV7 = async (req: LowBuyScannerRequest): P
 
 export const runDipEntryScannerV8 = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
   if (!isWailsGoReady()) {
-    warnWailsUnavailable('低吸入场策略8扫描', 'go');
+    warnWailsUnavailable('低吸入场策略扫描', 'go');
     return null;
   }
   const bridge = getGoBridge();
@@ -153,7 +207,7 @@ export const runDipEntryScannerV8 = async (req: LowBuyScannerRequest): Promise<L
 
 export const runMonsterScannerV9 = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
   if (!isWailsGoReady()) {
-    warnWailsUnavailable('捉妖策略9扫描', 'go');
+    warnWailsUnavailable('捉妖策略扫描', 'go');
     return null;
   }
   const bridge = getGoBridge();
@@ -165,7 +219,7 @@ export const runMonsterScannerV9 = async (req: LowBuyScannerRequest): Promise<Lo
 
 export const runMonsterScannerV10 = async (req: LowBuyScannerRequest): Promise<LowBuyScannerResult | null> => {
   if (!isWailsGoReady()) {
-    warnWailsUnavailable('捉妖策略10扫描', 'go');
+    warnWailsUnavailable('捉妖(旧v10)扫描', 'go');
     return null;
   }
   const bridge = getGoBridge();

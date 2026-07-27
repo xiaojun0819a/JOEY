@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { X, Brain, Plus, Trash2, Loader2, Sparkles, RefreshCw } from 'lucide-react';
+import { X, Brain, Plus, Trash2, Loader2, Sparkles, RefreshCw, Upload } from 'lucide-react';
 import { NodeRenderer } from 'markstream-react';
 import { useTheme } from '../contexts/ThemeContext';
-import { addIntelNote, listIntelNotes, deleteIntelNote, generateIntelDigest, IntelNote } from '../services/intelService';
+import { addIntelNote, addIntelNoteFromFile, listIntelNotes, deleteIntelNote, generateIntelDigest, IntelNote } from '../services/intelService';
 import { getHeldPositions } from '../services/sessionService';
 
 interface Props {
@@ -11,6 +11,7 @@ interface Props {
 }
 
 const SOURCE_LABEL: Record<string, string> = { manual: '手记', news: '快讯', url: '链接' };
+// source 形如 file:研报.docx 时,标签显示「文件」
 
 export const IntelDialog: React.FC<Props> = ({ isOpen, onClose }) => {
   const { colors } = useTheme();
@@ -23,6 +24,10 @@ export const IntelDialog: React.FC<Props> = ({ isOpen, onClose }) => {
   const [digestMeta, setDigestMeta] = useState('');
   const [genLoading, setGenLoading] = useState(false);
   const [genError, setGenError] = useState('');
+  const [uploading, setUploading] = useState('');
+  const [uploadMsg, setUploadMsg] = useState('');
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = React.useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(async () => {
     setNotes(await listIntelNotes('', 200));
@@ -43,6 +48,30 @@ export const IntelDialog: React.FC<Props> = ({ isOpen, onClose }) => {
       // 错误已在 service 打日志
     }
     setSaving(false);
+  };
+
+  // 文件入库:浏览器读成 base64 → Go 解析(docx 走标准库 zip,零依赖)→ 复用既有入库逻辑,
+  // 所以文件里点名的股票名/代码会被自动识别关联,和粘贴文字一个待遇。
+  const uploadFiles = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (!list.length) return;
+    setUploadMsg('');
+    const okMsgs: string[] = [];
+    const errMsgs: string[] = [];
+    for (const f of list) {
+      setUploading(f.name);
+      try {
+        const r = await addIntelNoteFromFile(f, codes.split(/[\s,，]+/).map(x => x.trim()).filter(Boolean));
+        if (r) {
+          okMsgs.push(`${r.fileName}:解析 ${r.textLen} 字,关联 ${r.codeCount} 只${r.warning ? `(${r.warning})` : ''}`);
+        }
+      } catch (e) {
+        errMsgs.push(`${f.name}:${String(e).replace(/^Error:\s*/, '')}`);
+      }
+    }
+    setUploading('');
+    setUploadMsg([...okMsgs, ...errMsgs].join(' / '));
+    await load();
   };
 
   const remove = async (id: number) => {
@@ -93,13 +122,39 @@ export const IntelDialog: React.FC<Props> = ({ isOpen, onClose }) => {
             <div className={`p-4 border-b ${dark ? 'border-slate-800' : 'border-slate-200'}`}>
               <div className="text-xs font-medium mb-2 flex items-center gap-1.5"><Plus className="h-3.5 w-3.5 text-accent-2" />记一条情报</div>
               <textarea value={draft} onChange={e => setDraft(e.target.value)} rows={3}
-                placeholder="看到的观点、听到的、临时想到的…粘进来就行" className={inputCls} />
+                placeholder="观点、传闻、临时想法…粘进来就行;带链接会自动抓正文摘要" className={inputCls} />
               <input value={codes} onChange={e => setCodes(e.target.value)}
-                placeholder="关联股票代码(可空,逗号分隔,如 sh600519)" className={`mt-2 ${inputCls}`} />
+                placeholder="关联代码(可空;正文里的股票名/代码会自动识别关联)" className={`mt-2 ${inputCls}`} />
               <button disabled={saving || !draft.trim()} onClick={save}
                 className="mt-2 w-full py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-br from-[var(--accent)] to-[var(--accent-2)] disabled:opacity-40">
                 {saving ? '保存中…' : '入库'}
               </button>
+
+              {/* 文件入库:支持 txt/md/csv/docx。PDF、图片、音视频这一步还不支持,Go 侧会返回明确原因。 */}
+              <div
+                onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={e => { e.preventDefault(); setDragOver(false); void uploadFiles(e.dataTransfer.files); }}
+                onClick={() => fileRef.current?.click()}
+                className={`mt-2 cursor-pointer rounded-lg border border-dashed px-3 py-3 text-center text-[11px] transition-colors ${
+                  dragOver ? 'border-accent bg-accent/10 text-accent' : 'border-slate-600/60 text-slate-500 hover:border-accent/50'
+                }`}
+              >
+                {uploading ? (
+                  <span className="inline-flex items-center gap-1.5"><Loader2 className="h-3.5 w-3.5 animate-spin" />正在解析 {uploading}…</span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5"><Upload className="h-3.5 w-3.5" />拖文件到这里,或点击选择(txt / md / csv / docx)</span>
+                )}
+              </div>
+              <input
+                ref={fileRef}
+                type="file"
+                multiple
+                accept=".txt,.md,.markdown,.csv,.json,.log,.docx,.doc"
+                className="hidden"
+                onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ''; }}
+              />
+              {uploadMsg && <div className="mt-1.5 text-[11px] text-slate-400 leading-relaxed break-words">{uploadMsg}</div>}
             </div>
             <div className="flex-1 min-h-0 overflow-auto p-3 space-y-2">
               <div className="text-[11px] text-slate-500 px-1">已沉淀 {notes.length} 条</div>
@@ -111,7 +166,7 @@ export const IntelDialog: React.FC<Props> = ({ isOpen, onClose }) => {
                   </div>
                   <div className="mt-1.5 flex items-center gap-1.5 flex-wrap text-[10px]">
                     <span className="text-slate-500">{n.createdAt?.slice(5, 16)}</span>
-                    <span className="rounded bg-slate-500/15 px-1.5 py-0.5 text-slate-400">{SOURCE_LABEL[n.source] || n.source}</span>
+                    <span className="rounded bg-slate-500/15 px-1.5 py-0.5 text-slate-400">{n.source?.startsWith('file:') ? `文件·${n.source.slice(5)}` : (SOURCE_LABEL[n.source] || n.source)}</span>
                     {n.codes?.map(c => <span key={c} className="rounded bg-accent/15 px-1.5 py-0.5 text-accent">{c}</span>)}
                   </div>
                 </div>

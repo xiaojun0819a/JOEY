@@ -5,6 +5,7 @@ import { AddToGroupButton } from './AddToGroupButton';
 import { BatchAddToGroupButton } from './BatchAddToGroupButton';
 import { StrategyReviewDialog } from './StrategyReviewDialog';
 import { runLateDayChaseScanner } from '../services/scannerService';
+import { watchSharedResult } from '../services/sharedScanService';
 
 export interface LateDayChaseScannerRequest {
   limit: number;
@@ -125,6 +126,19 @@ export const LateDayChaseScannerDialog: React.FC<LateDayChaseScannerDialogProps>
     [watchlistSymbols],
   );
 
+  // 跨账号共享:打开即显示任意账号最新一次扫描(不重扫),期间10秒轮询自动换新(♻️标记见结果警示行)
+  const sharedAtRef = useRef('');
+  useEffect(() => {
+    if (!isOpen || loading) return;
+    return watchSharedResult<LateDayChaseScannerResult>('RunLateDayChaseScanner', hit => {
+      if (!hit.result) return;
+      sharedAtRef.current = hit.at;
+      setResult(hit.result);
+      setSelected(hit.result.items?.[0] || null);
+      setError('');
+    }, () => sharedAtRef.current);
+  }, [isOpen, loading]);
+
   const runScan = async () => {
     const requestId = ++scanRequestIdRef.current;
     setLoading(true);
@@ -156,6 +170,7 @@ export const LateDayChaseScannerDialog: React.FC<LateDayChaseScannerDialogProps>
       }
       setResult(res);
       setSelected(res.items[0] || null);
+      sharedAtRef.current = new Date().toLocaleString('sv-SE'); // 自己刚扫的,共享轮询不用再回灌
     } catch (err) {
       if (requestId !== scanRequestIdRef.current) return;
       setError(err instanceof Error ? err.message : '扫描失败，请稍后重试');
@@ -505,6 +520,16 @@ export const LateDayChaseScannerDialog: React.FC<LateDayChaseScannerDialogProps>
       strategyId="latechase-v3"
       strategyName="尾盘强势策略3"
       signalDate={result?.asOf}
+      onOpenStock={onOpenStock ? (symbol, name, price) => {
+        // 与波段复盘同款:关掉复盘+扫描两层弹窗,直达全屏四窗口(鱼身组合)
+        setShowNextDayReview(false);
+        onClose();
+        void onOpenStock({
+          symbol, name, price,
+          change: 0, changePercent: 0, volume: 0, amount: 0,
+          marketCap: '', sector: '', open: price, high: price, low: price, preClose: price,
+        });
+      } : undefined}
     />
     </>
   );

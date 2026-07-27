@@ -15,6 +15,8 @@ type Stock struct {
 	High          float64 `json:"high"`
 	Low           float64 `json:"low"`
 	PreClose      float64 `json:"preClose"`
+	// WatchAddedAt 加入自选的时刻(仅自选列表持久化用,行情快照不带) "2006-01-02 15:04"
+	WatchAddedAt string `json:"watchAddedAt,omitempty"`
 }
 
 // StockGroup 自选分组定义（用户可自定义增删改名）
@@ -73,6 +75,8 @@ type KLineData struct {
 	Volume int64   `json:"volume"`
 	Amount float64 `json:"amount,omitempty"`
 	Avg    float64 `json:"avg,omitempty"` // 分时均价线
+	// 换手率%(真实值:日K来自 stock_daily/archive 采集口径;行情源K线不带,取不到留 0 → 前端显示 --)
+	TurnoverRate float64 `json:"turnoverRate,omitempty"`
 	// 均线数据
 	MA5  float64 `json:"ma5,omitempty"`
 	MA10 float64 `json:"ma10,omitempty"`

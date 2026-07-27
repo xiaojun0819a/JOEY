@@ -13,6 +13,7 @@ const PAPER_GROUP = '模拟持仓';
 interface Props {
   stock: Stock;
   inWatch?: boolean; // 已在自选股池
+  inPaper?: boolean; // 已在模拟持仓(与自选是两回事,状态必须分开显示)
   source?: string;   // 来源筛选系统：lowbuy-v1/wave-v1/caoyuan...
   onAddToWatchlist: (stock: Stock) => Promise<boolean> | void;
   onChanged?: () => void;
@@ -31,6 +32,7 @@ const FIXED: { name: string; icon: React.ElementType }[] = [
 export const AddToGroupButton: React.FC<Props> = ({
   stock,
   inWatch,
+  inPaper,
   source,
   onAddToWatchlist,
   onChanged,
@@ -53,7 +55,17 @@ export const AddToGroupButton: React.FC<Props> = ({
   const [myGroupIds, setMyGroupIds] = useState<string[]>([]);
   const ref = useRef<HTMLDivElement>(null);
 
-  const added = !!doneTag || !!inWatch;
+  // ⚠️「在自选」和「在模拟持仓」是两回事,必须分开显示:
+  // 以前统一显示"已添加"(added = doneTag || inWatch),在"胜率验证"这类界面会被读成
+  // "已加进持仓",但它其实只代表在自选里 —— 用户据此以为票进了持仓,实际没有。
+  const added = !!doneTag || !!inWatch || !!inPaper;
+  const stateLabel = inPaper
+    ? '持仓中'
+    : doneTag
+      ? `已加·${doneTag}`
+      : inWatch
+        ? '已加自选'
+        : '添加';
 
   // 打开菜单时拉取该票当前分组，给已加的分组打勾
   const openMenu = async () => {
@@ -235,13 +247,16 @@ export const AddToGroupButton: React.FC<Props> = ({
           onClick={openMenu}
           disabled={busy}
           className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-xs transition-colors disabled:opacity-50 ${
-            added
-              ? 'border-green-500/40 text-green-400 bg-green-500/10'
-              : dark ? 'border-slate-600 text-slate-200 hover:border-accent/50 hover:text-accent-2' : 'border-slate-300 text-slate-600 hover:border-accent/50'
+            inPaper
+              ? 'border-amber-500/50 text-amber-300 bg-amber-500/10' // 在模拟持仓:琥珀色,与"仅自选"的绿色区分
+              : added
+                ? 'border-green-500/40 text-green-400 bg-green-500/10'
+                : dark ? 'border-slate-600 text-slate-200 hover:border-accent/50 hover:text-accent-2' : 'border-slate-300 text-slate-600 hover:border-accent/50'
           }`}
+          title={inPaper ? '已在模拟持仓(参与胜率验证)' : inWatch ? '已在自选,但未加入模拟持仓' : '添加到自选/分组/模拟持仓'}
         >
-          {added ? <Check className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
-          <span>{doneTag ? `已加·${doneTag}` : added ? '已添加' : '添加'}</span>
+          {inPaper ? <Wallet className="h-3.5 w-3.5" /> : added ? <Check className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+          <span>{stateLabel}</span>
         </button>
       )}
 

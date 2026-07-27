@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,21 +25,21 @@ import (
 
 const researchReportTimeout = 25 * time.Minute // 整体参考值(前端提示用)
 const researchPartTimeout = 12 * time.Minute   // 单段生成超时;报告分两段(1-8章/9-16章)生成再拼接——模型单次稳定输出上限约6-8千字,一口气1.2万字必被压缩成摘要
-const researchReportPeriodKey = "research-v5" // 落库用的 period 标识
+const researchReportPeriodKey = "research-v5"  // 落库用的 period 标识
 
 // ResearchReportStatus 投研报告任务状态(供前端轮询)
 type ResearchReportStatus struct {
-	Status      string `json:"status"` // idle | running | done | failed
-	StockCode   string `json:"stockCode"`
-	StockName   string `json:"stockName"`
-	Report      string `json:"report"`
-	FileName    string `json:"fileName"` // Word 文件名(下载用)
-	FilePath    string `json:"filePath"` // 服务端绝对路径(本地模式打开用)
-	Error       string `json:"error"`
-	ModelName   string `json:"modelName"`
-	StartedAt   string `json:"startedAt"`
-	FinishedAt  string `json:"finishedAt"`
-	ElapsedSec  int    `json:"elapsedSec"`
+	Status     string `json:"status"` // idle | running | done | failed
+	StockCode  string `json:"stockCode"`
+	StockName  string `json:"stockName"`
+	Report     string `json:"report"`
+	FileName   string `json:"fileName"` // Word 文件名(下载用)
+	FilePath   string `json:"filePath"` // 服务端绝对路径(本地模式打开用)
+	Error      string `json:"error"`
+	ModelName  string `json:"modelName"`
+	StartedAt  string `json:"startedAt"`
+	FinishedAt string `json:"finishedAt"`
+	ElapsedSec int    `json:"elapsedSec"`
 }
 
 type researchJob struct {
@@ -319,9 +320,42 @@ func (a *App) runResearchReport(job *researchJob, stockCode, stockName string) {
 		s.ElapsedSec = int(time.Since(job.start).Seconds())
 	})
 	rt_logf("投研报告完成 %s(%s): %d 字, 耗时 %ds", stockName, stockCode, len([]rune(report)), int(time.Since(job.start).Seconds()))
+
+	// 报告即因子:生成完成自动摘录五字段入学习库(2026-07-25 用户闭环),失败只记日志不影响报告本身。
+	a.autoIngestResearchReport(stockCode, stockName, report)
 }
 
 func rt_logf(format string, args ...interface{}) { log.Info(format, args...) }
+
+// autoIngestResearchReport 从报告正文摘录 鱼身指数/主升浪概率/综合评级/阶段,连同基准日自动入 AI 报告因子库。
+func (a *App) autoIngestResearchReport(stockCode, stockName, report string) {
+	if a == nil || a.historyService == nil || report == "" {
+		return
+	}
+	grab := func(pat string) string {
+		if m := regexp.MustCompile(pat).FindStringSubmatch(report); len(m) > 1 {
+			return strings.TrimSpace(m[1])
+		}
+		return ""
+	}
+	fish, _ := strconv.ParseFloat(grab(`鱼身指数[：:\s]*([0-9]+(?:\.[0-9]+)?)`), 64)
+	prob, _ := strconv.ParseFloat(grab(`主升浪概率[：:\s]*([0-9]+(?:\.[0-9]+)?)\s*%`), 64)
+	rating := grab(`综合评级[：:\s]*([^\n。]{2,25})`)
+	phase := grab(`(?:短线状态|当前阶段|阶段判断)[：:\s]*([^\n]{2,30})`)
+	if fish == 0 && prob == 0 && rating == "" {
+		rt_logf("投研报告自动摘录: %s 未匹配到结构化字段,跳过入库", stockCode)
+		return
+	}
+	_, matched, err := a.historyService.UpsertAIReport(services.AIReportNote{
+		Code: stockCode, Name: stockName, ReportDate: time.Now().Format("2006-01-02"),
+		FishIndex: fish, Prob: prob, Rating: rating, Phase: phase,
+	})
+	if err != nil {
+		rt_logf("投研报告自动入因子库失败 %s: %v", stockCode, err)
+		return
+	}
+	rt_logf("投研报告已自动入因子库: %s 鱼身%.0f 主升浪%.0f%% [%s];学习样本已匹配 %d 笔", stockCode, fish, prob, rating, matched)
+}
 
 // researchReportPersona 放进 agent system 提示词(替换老陈人设)。
 // 教训：把整套 V5.0 塞进用户消息时，老陈 system 里的"精炼输出"风格会赢——68秒吐264字摘要收工。

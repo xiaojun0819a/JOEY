@@ -33,9 +33,9 @@ type CninfoResult struct {
 type CninfoService struct {
 	client *http.Client
 
-	mu        sync.Mutex
-	orgIDs    map[string]string // 6位代码 → orgId
-	orgIDsAt  time.Time
+	mu       sync.Mutex
+	orgIDs   map[string]string // 6位代码 → orgId
+	orgIDsAt time.Time
 }
 
 var (

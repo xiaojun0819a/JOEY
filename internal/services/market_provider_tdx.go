@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -133,22 +134,44 @@ func (p *tdxMarketProvider) FetchKLineData(code string, period string, days int)
 		return nil, err
 	}
 
+	// ⚠️指数必须走 GetIndexXxx 系列:通达信里指数与个股的 K线**请求命令相同但响应解析方式不同**
+	// (库作者原话:"接口是和k线一样的,但是解析不知道怎么区分(解析方式不一致),所以加一个方法";
+	// 内部差别是 KlineCache.Kind = KindIndex / KindStock)。用个股解析去拆指数的字节流会静默错位,
+	// 实测吐出 日期 429197 年、收盘 -483952、成交量 -9223372036854775808(int64 最小值)这种垃圾,
+	// 而且不报错——比直接失败更危险。个股路径保持原样不动。
 	var resp *protocol.KlineResp
-	switch period {
-	case "1m", "5d":
-		resp, err = cli.GetKlineMinuteAll(code)
-	case "30m":
-		resp, err = cli.GetKline30MinuteAll(code)
-	case "60m":
-		resp, err = cli.GetKline60MinuteAll(code)
-	case "1d":
-		resp, err = cli.GetKlineDayAll(code)
-	case "1w":
-		resp, err = cli.GetKlineWeekAll(code)
-	case "1mo":
-		resp, err = cli.GetKlineMonthAll(code)
-	default:
-		resp, err = cli.GetKlineDayAll(code)
+	if isTDXIndexCode(code) {
+		switch period {
+		case "1m", "5d":
+			resp, err = cli.GetIndexAll(protocol.TypeKlineMinute, code)
+		case "30m":
+			resp, err = cli.GetIndexAll(protocol.TypeKline30Minute, code)
+		case "60m":
+			resp, err = cli.GetIndexAll(protocol.TypeKline60Minute, code)
+		case "1w":
+			resp, err = cli.GetIndexWeekAll(code)
+		case "1mo":
+			resp, err = cli.GetIndexMonthAll(code)
+		default:
+			resp, err = cli.GetIndexDayAll(code)
+		}
+	} else {
+		switch period {
+		case "1m", "5d":
+			resp, err = cli.GetKlineMinuteAll(code)
+		case "30m":
+			resp, err = cli.GetKline30MinuteAll(code)
+		case "60m":
+			resp, err = cli.GetKline60MinuteAll(code)
+		case "1d":
+			resp, err = cli.GetKlineDayAll(code)
+		case "1w":
+			resp, err = cli.GetKlineWeekAll(code)
+		case "1mo":
+			resp, err = cli.GetKlineMonthAll(code)
+		default:
+			resp, err = cli.GetKlineDayAll(code)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -176,6 +199,13 @@ func (p *tdxMarketProvider) FetchKLineData(code string, period string, days int)
 			Volume: item.Volume,
 			Amount: item.Amount.Float64(),
 		})
+	}
+
+	// 通用防线:检出一根离谱值就整条作废(返 error → 上层回落新浪),别让垃圾流进指标/策略/图表。
+	// 不做"剔坏根留好根":那会返回一条长度骗人、中间有洞的序列,下游静默算错。
+	klines, dropped := sanitizeKLines(code, period, klines)
+	if dropped > 0 || len(klines) == 0 {
+		return nil, fmt.Errorf("tdx kline invalid: %s(%s) %d 根离谱值,整条作废", code, period, dropped)
 	}
 
 	if period == "1m" {
@@ -310,6 +340,10 @@ type tdxClient interface {
 	GetKline60MinuteAll(code string) (*protocol.KlineResp, error)
 	GetKlineDayAll(code string) (*protocol.KlineResp, error)
 	GetIndexDay(code string, start, count uint16) (*protocol.KlineResp, error)
+	GetIndexDayAll(code string) (*protocol.KlineResp, error)
+	GetIndexWeekAll(code string) (*protocol.KlineResp, error)
+	GetIndexMonthAll(code string) (*protocol.KlineResp, error)
+	GetIndexAll(Type uint8, code string) (*protocol.KlineResp, error)
 	GetKlineWeekAll(code string) (*protocol.KlineResp, error)
 	GetKlineMonthAll(code string) (*protocol.KlineResp, error)
 	GetCodeAll(exchange protocol.Exchange) (*protocol.CodeResp, error)
@@ -511,4 +545,50 @@ func calculateAvgLineByLotVolumePerDay(klines []models.KLineData) []models.KLine
 	}
 
 	return klines
+}
+
+// isTDXIndexCode 是否为指数代码(决定走通达信的指数解析而非个股解析)。
+// 沪市 sh000xxx = 上证指数系列(上证综指 sh000001/上证50 sh000016/沪深300 sh000300/中证500 sh000905);
+// 沪市个股是 6xxxxx/688xxx,不会与之冲突。深市 sz399xxx = 深证指数系列(深证成指 399001/创业板指 399006);
+// 深市个股是 000xxx/002xxx/300xxx —— 注意 sz000001 是平安银行(个股),与上证指数 sh000001 只差前缀,
+// 所以判定必须带交易所前缀,不能只看数字。
+func isTDXIndexCode(code string) bool {
+	c := strings.ToLower(strings.TrimSpace(code))
+	if len(c) < 5 {
+		return false
+	}
+	switch c[:2] {
+	case "sh":
+		return strings.HasPrefix(c[2:], "000")
+	case "sz":
+		return strings.HasPrefix(c[2:], "399")
+	}
+	return false
+}
+
+// sanitizeKLines 检出离谱的K线并返回丢弃数。判据全是物理上不可能的值,正常行情永不命中:
+// 负/零价、负量、高低倒挂、年份越界。命中任意一根即说明解析层已经出事。
+// ⚠️调用方必须"丢一根就整条作废":解析错位的特征是**第1根正常、之后累计错位全烂**,
+// 若只剔坏根、留下剩余的1~3根返回,下游会拿一条"长度骗人、中间有洞"的序列去算 MA/指标 ——
+// 那是静默算错,比直接取不到危险得多(本函数存在的理由就是反对静默错,自己更不能犯)。
+func sanitizeKLines(code, period string, in []models.KLineData) ([]models.KLineData, int) {
+	out := make([]models.KLineData, 0, len(in))
+	dropped := 0
+	for _, k := range in {
+		year := k.Time
+		if len(year) >= 4 {
+			year = year[:4]
+		}
+		bad := k.Close <= 0 || k.Open <= 0 || k.High <= 0 || k.Low <= 0 || k.Volume < 0 ||
+			k.High < k.Low || year < "1990" || year > "2100"
+		if bad {
+			dropped++
+			continue
+		}
+		out = append(out, k)
+	}
+	if dropped > 0 {
+		log.Warn("K线离谱值: %s(%s) %d/%d 根不合法(负零价/负量/高低倒挂/年份越界),整条作废回落备源", code, period, dropped, len(in))
+	}
+	return out, dropped
 }

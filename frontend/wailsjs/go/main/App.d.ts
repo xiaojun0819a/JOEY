@@ -11,6 +11,8 @@ export function AddAgentConfig(arg1:models.AgentConfig):Promise<string>;
 
 export function AddIntelNote(arg1:string,arg2:Array<string>,arg3:string):Promise<main.IntelNote>;
 
+export function AddIntelNoteFromUpload(arg1:string,arg2:string,arg3:Array<string>):Promise<main.IntelUploadResult>;
+
 export function AddMCPServer(arg1:models.MCPServerConfig):Promise<string>;
 
 export function AddPaperPosition(arg1:string,arg2:string,arg3:string,arg4:number,arg5:number):Promise<string>;
@@ -18,6 +20,8 @@ export function AddPaperPosition(arg1:string,arg2:string,arg3:string,arg4:number
 export function AddStockGroupDef(arg1:string):Promise<models.StockGroup>;
 
 export function AddStrategy(arg1:models.Strategy):Promise<string>;
+
+export function AddTipPicks(arg1:string,arg2:number,arg3:string):Promise<main.TipPickResult>;
 
 export function AddToWatchlist(arg1:models.Stock):Promise<string>;
 
@@ -29,7 +33,13 @@ export function BackfillAllHistory(arg1:number,arg2:boolean):Promise<models.Hist
 
 export function BackfillHistory(arg1:models.HistoryBackfillRequest):Promise<models.HistoryBackfillResult>;
 
+export function BackfillMissingOHLC(arg1:number):Promise<services.OHLCBackfillResult>;
+
+export function BackfillOversoldLearn(arg1:number):Promise<string>;
+
 export function BackfillWatchlistHistory(arg1:number):Promise<models.HistoryBackfillResult>;
+
+export function BacktestLimitupRetrace(arg1:string,arg2:string):Promise<string>;
 
 export function CancelInterruptedMeeting(arg1:string):Promise<boolean>;
 
@@ -37,11 +47,21 @@ export function CancelMeeting(arg1:string):Promise<boolean>;
 
 export function CheckForUpdate():Promise<services.UpdateInfo>;
 
+export function ClearAllPaperPositions():Promise<string>;
+
+export function ClearPaperPositionsByIDs(arg1:Array<number>):Promise<string>;
+
 export function ClearSessionMessages(arg1:string):Promise<string>;
 
 export function ClosePaperPosition(arg1:number,arg2:number):Promise<string>;
 
 export function CollectDailyHistory(arg1:models.HistoryCollectRequest):Promise<models.HistoryCollectResult>;
+
+export function CountAppInstances():Promise<number>;
+
+export function DebugOversoldIgnite(arg1:string,arg2:string):Promise<Record<string, any>>;
+
+export function DecideEvolutionProposal(arg1:number,arg2:boolean):Promise<string>;
 
 export function DeleteAgentConfig(arg1:string):Promise<string>;
 
@@ -59,6 +79,8 @@ export function DeleteStrategy(arg1:string):Promise<string>;
 
 export function DeleteTradeJournal(arg1:number):Promise<string>;
 
+export function DiagnoseLimitupRetrace():Promise<string>;
+
 export function DoUpdate():Promise<string>;
 
 export function EnhancePrompt(arg1:main.EnhancePromptRequest):Promise<main.EnhancePromptResponse>;
@@ -69,9 +91,13 @@ export function ForUser(arg1:string):Promise<main.App>;
 
 export function GenerateBoardReport(arg1:main.GenerateBoardReportRequest):Promise<main.GenerateBoardReportResponse>;
 
+export function GenerateEvolutionProposalsNow():Promise<string>;
+
 export function GenerateIntelDigest(arg1:Array<models.HeldPosition>):Promise<main.IntelDigestResponse>;
 
 export function GenerateStrategy(arg1:main.GenerateStrategyRequest):Promise<main.GenerateStrategyResponse>;
+
+export function GetAIReportCalibration():Promise<string>;
 
 export function GetActiveStrategyID():Promise<string>;
 
@@ -88,6 +114,10 @@ export function GetArchiveKLine(arg1:string,arg2:string,arg3:string,arg4:number)
 export function GetArchiveStockInfo(arg1:string):Promise<services.ArchiveStockInfo>;
 
 export function GetAuctionFinal(arg1:string,arg2:number):Promise<Array<services.AuctionFinalRow>>;
+
+export function GetAuctionPicksC(arg1:string):Promise<Array<services.AuctionFinalRow>>;
+
+export function GetAuctionPicksG(arg1:string):Promise<Array<services.AuctionFinalRow>>;
 
 export function GetAuditLogs(arg1:string,arg2:string,arg3:number,arg4:number):Promise<Array<main.AuditEntry>>;
 
@@ -109,6 +139,8 @@ export function GetBoardLeaders(arg1:string,arg2:number):Promise<models.BoardLea
 
 export function GetBoardReportStatus(arg1:string,arg2:string):Promise<main.BoardReportStatus>;
 
+export function GetBoardResealWatch():Promise<Array<main.boardResealWatch>>;
+
 export function GetCachedBoardReport(arg1:string,arg2:string):Promise<main.GetCachedBoardReportResponse>;
 
 export function GetCninfoAnnouncements(arg1:string,arg2:string,arg3:number):Promise<services.CninfoResult>;
@@ -121,6 +153,10 @@ export function GetConfigMasked():Promise<models.AppConfig>;
 
 export function GetCurrentVersion():Promise<string>;
 
+export function GetDrillSession(arg1:string,arg2:string):Promise<models.DrillSession>;
+
+export function GetEvolutionProposals(arg1:string):Promise<string>;
+
 export function GetF10Overview(arg1:string):Promise<models.F10Overview>;
 
 export function GetF10Valuation(arg1:string):Promise<models.StockValuation>;
@@ -131,6 +167,10 @@ export function GetHeldPositions():Promise<Array<models.HeldPosition>>;
 
 export function GetHistoryAutoCollectStatus():Promise<models.HistoryAutoCollectStatus>;
 
+export function GetHistoryMinuteBackfillStatus():Promise<services.MinuteHistoryBackfillStatus>;
+
+export function GetHistoryMinuteCoverage():Promise<Record<string, any>>;
+
 export function GetHotTrend(arg1:string):Promise<hottrend.HotTrendResult>;
 
 export function GetHotTrendPlatforms():Promise<Array<hottrend.PlatformInfo>>;
@@ -138,6 +178,8 @@ export function GetHotTrendPlatforms():Promise<Array<hottrend.PlatformInfo>>;
 export function GetIntradayCoverage():Promise<services.IntradayCoverage>;
 
 export function GetKLineData(arg1:string,arg2:string,arg3:number):Promise<Array<models.KLineData>>;
+
+export function GetLearnOverview():Promise<string>;
 
 export function GetLongHuBangDetail(arg1:string,arg2:string):Promise<Array<models.LongHuBangDetail>>;
 
@@ -161,11 +203,17 @@ export function GetMarketStatus():Promise<services.MarketStatus>;
 
 export function GetMarketStylePreference():Promise<models.MarketStylePreference>;
 
+export function GetMinuteHistory(arg1:string,arg2:string):Promise<Array<services.PriceMinute>>;
+
 export function GetOpenClawStatus():Promise<Record<string, any>>;
 
 export function GetOrCreateSession(arg1:string,arg2:string):Promise<models.StockSession>;
 
 export function GetOrderBook(arg1:string):Promise<models.OrderBook>;
+
+export function GetOversoldLearnReport():Promise<string>;
+
+export function GetPaperAutoPaused():Promise<boolean>;
 
 export function GetPaperRiskSummary():Promise<models.PaperRiskSummary>;
 
@@ -191,6 +239,8 @@ export function GetStockRealTimeData(arg1:Array<string>):Promise<Array<models.St
 
 export function GetStrategies():Promise<Array<models.Strategy>>;
 
+export function GetStrategyLearnReport(arg1:string):Promise<string>;
+
 export function GetStrategyNextDayReview(arg1:models.StrategyReviewRequest):Promise<models.StrategyReviewResult>;
 
 export function GetTailForwardConfig():Promise<models.TailForwardConfig>;
@@ -207,9 +257,17 @@ export function GetTradingSchedule():Promise<services.TradingSchedule>;
 
 export function GetWatchlist():Promise<Array<models.Stock>>;
 
+export function GetWaveScanStatus():Promise<main.WaveScanStatus>;
+
 export function Greet(arg1:string):Promise<string>;
 
+export function ImportAIReport(arg1:string,arg2:string,arg3:string,arg4:number,arg5:number,arg6:string,arg7:string):Promise<string>;
+
 export function IsTrustedRemoteUser(arg1:string):Promise<boolean>;
+
+export function LearnAllStrategiesNow():Promise<string>;
+
+export function LearnOversoldNow():Promise<string>;
 
 export function ListIntelNotes(arg1:string,arg2:number):Promise<Array<main.IntelNote>>;
 
@@ -220,6 +278,8 @@ export function ListRemoteUsers():Promise<Array<string>>;
 export function Login(arg1:string,arg2:string):Promise<main.LoginResponse>;
 
 export function NotifyFrontendReady():Promise<void>;
+
+export function OpenNewWindow():Promise<string>;
 
 export function OpenURL(arg1:string):Promise<void>;
 
@@ -236,6 +296,8 @@ export function RemoveFromWatchlist(arg1:string):Promise<string>;
 export function RenameStockGroupDef(arg1:string,arg2:string):Promise<string>;
 
 export function ReopenPaperPosition(arg1:number):Promise<string>;
+
+export function RepairQfqGaps(arg1:string):Promise<string>;
 
 export function ReprobeBackend():Promise<main.BackendMode>;
 
@@ -267,6 +329,8 @@ export function RunLateDayChaseScanner(arg1:models.LateDayChaseScannerRequest):P
 
 export function RunLimitPullbackScanner(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
 
+export function RunLimitupRetraceScanner(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
+
 export function RunLowBuyBatchReplay(arg1:string,arg2:string,arg3:number,arg4:number):Promise<models.LowBuyBatchResult>;
 
 export function RunLowBuyReplayOnDate(arg1:string,arg2:number,arg3:number):Promise<models.LowBuyScannerResult>;
@@ -277,11 +341,15 @@ export function RunMonsterScannerV10(arg1:models.LowBuyScannerRequest):Promise<m
 
 export function RunMonsterScannerV9(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
 
+export function RunOversoldIgniteScanner(arg1:models.LowBuyScannerRequest):Promise<models.LowBuyScannerResult>;
+
 export function RunPaperStrategyAccount(arg1:string):Promise<models.StrategyAccountResult>;
 
 export function RunPortfolioBacktest(arg1:models.BacktestRequest):Promise<models.BacktestResult>;
 
 export function RunPositionMonitorOnce():Promise<number>;
+
+export function RunQfqRebuild(arg1:number):Promise<services.RebuildQfqResult>;
 
 export function RunStrategyAccount(arg1:string,arg2:number):Promise<models.StrategyAccountResult>;
 
@@ -307,6 +375,8 @@ export function RunWaveScanner():Promise<models.WaveScanResult>;
 
 export function RunWaveScannerWithGate(arg1:boolean):Promise<models.WaveScanResult>;
 
+export function RunWaveTimingBacktest(arg1:number,arg2:number):Promise<services.WaveTimingBacktestResult>;
+
 export function SaveTradeJournal(arg1:models.TradeJournalRequest):Promise<string>;
 
 export function SearchStocks(arg1:string):Promise<Array<services.StockSearchResult>>;
@@ -316,6 +386,10 @@ export function SellStockPosition(arg1:string,arg2:number,arg3:string):Promise<s
 export function SendMeetingMessage(arg1:main.MeetingMessageRequest):Promise<Array<models.ChatMessage>>;
 
 export function SetActiveStrategy(arg1:string):Promise<string>;
+
+export function SetPaperAutoExit(arg1:number,arg2:boolean):Promise<string>;
+
+export function SetPaperAutoPaused(arg1:boolean):Promise<string>;
 
 export function SetRegisterInviteCode(arg1:string):Promise<string>;
 
@@ -328,6 +402,10 @@ export function SetTailForwardConfig(arg1:boolean,arg2:boolean):Promise<string>;
 export function SetUserTrusted(arg1:string,arg2:boolean):Promise<string>;
 
 export function StartBoardReport(arg1:main.GenerateBoardReportRequest):Promise<main.BoardReportStatus>;
+
+export function StartDrillTapeBackfill(arg1:string,arg2:string):Promise<string>;
+
+export function StartHistoryMinuteBackfill(arg1:string,arg2:string,arg3:number):Promise<string>;
 
 export function StartResearchReport(arg1:string,arg2:string):Promise<main.ResearchReportStatus>;
 
@@ -355,6 +433,8 @@ export function UpdateStrategy(arg1:models.Strategy):Promise<string>;
 
 export function WindowClose():Promise<void>;
 
-export function WindowMaximize():Promise<void>;
+export function WindowIsFullscreen():Promise<boolean>;
+
+export function WindowMaximize():Promise<boolean>;
 
 export function WindowMinimize():Promise<void>;

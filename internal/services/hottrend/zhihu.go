@@ -28,7 +28,7 @@ func (f *ZhihuFetcher) PlatformCN() string { return "知乎热榜" }
 type zhihuResponse struct {
 	Data []struct {
 		Target struct {
-			ID        int    `json:"id"`
+			ID        int `json:"id"`
 			TitleArea struct {
 				Text string `json:"text"`
 			} `json:"title_area"`

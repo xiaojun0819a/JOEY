@@ -46,7 +46,8 @@ import {
   calculateCCI,
   calculateWR,
 } from '../utils/indicators';
-import { calculateIntradayTradingSignals, calculateTradingSignals, getLatestTradingSignal, TradingSignal } from '../utils/tradingSignals';
+import { bingGeTLevels, calculateIntradayTradingSignals, calculateTradingSignals, getLatestTradingSignal, TradingSignal } from '../utils/tradingSignals';
+import { listPaperPositions, type PaperPosition } from '../services/paperService';
 
 const VOLUME_MIN = 18;
 const VOLUME_MAX = 420;
@@ -295,7 +296,7 @@ export type VipFiveDragonSeries = {
   endPrice: number;
 };
 
-export type MainChartTemplate = 'standard' | 'openEatFish' | `tdx:${string}`;
+export type MainChartTemplate = 'standard' | 'openEatFish' | 'bingGeT' | `tdx:${string}`;
 
 export type OpenEatFishPoint = {
   time: Time;
@@ -1660,7 +1661,23 @@ function signalPriority(signal: TradingSignal): number {
   return 60;
 }
 
+// 量柱涨跌上色判定:分时按"当分钟收 vs 上一分钟收"(A股约定,分时逐分钟 open 常缺失);K线按当根收 vs 开。
+function volBarUp(data: KLineData[], i: number, isIntraday: boolean): boolean {
+  const d = data[i];
+  if (isIntraday) {
+    const prev = i > 0 ? data[i - 1] : undefined;
+    if (prev && prev.close > 0) return d.close >= prev.close;
+    return d.close >= (d.open || d.close); // 首根无前值,退化到 open
+  }
+  return d.close >= d.open;
+}
+
 function markerTextForSignal(signal: TradingSignal, isIntraday: boolean): string {
+  // 兵哥分时做T系列:独立标记文字
+  if (signal.title === '兵哥T·买入') return 'T买';
+  if (signal.title === '兵哥T·卖出') return 'T卖';
+  if (signal.title === '起涨') return '涨';
+  if (signal.title === '加仓') return '加';
   if (signal.action === 'sell') return '清';
   if (signal.action === 'reduce' || signal.level === 'risk') return '减';
   if (isIntraday) {
@@ -1674,6 +1691,7 @@ function markerTextForSignal(signal: TradingSignal, isIntraday: boolean): string
 
 function shouldKeepSignalForMarker(signal: TradingSignal, isIntraday: boolean): boolean {
   if (signal.action === 'observe') return false;
+  if (signal.title.startsWith('兵哥T') || signal.title === '起涨' || signal.title === '加仓') return true;
   if (!isIntraday) return true;
   if (signal.level === 'risk') return true;
   return signal.level === 'S' || signal.level === 'S-' || signal.level === 'A+';
@@ -1784,22 +1802,33 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   // 集合竞价独立窗(通达信样式):分时线前拼 whitespace 占位让时间轴含竞价时段、分时线右移空出左侧,
   // overlay canvas 在该区自绘价格台阶+背景框。数据来自 NAS intraday 采集,无数据时隐藏。
   const auctionOverlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [auctionTicks, setAuctionTicks] = useState<{ time: string; price: number; volume: number }[]>([]);
+  // 模拟盘买卖点文字标签自绘层(黄框+深底,markers 原生文字会与其他信号文字重叠)
+  const paperOverlayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const daySepCanvasRef = useRef<HTMLCanvasElement>(null);
+  const auctionVolCanvasRef = useRef<HTMLCanvasElement>(null); // 量能图竞价段深色带框架(与价格图一致)
+  const [auctionTicks, setAuctionTicks] = useState<{ time: string; price: number; volume: number; b1: number; s1: number }[]>([]);
   // 竞价段按"价格变化点"降采样(相邻同价合并),保留台阶观感、点数远少于原始tick;时间保留到秒级。
+  // 竞价降采样:固定时间间隔取约 30 点(不按价格变化,否则平价股竞价带塌成几点、量台阶丢失)。
+  // 30 点让竞价带宽度稳定(约占分时 8%,与 A股行情软件一致),且量为累积值→上升红柱台阶清晰。
   const sampledAuction = useMemo(() => {
     const src = auctionTicks;
-    if (src.length < 2) return [] as { time: string; price: number; volume: number }[];
-    const out = [src[0]];
-    for (let i = 1; i < src.length; i++) {
-      if (src[i].price !== out[out.length - 1].price) out.push(src[i]);
-    }
-    const last = src[src.length - 1];
-    if (out[out.length - 1] !== last) out.push(last);
+    if (src.length < 2) return [] as { time: string; price: number; volume: number; b1: number; s1: number }[];
+    const TARGET = 30;
+    if (src.length <= TARGET) return src;
+    const out: typeof src = [];
+    const step = (src.length - 1) / (TARGET - 1);
+    for (let k = 0; k < TARGET; k++) out.push(src[Math.round(k * step)]);
+    if (out[out.length - 1] !== src[src.length - 1]) out[out.length - 1] = src[src.length - 1];
     return out;
   }, [auctionTicks]);
   const vipAxisSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null);
   const vipAxisPaneRefs = useRef<Array<ISeriesApi<SeriesType, Time> | null>>([null, null, null]);
   const maSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
+  const tLevelSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]); // 兵哥做T:分时阻力/支撑点线
+  const pctAxisSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null); // 分时左轴:涨跌幅%(相对昨收)
+  const auctionLineSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null); // 集合竞价白色价线(真序列,由图表按索引定位,不用 timeToCoordinate 避免压缩)
+  // 分时价格轴以昨收为中心上下对称(A股标准),autoscaleInfoProvider 从此读取
+  const trendScaleRef = useRef<{ priceMin: number; priceMax: number; pctMin: number; pctMax: number } | null>(null);
   const emaSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const bollSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const openEatFishSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
@@ -1891,11 +1920,12 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const lastData = safeData[safeData.length - 1];
   const displayData = hoverData || lastData;
   const displayTime = displayData?.time ? parseTime(displayData.time) : null;
+  const bingGeTActive = mainChartTemplate === 'bingGeT' && period === '1m';
   const tradingSignals = useMemo(
     () => (isTrendLinePeriod
-      ? calculateIntradayTradingSignals(safeData, preClose, dayKData)
+      ? calculateIntradayTradingSignals(safeData, preClose, dayKData, bingGeTActive)
       : calculateTradingSignals(safeData)),
-    [isTrendLinePeriod, safeData, preClose, dayKData],
+    [isTrendLinePeriod, safeData, preClose, dayKData, bingGeTActive],
   );
   const latestTradingSignal = useMemo(() => getLatestTradingSignal(tradingSignals), [tradingSignals]);
   const openEatFishMainSeries = useMemo(
@@ -1915,7 +1945,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   }, [fundFlowState.source, fundFlowState.points.length, klineFundFlowPoints.length]);
 
   const chartColors = useMemo(() => ({
-    background: colors.isDark ? '#0f172a' : '#ffffff',
+    background: colors.isDark ? '#000000' : '#ffffff',
     textColor: colors.isDark ? '#94a3b8' : '#64748b',
     gridColor: colors.isDark ? '#1e293b' : '#e2e8f0',
     upColor: cc.upColor,
@@ -2006,7 +2036,8 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     if (type === 'volume') {
       return [{
         label: 'VOL',
-        value: formatCompactVolume(displayData?.volume),
+        // 日K成交量确认为"手"(archive/行情源一致);分时(1m/5d)各数据源单位不一(腾讯股/TDX手),未确认前不标手
+        value: displayData?.volume != null ? `${formatCompactVolume(displayData.volume)}${isTrendLinePeriod ? '' : '手'}` : '--',
         color: displayData && displayData.close >= displayData.open ? chartColors.upColor : chartColors.downColor,
       }];
     }
@@ -2199,7 +2230,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         const res: any = await GetStockIntraday(stock.symbol, auctionDateKey);
         if (!cancelled) {
           const list = (res && res.auction) || [];
-          setAuctionTicks(list.map((t: any) => ({ time: String(t.time), price: Number(t.price), volume: Number(t.volume) || 0 })));
+          setAuctionTicks(list.map((t: any) => ({ time: String(t.time), price: Number(t.price), volume: Number(t.volume) || 0, b1: Number(t.b1) || 0, s1: Number(t.s1) || 0 })));
         }
       } catch {
         if (!cancelled) setAuctionTicks([]);
@@ -2246,6 +2277,15 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       mainSeriesRef.current = null;
     }
     clearSeriesArray(chart, maSeriesRefs);
+    clearSeriesArray(chart, tLevelSeriesRefs);
+    if (pctAxisSeriesRef.current) {
+      try { chart.removeSeries(pctAxisSeriesRef.current); } catch { /* already removed */ }
+      pctAxisSeriesRef.current = null;
+    }
+    if (auctionLineSeriesRef.current) {
+      try { chart.removeSeries(auctionLineSeriesRef.current); } catch { /* already removed */ }
+      auctionLineSeriesRef.current = null;
+    }
     clearSeriesArray(chart, emaSeriesRefs);
     clearSeriesArray(chart, bollSeriesRefs);
     clearSeriesArray(chart, openEatFishSeriesRefs);
@@ -2278,7 +2318,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
 
     const chart = createChart(chartContainerRef.current, {
       layout: {
-        background: { color: '#0f172a' },
+        background: { color: '#000000' },
         textColor: '#94a3b8',
         attributionLogo: false,
         fontFamily: CHART_FONT_FAMILY,
@@ -2298,7 +2338,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
 
     const volumeChart = createChart(volumeContainerRef.current, {
       layout: {
-        background: { color: '#0f172a' },
+        background: { color: '#000000' },
         textColor: '#94a3b8',
         attributionLogo: false,
         fontFamily: CHART_FONT_FAMILY,
@@ -2406,16 +2446,16 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       });
     }
 
-    // 更新成交量柱颜色（仅副图为成交量时）
+    // 更新成交量柱颜色（仅副图为成交量时）;分时按当分钟收 vs 上一分钟收上色
     if (volumeSeriesRef.current && subChartTypeRef.current === 'volume' && safeData.length > 0) {
-      const volData: HistogramData[] = safeData.map(d => ({
+      const volData: HistogramData[] = safeData.map((d, i) => ({
         time: parseTime(d.time),
         value: d.volume,
-        color: d.close >= d.open ? chartColors.upColor + '99' : chartColors.downColor + '99',
+        color: volBarUp(safeData, i, isTrendLinePeriod) ? chartColors.upColor + '99' : chartColors.downColor + '99',
       }));
       volumeSeriesRef.current.setData(volData);
     }
-  }, [chartColors, mainChartTemplate, safeData]);
+  }, [chartColors, mainChartTemplate, safeData, isTrendLinePeriod]);
 
   useEffect(() => {
     const canvas = mainOverlayCanvasRef.current;
@@ -2677,43 +2717,137 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       if (pts.length < 2) return;
 
       const xRight = pts[pts.length - 1].x + 2;
-      // 价格区裁剪(排除右侧价格刻度带),竞价台阶极端价超出上下边界时被裁而非画出界
+      // 竞价带左边缘=第一根竞价点(9:15)的 x,即绘图区左边界(左侧价格轴之后)。
+      // 价格轴移到左侧后,背景框不能再从 x=0 起(会盖住左侧价格刻度),须从竞价段左边缘起。
+      const xLeft = Math.max(0, pts[0].x);
+      // 裁剪到绘图区(左:竞价左边缘之后,右:排除右侧刻度带),竞价台阶极端价超界时被裁不出界
       ctx.save();
       ctx.beginPath();
-      ctx.rect(0, 0, Math.max(0, width - PRICE_SCALE_MIN_WIDTH), height);
+      ctx.rect(xLeft, 0, Math.max(0, (width - PRICE_SCALE_MIN_WIDTH) - xLeft), height);
       ctx.clip();
 
-      // 深灰背景框 + 右侧分隔竖线
+      // 深色背景框 + 左右分隔竖线,把竞价窗明显框起来(独立于连续竞价段,A股竞价窗样式)
+      ctx.fillStyle = 'rgba(2,6,23,0.55)';
+      ctx.fillRect(xLeft, 0, Math.max(0, xRight - xLeft), height);
+      ctx.strokeStyle = 'rgba(148,163,184,0.6)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(Math.round(xLeft) + 0.5, 0);
+      ctx.lineTo(Math.round(xLeft) + 0.5, height);
+      ctx.moveTo(Math.round(xRight) + 0.5, 0);
+      ctx.lineTo(Math.round(xRight) + 0.5, height);
+      ctx.stroke();
+      // 白色竞价价线即主线的竞价段;此处只画深色框 + 左右分隔线。
+      ctx.restore();
+    };
+    const scheduleDraw = () => { window.cancelAnimationFrame(frame); frame = window.requestAnimationFrame(draw); };
+    scheduleDraw();
+    // 多次延迟重画:图表把合并后的竞价数据渲染进 timeScale 需要时间,一次画可能拿不到坐标
+    const timeouts = [80, 200, 450, 900].map(ms => window.setTimeout(scheduleDraw, ms));
+    timeScale.subscribeVisibleLogicalRangeChange(scheduleDraw);
+    const ro = new ResizeObserver(scheduleDraw);
+    ro.observe(container);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      timeouts.forEach(t => window.clearTimeout(t));
+      timeScale.unsubscribeVisibleLogicalRangeChange(scheduleDraw);
+      ro.disconnect();
+    };
+  }, [showAuction, period, sampledAuction, safeData, chartColors, chartViewport.width, chartViewport.height]);
+
+  // 量能图竞价段:画与价格图一致的深色带 + 右侧分隔竖线(把竞价量能区上下框起来,匹配量柱在框内)。
+  useEffect(() => {
+    const canvas = auctionVolCanvasRef.current;
+    const container = volumeContainerRef.current;
+    const volumeChart = volumeChartRef.current;
+    const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
+    const active = showAuction && period === '1m' && sampledAuction.length >= 2 && !!datePrefix;
+    if (!canvas || !container || !volumeChart || !active) {
+      if (canvas) { const ctx = canvas.getContext('2d'); ctx?.clearRect(0, 0, canvas.width, canvas.height); }
+      return;
+    }
+    const timeScale = volumeChart.timeScale();
+    let frame = 0;
+    const draw = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width <= 0 || height <= 0) return;
+      const dpr = window.devicePixelRatio || 1;
+      const pw = Math.floor(width * dpr);
+      const ph = Math.floor(height * dpr);
+      if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph; }
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const xFirst = timeScale.timeToCoordinate(parseTime(`${datePrefix} ${sampledAuction[0].time}`));
+      const xLast = timeScale.timeToCoordinate(parseTime(`${datePrefix} ${sampledAuction[sampledAuction.length - 1].time}`));
+      if (typeof xFirst !== 'number' || typeof xLast !== 'number' || !Number.isFinite(xFirst) || !Number.isFinite(xLast)) return;
+      const xLeft = Math.max(0, xFirst as number);
+      const xRight = (xLast as number) + 2;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(xLeft, 0, Math.max(0, (width - PRICE_SCALE_MIN_WIDTH) - xLeft), height);
+      ctx.clip();
       ctx.fillStyle = 'rgba(30,41,59,0.4)';
-      ctx.fillRect(0, 0, Math.max(0, xRight), height);
+      ctx.fillRect(xLeft, 0, Math.max(0, xRight - xLeft), height);
+
+      // 竞价量能双结构:下方匹配量正立(从底往上)、上方未匹配量倒挂(从顶往下),中间零轴线。
+      // 匹配量=累积成交量(auction_ticks volume);未匹配量=|b1-s1|,买多红/卖多绿(自选/持仓股才有,仅临撮合时刻)。
+      const xs = sampledAuction.map(t => timeScale.timeToCoordinate(parseTime(`${datePrefix} ${t.time}`)))
+        .map(x => (typeof x === 'number' && Number.isFinite(x)) ? (x as number) : null);
+      let maxMatched = 0, maxUnmatched = 0;
+      for (const t of sampledAuction) {
+        maxMatched = Math.max(maxMatched, t.volume);
+        maxUnmatched = Math.max(maxUnmatched, Math.abs((t.b1 || 0) - (t.s1 || 0)));
+      }
+      const centerY = height * 0.5;
+      const barW = Math.max(1, Math.min(6, (xRight - xLeft) / Math.max(1, sampledAuction.length) * 0.7));
+      // 中间零轴线
+      ctx.strokeStyle = 'rgba(148,163,184,0.35)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(xLeft, Math.round(centerY) + 0.5);
+      ctx.lineTo(xRight, Math.round(centerY) + 0.5);
+      ctx.stroke();
+      for (let i = 0; i < sampledAuction.length; i++) {
+        const x = xs[i];
+        if (x == null) continue;
+        const t = sampledAuction[i];
+        // 下方匹配量(正立):从中轴往下,红/绿按价格 vs 昨收
+        if (maxMatched > 0 && t.volume > 0) {
+          const h = (t.volume / maxMatched) * (height - centerY - 2);
+          ctx.fillStyle = (preClose > 0 && t.price < preClose ? chartColors.downColor : chartColors.upColor) + 'cc';
+          ctx.fillRect(Math.round(x - barW / 2), centerY, Math.max(1, barW), h);
+        }
+        // 上方未匹配量(倒挂):从中轴往上,买多红/卖多绿
+        const unm = Math.abs((t.b1 || 0) - (t.s1 || 0));
+        if (maxUnmatched > 0 && unm > 0) {
+          const h = (unm / maxUnmatched) * (centerY - 2);
+          ctx.fillStyle = ((t.b1 || 0) >= (t.s1 || 0) ? '#ef4444' : '#22c55e') + 'cc';
+          ctx.fillRect(Math.round(x - barW / 2), centerY - h, Math.max(1, barW), h);
+        }
+      }
+
       ctx.strokeStyle = 'rgba(148,163,184,0.45)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(Math.round(xRight) + 0.5, 0);
       ctx.lineTo(Math.round(xRight) + 0.5, height);
       ctx.stroke();
-
-      // 台阶价折线(白色):先水平到当前 x(用前一点 y),再垂直到当前 y —— 通达信竞价台阶
-      ctx.strokeStyle = '#e2e8f0';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (let i = 1; i < pts.length; i++) {
-        ctx.lineTo(pts[i].x, pts[i - 1].y);
-        ctx.lineTo(pts[i].x, pts[i].y);
-      }
-      ctx.stroke();
       ctx.restore();
     };
     const scheduleDraw = () => { window.cancelAnimationFrame(frame); frame = window.requestAnimationFrame(draw); };
     scheduleDraw();
-    const timeout = window.setTimeout(scheduleDraw, 120);
+    const timeouts = [80, 200, 450, 900].map(ms => window.setTimeout(scheduleDraw, ms));
     timeScale.subscribeVisibleLogicalRangeChange(scheduleDraw);
     const ro = new ResizeObserver(scheduleDraw);
     ro.observe(container);
     return () => {
       window.cancelAnimationFrame(frame);
-      window.clearTimeout(timeout);
+      timeouts.forEach(t => window.clearTimeout(t));
       timeScale.unsubscribeVisibleLogicalRangeChange(scheduleDraw);
       ro.disconnect();
     };
@@ -3351,23 +3485,243 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     };
   }, [hasData, gridMode, volumeHeight, gridSubHeight, subChartType, subType2, subType3, vipOverlayRevision]);
 
+  // ===== 模拟盘买卖点:当前股票的模拟持仓建/平仓,标到日K(按日期)与分时(按分钟)上 =====
+  const [paperTrades, setPaperTrades] = useState<PaperPosition[]>([]);
+  useEffect(() => {
+    const sym = (stock?.symbol || '').toLowerCase();
+    if (!sym) { setPaperTrades([]); return; }
+    let alive = true;
+    listPaperPositions()
+      .then(list => { if (alive) setPaperTrades((list || []).filter(p => (p.symbol || '').toLowerCase() === sym)); })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, [stock?.symbol]);
+
+  // 买卖点解析:对齐到K线柱(分时按分钟/日K按日期),锚定柱高低价供 overlay 画带框标签
+  const paperMarks = useMemo<{ time: Time; side: 'buy' | 'sell'; text: string; anchorLow: number; anchorHigh: number }[]>(() => {
+    if (!paperTrades.length || !safeData.length) return [];
+    if (!isTrendLinePeriod && period !== '1d') return []; // 周/月K桶对不上具体日期,不标
+    const byMinute = new Map<string, KLineData>();
+    const byDate = new Map<string, KLineData>();
+    for (const item of safeData) {
+      const key = chartTimeToSearchKey(parseTime(item.time));
+      if (!byMinute.has(key.slice(0, 16))) byMinute.set(key.slice(0, 16), item);
+      if (!byDate.has(key.slice(0, 10))) byDate.set(key.slice(0, 10), item);
+    }
+    // 分时按精确时刻对齐到分钟(旧数据无时刻→分时不标);日K按日期。
+    const locate = (dateStr?: string, tsStr?: string): KLineData | undefined => (
+      isTrendLinePeriod
+        ? (tsStr ? byMinute.get(tsStr.replace('T', ' ').slice(0, 16)) : undefined)
+        : (dateStr ? byDate.get(dateStr.slice(0, 10)) : undefined)
+    );
+    const out: { time: Time; side: 'buy' | 'sell'; text: string; anchorLow: number; anchorHigh: number }[] = [];
+    for (const p of paperTrades) {
+      const bk = locate(p.openDate, p.openedAt);
+      if (bk) {
+        out.push({ time: parseTime(bk.time), side: 'buy', text: `买(模)${(p.costPrice || 0).toFixed(2)}`, anchorLow: bk.low, anchorHigh: bk.high });
+      }
+      if (p.status === 'closed' && p.closePrice) {
+        const sk = locate(p.closeDate, p.closedAt);
+        if (sk) {
+          out.push({ time: parseTime(sk.time), side: 'sell', text: `卖(模)${(p.closePrice || 0).toFixed(2)}`, anchorLow: sk.low, anchorHigh: sk.high });
+        }
+      }
+    }
+    return out;
+  }, [paperTrades, safeData, isTrendLinePeriod, period]);
+
+  // 箭头走 markers(自动叠放);文字标签由 overlay 自绘(黄框+深底,避开其他信号文字)
+  const paperMarkerData = useMemo<SeriesMarker<Time>[]>(() => (
+    paperMarks.map(m => (
+      m.side === 'buy'
+        ? { time: m.time, position: 'belowBar' as const, shape: 'arrowUp' as const, color: '#ff5252', size: 1.2 }
+        : { time: m.time, position: 'aboveBar' as const, shape: 'arrowDown' as const, color: '#69f0ae', size: 1.2 }
+    ))
+  ), [paperMarks]);
+
+  // 自绘 买(模)/卖(模) 标签:黄描边+深底圆角框。买标在柱下方远端、卖在柱上方远端,
+  // 与 markers 原生信号文字(贴着箭头)错开;标签间碰撞时自动竖向叠放避让。
+  useEffect(() => {
+    const canvas = paperOverlayCanvasRef.current;
+    const container = chartContainerRef.current;
+    const chart = chartRef.current;
+    const series = mainSeriesRef.current;
+    if (!canvas || !container || !chart || !series || paperMarks.length === 0) {
+      if (canvas) { const ctx = canvas.getContext('2d'); ctx?.clearRect(0, 0, canvas.width, canvas.height); }
+      return;
+    }
+    const timeScale = chart.timeScale();
+    let frame = 0;
+    const draw = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width <= 0 || height <= 0) return;
+      const dpr = window.devicePixelRatio || 1;
+      const pixelWidth = Math.floor(width * dpr);
+      const pixelHeight = Math.floor(height * dpr);
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+      }
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, Math.max(0, width - PRICE_SCALE_MIN_WIDTH), height);
+      ctx.clip();
+      ctx.font = 'bold 12px "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.textBaseline = 'middle';
+      const placed: { x0: number; x1: number; y0: number; y1: number }[] = [];
+      for (const m of paperMarks) {
+        const xr = timeScale.timeToCoordinate(m.time);
+        const x = typeof xr === 'number' ? Number(xr) : NaN;
+        if (!Number.isFinite(x) || x < -40 || x > width + 40) continue;
+        const anchor = series.priceToCoordinate(m.side === 'buy' ? m.anchorLow : m.anchorHigh);
+        if (typeof anchor !== 'number' || !Number.isFinite(anchor)) continue;
+        const tw = ctx.measureText(m.text).width;
+        const boxW = tw + 14;
+        const boxH = 20;
+        // 分时/5日图无原生信号文字,标签紧贴箭头(箭头高约10px+4px间隙);
+        // 日K维持44px越过箭头+信号文字区(2026-07-23 用户要标签跟箭头放一起)
+        const off = isTrendLinePeriod ? 14 : 44;
+        let by = m.side === 'buy' ? anchor + off : anchor - off - boxH;
+        let bx = Math.min(Math.max(x - boxW / 2, 2), Math.max(2, width - PRICE_SCALE_MIN_WIDTH - boxW - 2));
+        by = Math.min(Math.max(by, 2), height - boxH - 2);
+        for (let tries = 0; tries < 4; tries++) {
+          const hit = placed.some(r => bx < r.x1 && bx + boxW > r.x0 && by < r.y1 && by + boxH > r.y0);
+          if (!hit) break;
+          by = Math.min(Math.max(by + (m.side === 'buy' ? 1 : -1) * (boxH + 4), 2), height - boxH - 2);
+        }
+        placed.push({ x0: bx, x1: bx + boxW, y0: by, y1: by + boxH });
+        const r = 4;
+        ctx.beginPath();
+        ctx.moveTo(bx + r, by);
+        ctx.arcTo(bx + boxW, by, bx + boxW, by + boxH, r);
+        ctx.arcTo(bx + boxW, by + boxH, bx, by + boxH, r);
+        ctx.arcTo(bx, by + boxH, bx, by, r);
+        ctx.arcTo(bx, by, bx + boxW, by, r);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(10,12,18,0.88)';
+        ctx.fill();
+        ctx.strokeStyle = '#fbbf24';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.fillStyle = m.side === 'buy' ? '#ff6b6b' : '#69f0ae';
+        ctx.fillText(m.text, bx + 7, by + boxH / 2 + 0.5);
+      }
+      ctx.restore();
+    };
+    const scheduleDraw = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(draw);
+    };
+    scheduleDraw();
+    const timeout = window.setTimeout(scheduleDraw, 120);
+    chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleDraw);
+    const resizeObserver = new ResizeObserver(scheduleDraw);
+    resizeObserver.observe(container);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(scheduleDraw);
+      resizeObserver.disconnect();
+    };
+  }, [paperMarks, safeData, isTrendLinePeriod, chartViewport.width, chartViewport.height]);
+
+  // 5日图·日分界虚线:5个交易日连成一条分时线,日与日之间画深色竖直虚线便于分辨(2026-07-23 用户要)。
+  useEffect(() => {
+    const canvas = daySepCanvasRef.current;
+    const container = chartContainerRef.current;
+    const chart = chartRef.current;
+    if (!canvas || !container || !chart || period !== '5d' || safeData.length === 0) {
+      if (canvas) { const ctx = canvas.getContext('2d'); ctx?.clearRect(0, 0, canvas.width, canvas.height); }
+      return;
+    }
+    // 用「逻辑索引」定位而非时间戳:分时/5日轴对时间做过连续化处理,真实时间换算会整体偏移
+    // (2026-07-23 实测虚线整体左漂~64根)。i-0.5 = 前一日末根与新日首根的正中缝。
+    const boundaries: number[] = [];
+    let prevDay = '';
+    for (let i = 0; i < safeData.length; i++) {
+      const day = (safeData[i].time || '').slice(0, 10);
+      if (prevDay && day && day !== prevDay) boundaries.push(i - 0.5);
+      prevDay = day;
+    }
+    const timeScale = chart.timeScale();
+    let frame = 0;
+    const draw = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width <= 0 || height <= 0) return;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      if (boundaries.length === 0) return;
+      ctx.setLineDash([5, 5]);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = colors.isDark ? 'rgba(140,140,140,0.6)' : 'rgba(110,110,110,0.5)';
+      const bottom = height - 24; // 让开底部时间轴
+      for (const t of boundaries) {
+        const x = timeScale.logicalToCoordinate(t as never);
+        if (x === null) continue;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(x) + 0.5, 0);
+        ctx.lineTo(Math.round(x) + 0.5, bottom);
+        ctx.stroke();
+      }
+    };
+    const scheduleDraw = () => { window.cancelAnimationFrame(frame); frame = window.requestAnimationFrame(draw); };
+    scheduleDraw();
+    timeScale.subscribeVisibleLogicalRangeChange(scheduleDraw);
+    const daySepResize = new ResizeObserver(scheduleDraw);
+    daySepResize.observe(container);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      timeScale.unsubscribeVisibleLogicalRangeChange(scheduleDraw);
+      daySepResize.disconnect();
+    };
+  }, [period, safeData, colors.isDark, chartViewport.width, chartViewport.height]);
+
   const compactMarkerSignals = useMemo(
     () => compactSignalsForMarkers(tradingSignals, isTrendLinePeriod),
     [tradingSignals, isTrendLinePeriod],
   );
 
-  const signalMarkerData = useMemo<SeriesMarker<Time>[]>(() => (
-    SHOW_MAIN_TRADING_MARKERS ? (
-    compactMarkerSignals.map(signal => ({
-      time: signal.time,
-      position: signal.action === 'buy' ? 'belowBar' : 'aboveBar',
-      shape: signal.action === 'buy' ? 'arrowUp' : 'arrowDown',
-      color: signal.action === 'buy' ? '#f97316' : '#22c55e',
-      text: markerTextForSignal(signal, isTrendLinePeriod),
-      size: isTrendLinePeriod ? 0.75 : 0.9,
-    }))
-    ) : []
-  ), [compactMarkerSignals, isTrendLinePeriod]);
+  const signalMarkerData = useMemo<SeriesMarker<Time>[]>(() => {
+    // 默认主图交易标记全局关闭(SHOW_MAIN_TRADING_MARKERS=false);但"兵哥做T"模板下,
+    // 它自己的 T买/T卖/涨/加 信号必须显示——这才是选这个模板的目的。
+    const isBingGeTSignal = (s: TradingSignal) => s.title.startsWith('兵哥T') || s.title === '起涨' || s.title === '加仓';
+    const source = SHOW_MAIN_TRADING_MARKERS
+      ? compactMarkerSignals
+      : (bingGeTActive ? compactMarkerSignals.filter(isBingGeTSignal) : []);
+    return source.map(signal => {
+      // 兵哥做T:红钻买(T买/涨/加)、绿钻卖(T卖);markers 无菱形,用方块近似
+      const isBingGeT = isBingGeTSignal(signal);
+      return {
+        time: signal.time,
+        position: signal.action === 'buy' ? 'belowBar' as const : 'aboveBar' as const,
+        shape: isBingGeT ? 'square' as const : (signal.action === 'buy' ? 'arrowUp' as const : 'arrowDown' as const),
+        color: signal.action === 'buy' ? (isBingGeT ? '#ef4444' : '#f97316') : '#22c55e',
+        text: markerTextForSignal(signal, isTrendLinePeriod),
+        size: isTrendLinePeriod ? 0.9 : 0.9,
+      };
+    });
+  }, [compactMarkerSignals, isTrendLinePeriod, bingGeTActive]);
+
+  // 主图标记 = 策略信号 + 模拟盘买卖点(setMarkers 要求按时间升序)
+  const allMarkerData = useMemo<SeriesMarker<Time>[]>(() => {
+    if (!paperMarkerData.length) return signalMarkerData;
+    return [...signalMarkerData, ...paperMarkerData].sort((a, b) => timeToMs(a.time) - timeToMs(b.time));
+  }, [signalMarkerData, paperMarkerData]);
 
   // ========== 周期变化：更新 timeScale 选项 + 交互模式 ==========
   useEffect(() => {
@@ -3375,23 +3729,35 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     const volumeChart = volumeChartRef.current;
     if (!chart || !volumeChart) return;
 
-    // 左键拖拽改作"框选区间"，平移导航交给滚轮，故关闭 pressedMouseMove
+    // 普通左键拖动=平移(pressedMouseMove);区间统计改由 Shift+左键拖触发,两者不冲突
     const noDragPan = isTrendLinePeriod
       ? false
-      : { mouseWheel: true, pressedMouseMove: false, horzTouchDrag: true, vertTouchDrag: true };
+      : { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true };
     chart.applyOptions({
       timeScale: { timeVisible: isTrendLinePeriod, secondsVisible: false },
+      // 分时/5日显示左侧价格轴(A股分时:价格在左);两侧刻度栏等宽,便于与量能图对齐
+      leftPriceScale: {
+        visible: isTrendLinePeriod,
+        borderColor: chartColors.gridColor,
+        scaleMargins: { top: 0.15, bottom: 0.15 },
+        minimumWidth: PRICE_SCALE_MIN_WIDTH,
+      },
       rightPriceScale: { minimumWidth: PRICE_SCALE_MIN_WIDTH },
       handleScroll: noDragPan,
       handleScale: !isTrendLinePeriod,
     });
     volumeChart.applyOptions({
-      timeScale: { timeVisible: isTrendLinePeriod, secondsVisible: false },
+      // 分时:价格图时间轴隐藏,只在底部量能图显示一条共享时间轴(A股分时:两块共用一条时间轴)
+      timeScale: { visible: true, timeVisible: isTrendLinePeriod, secondsVisible: false },
+      // 量能图左右刻度栏与价格图等宽,保证两块的绘图区左右边界对齐、竖直方向严格对齐
+      leftPriceScale: { visible: isTrendLinePeriod, minimumWidth: PRICE_SCALE_MIN_WIDTH, borderColor: chartColors.gridColor },
       rightPriceScale: { minimumWidth: PRICE_SCALE_MIN_WIDTH },
       handleScroll: noDragPan,
       handleScale: !isTrendLinePeriod,
     });
-  }, [isTrendLinePeriod]);
+    // 分时下隐藏价格图自身的时间轴(顶部),避免与底部量能图的时间轴重复且不对齐
+    chart.timeScale().applyOptions({ visible: !isTrendLinePeriod });
+  }, [isTrendLinePeriod, chartColors.gridColor]);
 
   // 切换周期时重置 fit 状态，避免沿用旧 X 轴可视范围
   useEffect(() => {
@@ -3492,21 +3858,21 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     }
     if (type === 'volume') {
       const s = vc.addSeries(HistogramSeries, { priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false }, paneIndex);
-      const volData = chartData.map(d => ({
+      // 量柱上色:分时按"当分钟收 vs 上一分钟收"(A股约定:涨红跌绿;分时逐分钟 open 常缺失,不能用 close vs open);
+      // K线按当根 涨/跌。
+      const volData = chartData.map((d, i) => ({
         time: parseTime(d.time), value: d.volume,
-        color: d.close >= d.open ? chartColors.upColor + '99' : chartColors.downColor + '99',
+        color: volBarUp(chartData, i, isTrendLinePeriod) ? chartColors.upColor + '99' : chartColors.downColor + '99',
       })) as HistogramData[];
-      // 分时+竞价开关开:量图前拼竞价匹配量柱(与主图竞价段同点位,保证上下两图时间轴对齐)
+      // 分时+竞价开关开:前拼竞价 whitespace 占位(只占时间轴位,不画柱;竞价量柱的上下双结构由
+      // auctionVolCanvas 覆盖层画:下方匹配量正立、上方未匹配量倒挂),保证与主图竞价段时间轴对齐。
       if (showAuction && period === '1m' && sampledAuction.length >= 2) {
         const datePrefix = String(chartData[0]?.time || '').slice(0, 10);
         if (datePrefix) {
-          const preClosePrice = preClose;
-          const auctionBars = sampledAuction.map(t => ({
-            time: parseTime(`${datePrefix} ${t.time}`),
-            value: t.volume,
-            color: (preClosePrice > 0 && t.price < preClosePrice ? chartColors.downColor : chartColors.upColor) + '66',
-          })) as HistogramData[];
-          s.setData([...auctionBars, ...volData]);
+          // 竞价段占位用 0 值透明柱(不用 whitespace:fitContent 会把开头 whitespace 当无数据排除→压缩);
+          // 竞价量柱的上下双结构由 auctionVolCanvas 覆盖层画。
+          const auctionWs = sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: 0, color: 'rgba(0,0,0,0)' })) as HistogramData[];
+          s.setData([...auctionWs, ...volData]);
           return [s];
         }
       }
@@ -3707,25 +4073,72 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     // ---------- 走势图（分时 / 5日） ----------
     if (isTrendLinePeriod) {
       if (!mainSeriesRef.current) {
-        // 首次创建 series
+        // 首次创建 series。分时线用白色(A股行情软件标准分时线),均价线黄色。
+        // autoscaleInfoProvider:价格轴强制以昨收为中心上下对称(A股分时标准),昨收=0轴居中。
         const lineSeries = chart.addSeries(LineSeries, {
-          color: '#38bdf8', lineWidth: 2, priceLineVisible: false, lastValueVisible: true,
+          priceScaleId: 'left', // A股分时:价格在左轴
+          color: '#ffffff', lineWidth: 1, priceLineVisible: false, lastValueVisible: true,
+          autoscaleInfoProvider: (base: () => any) => {
+            const r = trendScaleRef.current;
+            if (r) return { priceRange: { minValue: r.priceMin, maxValue: r.priceMax } };
+            return base();
+          },
         });
         mainSeriesRef.current = lineSeries;
         seriesTypeRef.current = 'line';
 
         if (preClose > 0) {
+          // 昨收基准线:红色(A股分时 0.00% 中轴)
           lineSeries.createPriceLine({
-            price: preClose, color: chartColors.priceLineColor,
+            price: preClose, color: '#ef4444',
             lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '昨收',
           });
         }
 
-        // 均价线
+        // 集合竞价白色价线(左价格轴):真序列,竞价时段有值、连续竞价时段留空;由图表按索引稳稳定位在竞价带内
+        const auctionSeries = chart.addSeries(LineSeries, {
+          priceScaleId: 'left',
+          color: '#e2e8f0', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+        });
+        auctionLineSeriesRef.current = auctionSeries;
+
+        // 右轴涨跌幅%(相对昨收):透明承载线,只为右侧刻度显示 ±% —— A股分时:涨跌幅在右轴,同样对称
+        const pctSeries = chart.addSeries(LineSeries, {
+          priceScaleId: 'right',
+          color: 'rgba(0,0,0,0)',
+          lineWidth: 1,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          priceFormat: {
+            type: 'custom',
+            minMove: 0.01,
+            formatter: (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`,
+          },
+          autoscaleInfoProvider: (base: () => any) => {
+            const r = trendScaleRef.current;
+            if (r) return { priceRange: { minValue: r.pctMin, maxValue: r.pctMax } };
+            return base();
+          },
+        });
+        pctAxisSeriesRef.current = pctSeries;
+
+        // 均价线(跟价格轴 → 左轴)
         const avgSeries = chart.addSeries(LineSeries, {
+          priceScaleId: 'left',
           color: '#facc15', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
         });
         maSeriesRefs.current = [avgSeries];
+
+        // 兵哥做T:日内阻力(绿,高低区间7/8)/支撑(紫,0.5/8)运行位点线(跟价格轴 → 左轴)
+        const resistanceSeries = chart.addSeries(LineSeries, {
+          priceScaleId: 'left',
+          color: '#22c55e', lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false,
+        });
+        const supportSeries = chart.addSeries(LineSeries, {
+          priceScaleId: 'left',
+          color: '#e879f9', lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false,
+        });
+        tLevelSeriesRefs.current = [resistanceSeries, supportSeries];
 
         // 成交量
         volumeSeriesRef.current = volumeChart.addSeries(HistogramSeries, {
@@ -3738,21 +4151,72 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       // 更新数据。分时+竞价开启:前拼竞价 whitespace 占位点(只有 time 无 value),让时间轴含 9:15-9:25、
       // 分时线右移空出左侧竞价窗;分时线本身不在竞价段绘制(whitespace),竞价台阶由 overlay canvas 画。
       const datePrefix = String(safeData[0]?.time || '').slice(0, 10);
-      const withAuction = showAuction && period === '1m' && sampledAuction.length >= 2 && datePrefix;
-      const auctionWhitespace = withAuction
-        ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`) } as LineData))
-        : [];
+      const withAuction = showAuction && period === '1m' && sampledAuction.length >= 2 && !!datePrefix;
       const lineData: LineData[] = safeData.map(d => ({ time: parseTime(d.time), value: d.close }));
-      mainSeriesRef.current.setData([...auctionWhitespace, ...lineData]);
-      if (!signalMarkersRef.current) {
-        signalMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, signalMarkerData, { zOrder: 'top' });
+
+      // 价格轴以昨收为中心对称:取全日(含竞价)离昨收最大偏离,上下等距。昨收即 0.00% 居中。
+      if (preClose > 0) {
+        let maxDev = 0;
+        for (const d of safeData) {
+          maxDev = Math.max(maxDev, Math.abs((d.high || d.close) - preClose), Math.abs((d.low || d.close) - preClose));
+        }
+        for (const t of sampledAuction) {
+          maxDev = Math.max(maxDev, Math.abs(t.price - preClose));
+        }
+        if (maxDev <= 0) maxDev = preClose * 0.01;
+        maxDev *= 1.05; // 上下留白
+        trendScaleRef.current = {
+          priceMin: preClose - maxDev,
+          priceMax: preClose + maxDev,
+          pctMin: (-maxDev / preClose) * 100,
+          pctMax: (maxDev / preClose) * 100,
+        };
       } else {
-        signalMarkersRef.current.setMarkers(signalMarkerData);
+        trendScaleRef.current = null;
+      }
+
+      // 竞价价格直接进主线:竞价段 + 连续竞价段是一条连续的真实数据线(全是有值点,无 whitespace),
+      // 这样 fitContent 必然把竞价段均匀铺开在竞价带内,不会被当"无数据"压到可视窗左边留空。
+      const auctionPricePts: LineData[] = withAuction
+        ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: t.price } as LineData))
+        : [];
+      mainSeriesRef.current.setData([...auctionPricePts, ...lineData]);
+      // 独立竞价白线序列不再使用(白线即主线的竞价段),置空
+      if (auctionLineSeriesRef.current) auctionLineSeriesRef.current.setData([]);
+
+      // 左轴涨跌幅%:竞价段也给真实 % 值(与主线同索引),分时段=(收/昨收-1)*100
+      if (pctAxisSeriesRef.current) {
+        if (preClose > 0) {
+          const auctionPct: LineData[] = withAuction
+            ? sampledAuction.map(t => ({ time: parseTime(`${datePrefix} ${t.time}`), value: (t.price / preClose - 1) * 100 } as LineData))
+            : [];
+          const pctData: LineData[] = safeData.map(d => ({ time: parseTime(d.time), value: (d.close / preClose - 1) * 100 }));
+          pctAxisSeriesRef.current.setData([...auctionPct, ...pctData]);
+        } else {
+          pctAxisSeriesRef.current.setData([]);
+        }
+      }
+      if (!signalMarkersRef.current) {
+        signalMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, allMarkerData, { zOrder: 'top' });
+      } else {
+        signalMarkersRef.current.setMarkers(allMarkerData);
       }
 
       if (maSeriesRefs.current.length > 0) {
         const avgData: LineData[] = safeData.filter(d => d.avg).map(d => ({ time: parseTime(d.time), value: d.avg! }));
         maSeriesRefs.current[0].setData(avgData);
+      }
+
+      // 兵哥做T阻力/支撑:仅"兵哥做T"模板选中且分时1m 才画(默认分时不画)
+      if (tLevelSeriesRefs.current.length === 2) {
+        if (mainChartTemplate === 'bingGeT' && period === '1m' && safeData.length >= 30) {
+          const { support, resistance } = bingGeTLevels(safeData, preClose);
+          tLevelSeriesRefs.current[0].setData(safeData.map((d, i) => ({ time: parseTime(d.time), value: resistance[i] })) as LineData[]);
+          tLevelSeriesRefs.current[1].setData(safeData.map((d, i) => ({ time: parseTime(d.time), value: support[i] })) as LineData[]);
+        } else {
+          tLevelSeriesRefs.current[0].setData([]);
+          tLevelSeriesRefs.current[1].setData([]);
+        }
       }
     }
     // ---------- K线图 ----------
@@ -3795,9 +4259,9 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       });
       mainSeriesRef.current.setData(candleData);
       if (!signalMarkersRef.current) {
-        signalMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, signalMarkerData, { zOrder: 'top' });
+        signalMarkersRef.current = createSeriesMarkers(mainSeriesRef.current, allMarkerData, { zOrder: 'top' });
       } else {
-        signalMarkersRef.current.setMarkers(signalMarkerData);
+        signalMarkersRef.current.setMarkers(allMarkerData);
       }
 
       // --- MA 均线（配置驱动） ---
@@ -3971,7 +4435,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       }
       hasFittedRef.current = true;
     }
-  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, signalMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, sampledAuction, showAuction]);
+  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, allMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, sampledAuction, showAuction]);
 
   // 副图指标独立于主图叠加开关，用户可自由切换 VOL/MACD/KDJ/RSI/CCI/WR（不再随设置回退）
 
@@ -4095,7 +4559,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     const getY = (clientY: number) => clientY - rect().top;
 
     const down = (e: MouseEvent) => {
-      if (e.button !== 0 || isTrendLinePeriodRef.current) return;
+      // 只有按住 Shift 的左键拖动才进入区间统计;普通左键拖动放行给图表平移
+      if (e.button !== 0 || isTrendLinePeriodRef.current || !e.shiftKey) return;
+      // 拦住事件,别让图表把这次 Shift 拖动当成平移
+      e.stopPropagation();
+      e.preventDefault();
       armed = true;
       draggingRef.current = false;
       startX = getX(e.clientX);
@@ -4277,6 +4745,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     const amplitude = baseClose > 0 ? ((hoverData.high - hoverData.low) / baseClose) * 100 : 0;
     const amount = hoverData.amount ?? hoverData.close * (hoverData.volume || 0) * 100;
     const turnover = getOptionalKLineNumber(hoverData, ['turnoverRate', 'turnover', 'turnover_rate']);
+    // 当日未收盘那根的换手率是"开盘至此刻累计",历史根是"全天"——口径同(量/流通股本)但时间不同。
+    // 不标注的话:早盘看到 0.5% 会被当成极度缩量,而收盘后同一根可能是 5%。
+    const isLiveBar = safeData.length > 0
+      && hoverData.time === safeData[safeData.length - 1].time
+      && hoverData.time.slice(0, 10) === new Date().toLocaleDateString('sv-SE');
     const width = 118;
     const height = 214;
     const chart = chartRef.current;
@@ -4304,8 +4777,8 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         { label: '最高', value: hoverData.high.toFixed(2) },
         { label: '最低', value: hoverData.low.toFixed(2) },
         { label: '收盘', value: hoverData.close.toFixed(2) },
-        { label: '总量', value: formatHoverVolume(hoverData.volume) },
-        { label: '换手', value: turnover != null ? `${turnover.toFixed(2)}%` : '--' },
+        { label: '总量', value: hoverData.volume != null ? `${formatHoverVolume(hoverData.volume)}${isTrendLinePeriod ? '' : '手'}` : '--' },
+        { label: '换手', value: turnover != null ? `${turnover.toFixed(2)}%${isLiveBar ? '(盘中)' : ''}` : '--' },
         { label: '总额', value: formatHoverAmount(amount) },
         { label: '振幅', value: `${amplitude.toFixed(2)}%` },
         { label: '涨跌', value: formatSignedFixed(change) },
@@ -4513,6 +4986,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
             >
               <option value="standard">主图：标准</option>
               <option value="openEatFish">主图：开仓吃鱼</option>
+              <option value="bingGeT">分时：兵哥做T</option>
               {TDX_MAIN_GROUPS.map(g => (
                 <optgroup key={g.category} label={`通达信·${g.category}`}>
                   {g.items.map(f => (
@@ -4553,11 +5027,11 @@ export const StockChartLW: React.FC<StockChartProps> = ({
               </div>
               <div className={`flex items-center gap-1 text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
                 <MoveHorizontal size={12} />
-                <span>拖拽</span>
+                <span>拖拽=平移</span>
               </div>
               <div className={`flex items-center gap-1 text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
                 <Target size={12} />
-                <span>拖框=区间统计</span>
+                <span>Shift+拖=区间统计</span>
               </div>
               </>
             )}
@@ -4617,6 +5091,16 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         <canvas
           ref={auctionOverlayCanvasRef}
           className={`absolute inset-0 z-10 pointer-events-none ${showAuction && period === '1m' ? 'block' : 'hidden'}`}
+        />
+        {/* 5日图日分界虚线(自绘,深色 dashed) */}
+        <canvas
+          ref={daySepCanvasRef}
+          className={`absolute inset-0 z-[5] pointer-events-none ${period === '5d' ? 'block' : 'hidden'}`}
+        />
+        {/* 模拟盘买(模)/卖(模)标签:黄框深底自绘,偏移避开信号文字 */}
+        <canvas
+          ref={paperOverlayCanvasRef}
+          className={`absolute inset-0 z-10 pointer-events-none ${paperMarks.length > 0 ? 'block' : 'hidden'}`}
         />
         {!isTrendLinePeriod && mainChartTemplate === 'standard' && renderBottomLegend(mainIndicatorLegend, 'bottom-1.5')}
         {!isTrendLinePeriod && typeof mainChartTemplate === 'string' && mainChartTemplate.startsWith('tdx:') && tdxMainHint && (
@@ -4705,7 +5189,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
                 </div>
                 <div className="flex justify-between"><span className="text-slate-500">开盘 / 收盘</span><span>{rangeStats.open.toFixed(2)} / {rangeStats.close.toFixed(2)}</span></div>
                 <div className="flex justify-between"><span className="text-slate-500">最高 / 最低</span><span>{rangeStats.high.toFixed(2)} / {rangeStats.low.toFixed(2)}</span></div>
-                <div className="flex justify-between"><span className="text-slate-500">成交量</span><span>{formatRangeVolume(rangeStats.volume)}</span></div>
+                <div className="flex justify-between"><span className="text-slate-500">成交量</span><span>{formatRangeVolume(rangeStats.volume)}{isTrendLinePeriod ? '' : '手'}</span></div>
                 <div className="flex justify-between"><span className="text-slate-500">成交额</span><span>{formatRangeAmount(rangeStats.amount)}</span></div>
               </div>
             )}
@@ -4894,6 +5378,10 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         <canvas
           ref={vipOverlayCanvasRef}
           className={`absolute inset-0 z-10 pointer-events-none ${showVipOverlayCanvas ? 'block' : 'hidden'}`}
+        />
+        <canvas
+          ref={auctionVolCanvasRef}
+          className={`absolute inset-0 z-[9] pointer-events-none ${showAuction && period === '1m' ? 'block' : 'hidden'}`}
         />
         {!isTrendLinePeriod && hasData && !gridMode && (
           renderSubSelect(subChartType, handleSubChartSwitch)

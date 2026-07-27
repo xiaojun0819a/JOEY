@@ -68,10 +68,10 @@ func HotMoney7Profile() *StrategyTradeProfile {
 		HalfTPPct:        15,
 		TrailAfterHalf:   true,
 		// 补仓全关（回测证伪，见上）
-		AddOnLimitUp:    false,
-		AddOnNewHighVol: false,
-		MaxAdds:         0,
-		TimeStopDays:    8,
+		AddOnLimitUp:         false,
+		AddOnNewHighVol:      false,
+		MaxAdds:              0,
+		TimeStopDays:         8,
 		EntrySkipSealedLimit: false,
 		// 信号日封死涨停买不进 → 账户回测改用"可成交的次日回踩"口径(高开≤3%)，
 		// 显示诚实地板(超额约-48%)而非+89%的不可成交幻觉。真实2:30入场需实盘分时向前验证。

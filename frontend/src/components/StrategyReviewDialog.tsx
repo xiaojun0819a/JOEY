@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, BarChart3, CalendarDays, Loader2, RefreshCw, TrendingUp, X } from 'lucide-react';
 import {
   getStrategyNextDayReview,
@@ -12,6 +12,8 @@ interface StrategyReviewDialogProps {
   strategyId: string;
   strategyName: string;
   signalDate?: string;
+  // 点股票名直接开全屏四窗口(鱼身组合);不传则名字为纯文本
+  onOpenStock?: (symbol: string, name: string, price: number) => void;
 }
 
 const dateOnly = (value?: string): string => {
@@ -50,14 +52,32 @@ const formatSignalScore = (value: number): string => {
   return score > 0 ? `评分 ${score.toFixed(1)}` : '评分暂缺';
 };
 
-const ReviewItemCard: React.FC<{ item: StrategyReviewItem }> = ({ item }) => (
-  <div className="rounded-lg border fin-divider bg-slate-950/20 p-3">
+// 该条目扫描当日是否命中「重点布局」(日K+30分+60分三周期共振,存于触发标签留痕)
+export const isKeyLayoutItem = (item: StrategyReviewItem): boolean =>
+  (item.signalTriggers || []).some(t => t.includes('重点布局'));
+
+const ReviewItemCard: React.FC<{ item: StrategyReviewItem; pending?: boolean; onOpenStock?: (symbol: string, name: string, price: number) => void }> = ({ item, pending, onOpenStock }) => (
+  <div className={`rounded-lg border p-3 ${isKeyLayoutItem(item) ? 'border-red-500/50 bg-red-500/[0.06] ring-1 ring-red-500/25' : 'fin-divider bg-slate-950/20'}`}>
     <div className="flex items-start justify-between gap-3">
       <div className="flex min-w-0 flex-1 flex-col items-start text-left">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-semibold fin-text-primary">{item.name || item.symbol}</span>
+          {onOpenStock ? (
+            <button
+              type="button"
+              onClick={() => onOpenStock(item.symbol, item.name || item.symbol, item.close || item.signalPrice || 0)}
+              className="text-sm font-semibold fin-text-primary hover:text-amber-300 hover:underline underline-offset-2"
+              title="打开全屏四窗口(鱼身组合)"
+            >
+              {item.name || item.symbol}
+            </button>
+          ) : (
+            <span className="text-sm font-semibold fin-text-primary">{item.name || item.symbol}</span>
+          )}
           <span className="font-mono text-[11px] fin-text-tertiary">{item.symbol}</span>
           {item.rank > 0 && <span className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] fin-text-tertiary">#{item.rank}</span>}
+          {isKeyLayoutItem(item) && (
+            <span className="rounded-md border border-red-500/50 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold text-red-300">★ 重点布局</span>
+          )}
         </div>
         <div className="mt-1 w-fit max-w-full text-left text-[11px] fin-text-tertiary">
           入选价 {item.signalPrice?.toFixed?.(2) || '--'} · {formatSignalScore(item.signalScore)} · {item.industry || '行业未知'}
@@ -70,8 +90,17 @@ const ReviewItemCard: React.FC<{ item: StrategyReviewItem }> = ({ item }) => (
         </div>
       </div>
       <div className="shrink-0 text-right">
-        <div className={`text-lg font-bold ${returnClass(item.closeReturnPercent)}`}>{formatPct(item.closeReturnPercent)}</div>
-        <div className="text-[11px] fin-text-tertiary">收盘收益</div>
+        {pending ? (
+          <>
+            <div className="text-lg font-bold text-amber-300">待复盘</div>
+            <div className="text-[11px] fin-text-tertiary">复盘日收盘后生效</div>
+          </>
+        ) : (
+          <>
+            <div className={`text-lg font-bold ${returnClass(item.closeReturnPercent)}`}>{formatPct(item.closeReturnPercent)}</div>
+            <div className="text-[11px] fin-text-tertiary">收盘收益</div>
+          </>
+        )}
       </div>
     </div>
 
@@ -126,6 +155,7 @@ export const StrategyReviewDialog: React.FC<StrategyReviewDialogProps> = ({
   strategyId,
   strategyName,
   signalDate,
+  onOpenStock,
 }) => {
   const [selectedSignalDate, setSelectedSignalDate] = useState(dateOnly(signalDate));
   const [reviewDate, setReviewDate] = useState(todayISO());
@@ -156,6 +186,10 @@ export const StrategyReviewDialog: React.FC<StrategyReviewDialogProps> = ({
         return;
       }
       setResult(res);
+      // 输入框始终回填为后端实际生效的日期:选股日回落(空仓日)/复盘日纠正(周末→次一交易日)后,
+      // 输入框若还停留在用户原选的日期,会和下方卡片"选股日/复盘日"对不上,看着像出错(用户实测抓到)。
+      if (res.signalDate) setSelectedSignalDate(dateOnly(res.signalDate));
+      if (res.reviewDate) setReviewDate(dateOnly(res.reviewDate));
     } catch (err) {
       setError(err instanceof Error ? err.message : '策略复盘失败，请稍后重试');
       setResult(null);
@@ -164,16 +198,36 @@ export const StrategyReviewDialog: React.FC<StrategyReviewDialogProps> = ({
     }
   }, [strategyId, strategyName, selectedSignalDate, reviewDate]);
 
+  // 只在窗口打开时自动复盘一次;之后改选股日/复盘日不自动触发,由用户点「刷新复盘」执行
+  // (loadReview 依赖日期,若放进依赖数组,日期一变就自动跑,用户还没选完就开始复盘)
+  const autoLoadedRef = useRef(false);
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      autoLoadedRef.current = false;
+      return;
+    }
+    if (autoLoadedRef.current) return;
+    autoLoadedRef.current = true;
     void loadReview();
-  }, [isOpen, loadReview]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
+
+  const [keyOnly, setKeyOnly] = useState(false); // 只看重点布局(扫描留痕里带★重点布局标签的)
 
   const sortedItems = useMemo(() => {
-    const rows = [...(result?.items || [])];
-    rows.sort((a, b) => b.closeReturnPercent - a.closeReturnPercent);
+    let rows = [...(result?.items || [])];
+    if (keyOnly) rows = rows.filter(isKeyLayoutItem);
+    // 重点布局置顶,组内按收盘收益降序
+    rows.sort((a, b) => {
+      const ka = isKeyLayoutItem(a) ? 1 : 0;
+      const kb = isKeyLayoutItem(b) ? 1 : 0;
+      if (ka !== kb) return kb - ka;
+      return b.closeReturnPercent - a.closeReturnPercent;
+    });
     return rows;
-  }, [result]);
+  }, [result, keyOnly]);
+
+  const keyCount = useMemo(() => (result?.items || []).filter(isKeyLayoutItem).length, [result]);
 
   if (!isOpen) return null;
 
@@ -181,15 +235,13 @@ export const StrategyReviewDialog: React.FC<StrategyReviewDialogProps> = ({
     <div className="fixed inset-0 z-[95] flex items-center justify-center">
       <div className="absolute inset-0 bg-black/65 backdrop-blur-sm" onClick={onClose} />
       <div className="relative flex h-[820px] max-h-[92vh] w-[1180px] max-w-[96vw] flex-col overflow-hidden rounded-xl border fin-divider fin-panel shadow-2xl">
-        <div className="flex items-center justify-between border-b fin-divider px-5 py-3">
-          <div className="flex items-center gap-2">
-            <BarChart3 className="h-5 w-5 text-amber-300" />
-            <div>
-              <div className="text-sm font-semibold fin-text-primary">{strategyName} · 次日收盘复盘</div>
-              <div className="text-[11px] fin-text-tertiary">回看前一交易日入选理由，盘点今日K线/资金/大盘/消息，并给策略优化建议</div>
-            </div>
+        <div className="flex items-center border-b fin-divider px-5 py-3">
+          <BarChart3 className="h-5 w-5 text-amber-300 shrink-0" />
+          <div className="flex-1 text-center px-2">
+            <div className="text-sm font-semibold fin-text-primary">{strategyName} · 次日收盘复盘</div>
+            <div className="text-[11px] fin-text-tertiary">回看前一交易日入选理由，盘点今日K线/资金/大盘/消息，并给策略优化建议</div>
           </div>
-          <button onClick={onClose} className="rounded-lg p-2 fin-hover" title="关闭">
+          <button onClick={onClose} className="rounded-lg p-2 fin-hover shrink-0" title="关闭">
             <X className="h-4 w-4 fin-text-secondary" />
           </button>
         </div>
@@ -219,6 +271,17 @@ export const StrategyReviewDialog: React.FC<StrategyReviewDialogProps> = ({
             {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
             <span>{loading ? '复盘中...' : '刷新复盘'}</span>
           </button>
+          {keyCount > 0 && (
+            <button
+              onClick={() => setKeyOnly(v => !v)}
+              className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                keyOnly ? 'border-red-500/60 bg-red-500/15 text-red-300' : 'border-red-500/30 text-red-300/70 hover:bg-red-500/10'
+              }`}
+              title="只看扫描当日命中「重点布局」(日K+30分+60分三周期共振)的标的"
+            >
+              ★ 只看重点布局({keyCount}){keyOnly ? ' ✓' : ''}
+            </button>
+          )}
           {result && (
             <div className="ml-auto fin-text-tertiary">
               入选 {result.pickCount} · 有效 {result.reviewedCount} · 胜率 <span className="fin-text-primary">{result.winRate.toFixed(1)}%</span>
@@ -254,21 +317,31 @@ export const StrategyReviewDialog: React.FC<StrategyReviewDialogProps> = ({
                 </div>
                 <div className="rounded-lg border fin-divider bg-slate-950/20 px-3 py-2">
                   <div className="fin-text-tertiary">平均收盘收益</div>
-                  <div className={`mt-1 font-mono text-base font-semibold ${returnClass(result.avgCloseReturn)}`}>{formatPct(result.avgCloseReturn)}</div>
+                  <div className={`mt-1 font-mono text-base font-semibold ${result.reviewPending ? 'text-amber-300' : returnClass(result.avgCloseReturn)}`}>{result.reviewPending ? '待复盘' : formatPct(result.avgCloseReturn)}</div>
                 </div>
                 <div className="rounded-lg border fin-divider bg-slate-950/20 px-3 py-2">
                   <div className="fin-text-tertiary">平均盘中高点</div>
-                  <div className={`mt-1 font-mono text-base font-semibold ${returnClass(result.avgHighReturn)}`}>{formatPct(result.avgHighReturn)}</div>
+                  <div className={`mt-1 font-mono text-base font-semibold ${result.reviewPending ? 'text-amber-300' : returnClass(result.avgHighReturn)}`}>{result.reviewPending ? '待复盘' : formatPct(result.avgHighReturn)}</div>
                 </div>
                 <div className="rounded-lg border fin-divider bg-slate-950/20 px-3 py-2">
                   <div className="fin-text-tertiary">高点≥3%</div>
                   <div className="mt-1 font-mono text-base font-semibold fin-text-primary">{result.hit3Rate.toFixed(1)}%</div>
                 </div>
                 <div className="rounded-lg border fin-divider bg-slate-950/20 px-3 py-2">
-                  <div className="fin-text-tertiary">大盘环境</div>
-                  <div className={result.market?.shChangePercent >= 0 ? 'mt-1 text-rose-300' : 'mt-1 text-emerald-300'}>
-                    上证 {formatPct(result.market?.shChangePercent || 0)}
-                  </div>
+                  <div className="fin-text-tertiary">复盘日大盘</div>
+                  {/* 上证历史值本地取不到(库里只存个股不含指数)→ 显示当日涨跌停家数,
+                      口径与波段闸门判大盘一致;绝不用今天的实时指数冒充复盘日 */}
+                  {result.market?.shChangePercent ? (
+                    <div className={result.market.shChangePercent >= 0 ? 'mt-1 text-rose-300' : 'mt-1 text-emerald-300'}>
+                      上证 {formatPct(result.market.shChangePercent)}
+                    </div>
+                  ) : (
+                    <div className="mt-1 text-xs">
+                      <span className="text-rose-300">涨停 {result.market?.limitUpCount ?? 0}</span>
+                      <span className="fin-text-tertiary"> / </span>
+                      <span className="text-emerald-300">跌停 {result.market?.limitDownCount ?? 0}</span>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -294,7 +367,7 @@ export const StrategyReviewDialog: React.FC<StrategyReviewDialogProps> = ({
               ) : (
                 <div className="space-y-2">
                   {sortedItems.map((item) => (
-                    <ReviewItemCard key={item.symbol} item={item} />
+                    <ReviewItemCard key={item.symbol} item={item} pending={!!result.reviewPending} onOpenStock={onOpenStock} />
                   ))}
                 </div>
               )}

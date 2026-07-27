@@ -3,7 +3,7 @@ import { Stock, MarketIndex, KLineData } from '../types';
 import { searchStocks, StockSearchResult, getKLineData } from '../services/stockService';
 import { getHeldPositions } from '../services/sessionService';
 import {
-  getStockGroups, setStockGroups,
+  getStockGroups, setStockGroups, getWatchlist,
   getStockGroupDefs, addStockGroupDef, renameStockGroupDef, deleteStockGroupDef,
   type StockGroup,
 } from '../services/watchlistService';
@@ -67,6 +67,7 @@ interface StockListProps {
   selectedSymbol: string;
   onSelect: (symbol: string) => void;
   onAddStock: (stock: Stock) => void;
+  onPreviewStock: (stock: Stock) => void; // 只看不加自选(搜索结果点进来走这个)
   onRemoveStock?: (symbol: string) => void;
   marketIndices?: MarketIndex[];
 }
@@ -86,6 +87,7 @@ export const StockList: React.FC<StockListProps> = ({
   selectedSymbol,
   onSelect,
   onAddStock,
+  onPreviewStock,
   onRemoveStock,
   marketIndices
 }) => {
@@ -107,6 +109,24 @@ export const StockList: React.FC<StockListProps> = ({
   const [sparkMode, setSparkMode] = useState<'daily' | 'intraday'>(() => {
     return (localStorage.getItem('watchlistSparkMode') as 'daily' | 'intraday') || 'daily';
   });
+
+  // symbol → 加入自选时刻:直接读自选持久化数据,不依赖父层实时合并后的 Stock 对象(合并可能丢字段)
+  const [watchAddedMap, setWatchAddedMap] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const wl = await getWatchlist();
+        if (!alive) return;
+        const m: Record<string, string> = {};
+        for (const w of wl) { if (w.watchAddedAt) m[w.symbol] = w.watchAddedAt; }
+        setWatchAddedMap(m);
+      } catch { /* ignore */ }
+    };
+    void load();
+    window.addEventListener('watchlist-groups-changed', load);
+    return () => { alive = false; window.removeEventListener('watchlist-groups-changed', load); };
+  }, [stocks.length]);
   const [intradayMap, setIntradayMap] = useState<Record<string, number[]>>({});
   const [activeGroup, setActiveGroup] = useState<GroupFilter>('all');
   const [showGroupMenu, setShowGroupMenu] = useState(false);
@@ -368,31 +388,40 @@ export const StockList: React.FC<StockListProps> = ({
     };
   }, [searchTerm]);
 
-  // 选择搜索结果：已存在则直接打开，不存在才添加。
+  const buildStockFromResult = (result: StockSearchResult): Stock => ({
+    symbol: result.symbol,
+    name: result.name,
+    price: 0,
+    change: 0,
+    changePercent: 0,
+    volume: 0,
+    amount: 0,
+    marketCap: '',
+    sector: result.industry,
+    open: 0,
+    high: 0,
+    low: 0,
+    preClose: 0,
+  });
+
+  // 选择搜索结果：**只打开看，不加自选**。
+  // 原来这里对不在自选的票直接 onAddStock,结果"随手查一只"就永久躺进自选里
+  // (用户实测自选从 52 涨到 67)。浏览不该有副作用——要加自选走行右侧的「+自选」按钮。
   const handleSelectResult = (result: StockSearchResult) => {
     const existing = findWatchedStock(result.symbol);
     if (existing) {
       onSelect(existing.symbol);
-      setSearchTerm('');
-      setShowDropdown(false);
-      return;
+    } else {
+      onPreviewStock(buildStockFromResult(result));
     }
-    const newStock: Stock = {
-      symbol: result.symbol,
-      name: result.name,
-      price: 0,
-      change: 0,
-      changePercent: 0,
-      volume: 0,
-      amount: 0,
-      marketCap: '',
-      sector: result.industry,
-      open: 0,
-      high: 0,
-      low: 0,
-      preClose: 0,
-    };
-    onAddStock(newStock);
+    setSearchTerm('');
+    setShowDropdown(false);
+  };
+
+  // 显式加自选(下拉行右侧按钮),加完顺带打开——这是明确动作,不是浏览副作用。
+  const handleAddResult = (result: StockSearchResult) => {
+    if (findWatchedStock(result.symbol)) return;
+    onAddStock(buildStockFromResult(result));
     setSearchTerm('');
     setShowDropdown(false);
   };
@@ -493,7 +522,7 @@ export const StockList: React.FC<StockListProps> = ({
                     key={result.symbol}
                     onClick={() => handleSelectResult(result)}
                     className={`px-3 py-2 cursor-pointer border-b last:border-b-0 ${colors.isDark ? 'hover:bg-slate-700 border-slate-700' : 'hover:bg-slate-100 border-slate-200'}`}
-                    title={existing ? '已在自选/分组中，点击打开' : '点击添加并打开'}
+                    title={existing ? '已在自选/分组中，点击打开' : '点击只打开查看（不会加进自选）'}
                   >
                     <div className="flex justify-between items-center gap-2">
                       <div className="min-w-0">
@@ -501,10 +530,20 @@ export const StockList: React.FC<StockListProps> = ({
                         <span className="ml-2 font-mono text-accent-2 text-sm">{result.symbol}</span>
                       </div>
                       <div className="shrink-0 flex items-center gap-1">
-                        {existing && (
+                        {existing ? (
                           <span className="rounded border border-accent/30 bg-accent/15 px-1.5 py-0.5 text-[10px] leading-none text-accent">
                             已添加
                           </span>
+                        ) : (
+                          // 加自选必须是显式点击。stopPropagation 防冒泡到行的"只看"处理。
+                          <button
+                            type="button"
+                            onClick={e => { e.stopPropagation(); handleAddResult(result); }}
+                            title="加入自选"
+                            className={`rounded border px-1.5 py-0.5 text-[10px] leading-none transition-colors ${colors.isDark ? 'border-slate-600 text-slate-400 hover:border-accent hover:text-accent' : 'border-slate-300 text-slate-500 hover:border-accent hover:text-accent'}`}
+                          >
+                            +自选
+                          </button>
                         )}
                         <span className={`text-xs ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>{result.market}</span>
                       </div>
@@ -807,7 +846,7 @@ export const StockList: React.FC<StockListProps> = ({
                 </div>
               </div>
               <div className={`flex justify-between items-center text-xs mt-1 ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>
-                <span>量: {formatVolume(stock.volume)}</span>
+                <span>量: {formatVolume(stock.volume)}手</span>
                 {pnl !== null ? (
                   <span className={`font-mono ${cc.getColorClass(pnl >= 0)}`}>
                     持仓 {pnl >= 0 ? '+' : ''}{(pnl * 100).toFixed(2)}%
@@ -816,6 +855,11 @@ export const StockList: React.FC<StockListProps> = ({
                   <span className={`fin-chip px-1.5 py-0.5 rounded ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>{stock.sector}</span>
                 ) : null}
               </div>
+              {watchAddedMap[stock.symbol] && (
+                <div className={`flex justify-end text-[10px] mt-0.5 ${colors.isDark ? 'text-slate-600' : 'text-slate-400'}`}>
+                  加入 {watchAddedMap[stock.symbol]}
+                </div>
+              )}
             </div>
           );
         })}

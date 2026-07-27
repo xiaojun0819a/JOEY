@@ -57,7 +57,72 @@ interface OpenClawConfig {
   apiKey: string;
 }
 
-type TabType = 'provider' | 'appearance' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'chart' | 'proxy' | 'openclaw' | 'push' | 'update' | 'accounts';
+type TabType = 'provider' | 'appearance' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'chart' | 'window' | 'proxy' | 'openclaw' | 'push' | 'update' | 'accounts';
+
+// 多窗口:Wails v2 是单窗口架构,"新窗口"= 再起一个应用实例(独立进程)。
+// 两个实例都会走远程模式瘦身(不重复启调度器/采集),数据以 NAS 为单一来源,所以持仓/自选天然同步。
+const MultiWindowSettings: React.FC = () => {
+  const [instances, setInstances] = React.useState(0);
+  const [opening, setOpening] = React.useState(false);
+  const [msg, setMsg] = React.useState('');
+
+  const bridge = () => (window as unknown as {
+    go?: { main?: { App?: { OpenNewWindow?: () => Promise<string>; CountAppInstances?: () => Promise<number> } } }
+  }).go?.main?.App;
+
+  const refresh = React.useCallback(async () => {
+    try {
+      const n = await bridge()?.CountAppInstances?.();
+      if (typeof n === 'number') setInstances(n);
+    } catch { /* 数不出来就不显示 */ }
+  }, []);
+
+  React.useEffect(() => { void refresh(); }, [refresh]);
+
+  const openWindow = async () => {
+    setOpening(true);
+    setMsg('');
+    try {
+      const r = await bridge()?.OpenNewWindow?.();
+      setMsg(r === 'success' ? '新窗口已打开' : (r || '当前版本未提供该接口,请重装最新 app'));
+    } catch (e) {
+      setMsg(String(e));
+    }
+    setOpening(false);
+    setTimeout(() => { void refresh(); }, 4000); // 新实例启动要几秒才出现在进程表里
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h3 className="text-base font-semibold fin-text-primary">多窗口</h3>
+        <p className="mt-1 text-xs fin-text-tertiary">
+          再开一个软件窗口,比如左边看盯盘、右边跑体感练习或复盘。两个窗口都连同一个 NAS 后端,
+          持仓/自选/留痕是同一份数据,不会各记各的。
+        </p>
+      </div>
+      <div className="rounded-lg border fin-divider p-4">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => void openWindow()}
+            disabled={opening}
+            className="inline-flex items-center gap-2 rounded-lg border border-sky-400/50 bg-sky-500/10 px-4 py-2 text-sm font-semibold text-sky-200 transition-colors hover:bg-sky-500/20 disabled:opacity-50"
+          >
+            {opening ? '正在打开…' : '打开新窗口'}
+          </button>
+          {instances > 0 && <span className="text-xs fin-text-tertiary">当前已开 {instances} 个窗口</span>}
+          {msg && <span className="text-xs fin-text-secondary">{msg}</span>}
+        </div>
+        <ul className="mt-3 space-y-1 text-[11px] fin-text-tertiary">
+          <li>· 新窗口是独立进程,关掉其中一个不影响另一个</li>
+          <li>· 后台任务(自动选股/采集/推送)始终只在 NAS 上跑一份,多开窗口不会重复执行</li>
+          <li>· ⚠️设置项建议只在一个窗口里改:两个窗口同时改设置,后保存的那个会覆盖先保存的</li>
+        </ul>
+      </div>
+    </div>
+  );
+};
 
 // ADMIN_BUILD:编译期常量(vite.config.ts 里按 VITE_ADMIN_BUILD 注入,分发构建恒 false)。
 // 恒 false 时 Vite 把下面所有 `ADMIN_BUILD && …` 死分支连同 AccountsSettings 组件从产物剔除,
@@ -342,6 +407,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose,
     { id: 'mcp', label: 'MCP服务', icon: <Plug className="h-4 w-4" /> },
     { id: 'memory', label: '记忆管理', icon: <Brain className="h-4 w-4" /> },
     { id: 'chart', label: '图表设置', icon: <Sliders className="h-4 w-4" /> },
+    { id: 'window', label: '多窗口', icon: <Copy className="h-4 w-4" /> },
     { id: 'proxy', label: '网络代理', icon: <Globe className="h-4 w-4" /> },
     { id: 'openclaw', label: 'OpenClaw', icon: <Plug className="h-4 w-4" /> },
     { id: 'push', label: '信号推送', icon: <Bell className="h-4 w-4" /> },
@@ -401,6 +467,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose,
             )}
             {activeTab === 'appearance' && (
               <AppearanceSettings />
+            )}
+            {activeTab === 'window' && (
+              <MultiWindowSettings />
             )}
             {activeTab === 'intent' && (
               <IntentSettings
@@ -567,6 +636,11 @@ const AccountsSettings: React.FC<AccountsSettingsProps> = ({ showToast }) => {
   const [inviteCode, setInviteCode] = useState('');
   const [inviteSaved, setInviteSaved] = useState('');
   const [busy, setBusy] = useState(false);
+  // Wails 的 WKWebView 不支持 window.confirm/prompt(静默失败),删除/重置密码改用应用内交互
+  const [delFor, setDelFor] = useState(''); // 待二次确认删除的用户名(5秒超时复位)
+  const delTimer = useRef<ReturnType<typeof setTimeout>>();
+  const [pwdFor, setPwdFor] = useState(''); // 正在行内重置密码的用户名
+  const [pwdVal, setPwdVal] = useState('');
 
   const app = () => (window as any).go?.main?.App;
 
@@ -616,18 +690,27 @@ const AccountsSettings: React.FC<AccountsSettingsProps> = ({ showToast }) => {
     setBusy(false);
   };
 
-  const resetPass = async (name: string) => {
-    const p = window.prompt(`给「${name}」设置新密码(至少6位):`);
-    if (p == null) return;
+  // 重置密码:点按钮展开行内输入框,输完点确认(WKWebView 无 prompt)
+  const submitResetPass = async (name: string) => {
+    const p = pwdVal;
     if (p.length < 6) { showToast('error', '密码至少6位'); return; }
     try {
       const r = await app()?.SetRemoteUser?.(name, p);
       showToast(r === 'success' ? 'success' : 'error', r === 'success' ? '密码已重置' : (r || '失败'));
+      if (r === 'success') { setPwdFor(''); setPwdVal(''); }
     } catch (e: any) { showToast('error', '失败: ' + (e?.message ?? e)); }
   };
 
+  // 删除:第一次点进入待确认(按钮变"确认删除",5秒复位),再点才执行(WKWebView 无 confirm)
   const delUser = async (name: string) => {
-    if (!window.confirm(`确定删除账号「${name}」?其自选/持仓/会话等数据会保留在服务器,但该账号无法再登录。`)) return;
+    if (delFor !== name) {
+      setDelFor(name);
+      if (delTimer.current) clearTimeout(delTimer.current);
+      delTimer.current = setTimeout(() => setDelFor(''), 5000);
+      return;
+    }
+    if (delTimer.current) clearTimeout(delTimer.current);
+    setDelFor('');
     try {
       const r = await app()?.DeleteRemoteUser?.(name);
       if (r === 'success') { showToast('success', '已删除 ' + name); await load(); }
@@ -698,33 +781,59 @@ const AccountsSettings: React.FC<AccountsSettingsProps> = ({ showToast }) => {
         ) : (
           <div className="space-y-2">
             {users.map(u => (
-              <div key={u.username} className={`flex items-center gap-3 px-3 py-2.5 rounded-lg ${colors.isDark ? 'bg-slate-900/60' : 'bg-slate-100'}`}>
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium flex items-center gap-2">
-                    {u.username}
-                    {u.trusted && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 flex items-center gap-0.5">
-                        <ShieldCheck className="h-2.5 w-2.5" /> 信任
-                      </span>
-                    )}
+              <div key={u.username} className={`px-3 py-2.5 rounded-lg ${colors.isDark ? 'bg-slate-900/60' : 'bg-slate-100'}`}>
+                <div className="flex items-center gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium flex items-center gap-2">
+                      {u.username}
+                      {u.trusted && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 flex items-center gap-0.5">
+                          <ShieldCheck className="h-2.5 w-2.5" /> 信任
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-slate-400 mt-0.5">
+                      {u.count > 0 ? `${u.count} 次操作` : '未活跃'}
+                      {u.lastTime ? ` · 最近 ${u.lastTime.replace('T', ' ').slice(5, 16)}` : ''}
+                    </div>
                   </div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">
-                    {u.count > 0 ? `${u.count} 次操作` : '未活跃'}
-                    {u.lastTime ? ` · 最近 ${u.lastTime.replace('T', ' ').slice(5, 16)}` : ''}
-                  </div>
+                  <button onClick={() => toggleTrust(u)} title={u.trusted ? '取消信任' : '设为信任账号(免资源防线)'}
+                    className={`text-xs px-2 py-1 rounded ${u.trusted ? 'text-amber-400 hover:bg-amber-500/10' : 'text-slate-400 hover:bg-slate-700/50'}`}>
+                    <ShieldCheck className="h-4 w-4" />
+                  </button>
+                  <button onClick={() => { setPwdFor(pwdFor === u.username ? '' : u.username); setPwdVal(''); }} title="重置密码"
+                    className={`text-xs px-2 py-1 rounded ${pwdFor === u.username ? 'text-sky-300 bg-sky-500/15' : 'text-slate-400 hover:bg-slate-700/50'}`}>
+                    <RotateCcw className="h-4 w-4" />
+                  </button>
+                  {delFor === u.username ? (
+                    <button onClick={() => delUser(u.username)}
+                      className="text-xs px-2 py-1 rounded bg-red-500/25 text-red-200 border border-red-500 animate-pulse font-medium whitespace-nowrap">
+                      确认删除!
+                    </button>
+                  ) : (
+                    <button onClick={() => delUser(u.username)} title="删除账号(需二次确认)"
+                      className="text-xs px-2 py-1 rounded text-red-400 hover:bg-red-500/10">
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  )}
                 </div>
-                <button onClick={() => toggleTrust(u)} title={u.trusted ? '取消信任' : '设为信任账号(免资源防线)'}
-                  className={`text-xs px-2 py-1 rounded ${u.trusted ? 'text-amber-400 hover:bg-amber-500/10' : 'text-slate-400 hover:bg-slate-700/50'}`}>
-                  <ShieldCheck className="h-4 w-4" />
-                </button>
-                <button onClick={() => resetPass(u.username)} title="重置密码"
-                  className="text-xs px-2 py-1 rounded text-slate-400 hover:bg-slate-700/50">
-                  <RotateCcw className="h-4 w-4" />
-                </button>
-                <button onClick={() => delUser(u.username)} title="删除账号"
-                  className="text-xs px-2 py-1 rounded text-red-400 hover:bg-red-500/10">
-                  <Trash2 className="h-4 w-4" />
-                </button>
+                {pwdFor === u.username && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      type="password"
+                      value={pwdVal}
+                      onChange={e => setPwdVal(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') void submitResetPass(u.username); }}
+                      placeholder={`给「${u.username}」设新密码(至少6位)`}
+                      autoFocus
+                      className={`flex-1 px-2.5 py-1.5 rounded border text-xs outline-none ${colors.isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-300 text-slate-800'}`}
+                    />
+                    <button onClick={() => void submitResetPass(u.username)}
+                      className="text-xs px-2.5 py-1.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 hover:bg-sky-500/30">确认</button>
+                    <button onClick={() => { setPwdFor(''); setPwdVal(''); }}
+                      className="text-xs px-2.5 py-1.5 rounded text-slate-400 hover:bg-slate-700/50">取消</button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -2679,8 +2788,17 @@ const PushSettings: React.FC<PushSettingsProps> = ({ config, onChange, flushSave
               <input
                 type="number"
                 min={5}
-                value={config.monitor.intervalMinutes}
-                onChange={(e) => onChange({ ...config, monitor: { ...config.monitor, intervalMinutes: parseInt(e.target.value) || 15 } })}
+                value={config.monitor.intervalMinutes || ''}
+                onChange={(e) => {
+                  // 编辑中允许清空(存0渲染成空串),失焦再校验——否则清空瞬间被强制回填,手动输入形同残废
+                  const n = e.target.value === '' ? 0 : parseInt(e.target.value);
+                  onChange({ ...config, monitor: { ...config.monitor, intervalMinutes: Number.isFinite(n) && n >= 0 ? n : 0 } });
+                }}
+                onBlur={() => {
+                  const v = config.monitor.intervalMinutes;
+                  if (!v) onChange({ ...config, monitor: { ...config.monitor, intervalMinutes: 30 } });
+                  else if (v < 5) onChange({ ...config, monitor: { ...config.monitor, intervalMinutes: 5 } });
+                }}
                 className={`w-24 fin-input rounded-lg px-3 py-2 text-sm ${colors.isDark ? 'text-white' : 'text-slate-800'}`}
               />
             </div>

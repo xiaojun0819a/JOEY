@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Wallet, X, Trash2, LogOut, RefreshCw, Loader2, Undo2, Plus, Search, LineChart, Radar } from 'lucide-react';
+import { Wallet, X, Trash2, LogOut, RefreshCw, Loader2, Undo2, Plus, Search, LineChart, Radar, ClipboardPaste } from 'lucide-react';
 import StrategyAccountDialog from './StrategyAccountDialog';
 import TailForwardDialog from './TailForwardDialog';
 import { useTheme } from '../contexts/ThemeContext';
@@ -7,8 +7,9 @@ import { useCandleColor } from '../contexts/CandleColorContext';
 import { StrategyScorecard } from './StrategyScorecard';
 import {
   addPaperPosition, listPaperPositions, updatePaperPosition, closePaperPosition, reopenPaperPosition, deletePaperPosition, getPaperStats,
-  applyPaperExitRules, exitReasonText, getPaperRiskSummary,
-  SOURCE_LABEL, STRATEGY_SOURCE_FILTERS, type PaperPosition, type PaperStats, type PaperSourceStat, type PaperRiskSummary,
+  applyPaperExitRules, exitReasonText, getPaperRiskSummary, clearAllPaperPositions, clearPaperPositionsByIDs,
+  getPaperAutoPaused, setPaperAutoPaused, setPaperAutoExit, addTipPicks,
+  SOURCE_LABEL, STRATEGY_SOURCE_FILTERS, sourceMatchesStrategyKey, type PaperPosition, type PaperStats, type PaperSourceStat, type PaperRiskSummary, type TipPickResult,
 } from '../services/paperService';
 import { getStockRealTimeData, searchStocks } from '../services/stockService';
 import type { Stock } from '../types';
@@ -22,9 +23,11 @@ interface Props {
 type SourceFilter = string;
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
-const formatOpenDate = (value?: string) => {
-  if (!value) return '--';
-  return value.length > 10 ? value.slice(0, 16).replace('T', ' ') : value;
+// 加入时间:优先用建仓精确时刻 openedAt(带时分秒),回落纯日期 openDate(旧数据无时刻)
+const openDateLine = (p: { openedAt?: string; openDate?: string }) => (p.openedAt || p.openDate || '').slice(0, 10);
+const openTimeLine = (p: { openedAt?: string }) => {
+  const ts = (p.openedAt || '').replace('T', ' ');
+  return ts.length >= 19 ? ts.slice(11, 19) : '';
 };
 const parseDateOnly = (value?: string) => {
   const dateText = (value || '').slice(0, 10);
@@ -82,24 +85,8 @@ const toStock = (position: PaperPosition): Stock => ({
   preClose: 0,
 });
 
-const sourceMatchesFilter = (source: string | undefined, filter: SourceFilter) => {
-  const src = normalizeSource(source);
-  if (filter === 'all') return true;
-  if (filter === 'lowbuy-v1') return src === filter || src === 'lowbuy';
-  if (filter === 'limit-pullback-v1') return src === filter;
-  if (filter === 'triple-volume-v5') return src === filter || src === 'triple-volume';
-  if (filter === 'tail-buy-v6') return src === filter || src === 'tail-buy';
-  if (filter === 'hot-money-v7') return src === filter || src === 'hot-money';
-  if (filter === 'dip-entry-v8') return src === filter || src === 'dip-entry';
-  if (filter === 'monster-v9') return src === filter || src === 'monster' || src === '捉妖策略6';
-  if (filter === 'monster-v10') return src === filter || src === '捉妖策略10';
-  if (filter === 'taillazy-v2') return src === filter || src === 'taillazy';
-  if (filter === 'latechase-v3') return src === filter || src === 'latechase';
-  if (filter === 'wave-v1') return src === filter || src === 'wave';
-  if (filter === 'caoyuan-standard4a') return src === filter || src === 'caoyuan-standard4a-strict';
-  if (filter === 'caoyuan-zhuang4b') return src === filter || src === 'caoyuan-zhuang4b-strict';
-  return src === filter;
-};
+const sourceMatchesFilter = (source: string | undefined, filter: SourceFilter) =>
+  sourceMatchesStrategyKey(source, filter); // 别名逻辑收敛到 utils/strategySource,与策略账户口径一致
 
 const buildPaperStats = (positions: PaperPosition[]): PaperStats => {
   const out = emptyStats();
@@ -212,6 +199,14 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
   const [closePriceInput, setClosePriceInput] = useState('');
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
   const [showManualAdd, setShowManualAdd] = useState(false);
+  // 外部荐股跟单录入(2026-07-27)。手机端同款入口在 NAS 的 /tip 页面。
+  const [showTipAdd, setShowTipAdd] = useState(false);
+  const [tipRaw, setTipRaw] = useState('');
+  const [tipAmount, setTipAmount] = useState('30000');
+  const [tipNote, setTipNote] = useState('天鼎早盘');
+  const [tipBusy, setTipBusy] = useState(false);
+  const [tipResult, setTipResult] = useState<TipPickResult | null>(null);
+  const [tipError, setTipError] = useState('');
   const [showAccount, setShowAccount] = useState(false);
   const [showTailFwd, setShowTailFwd] = useState(false);
   const [manualSymbol, setManualSymbol] = useState('');
@@ -220,7 +215,50 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
   const [manualShares, setManualShares] = useState('1000');
   const [manualLoading, setManualLoading] = useState(false);
   const [manualMessage, setManualMessage] = useState('');
+  const [clearing, setClearing] = useState(false);
+  // 两段式确认(Wails 的 WKWebView 不支持 window.confirm,原生弹窗静默返回 false):
+  // 第一次点进入"待确认"态(按钮变红倒计时),5秒内再点一次才真正执行。
+  const [clearArmed, setClearArmed] = useState(false);
+  const [clearError, setClearError] = useState('');
+  const clearArmTimer = useRef<ReturnType<typeof setTimeout>>();
   const timer = useRef<ReturnType<typeof setInterval>>();
+  // 自动入盘总开关(true=已暂停):策略盘后自动扫描不再建仓;手动添加不受影响
+  const [autoPaused, setAutoPaused] = useState(false);
+  useEffect(() => {
+    if (!isOpen) return;
+    void getPaperAutoPaused().then(setAutoPaused);
+  }, [isOpen]);
+  const toggleAutoPaused = async () => {
+    const next = !autoPaused;
+    const r = await setPaperAutoPaused(next);
+    if (r === 'success') setAutoPaused(next);
+  };
+
+  // 清空范围跟随上方来源筛选:选「全部」清一切(含权益曲线);选具体策略只清该来源的持仓+历史
+  const handleClearAll = async () => {
+    setClearError('');
+    if (!clearArmed) {
+      setClearArmed(true);
+      if (clearArmTimer.current) clearTimeout(clearArmTimer.current);
+      clearArmTimer.current = setTimeout(() => setClearArmed(false), 5000);
+      return;
+    }
+    if (clearArmTimer.current) clearTimeout(clearArmTimer.current);
+    setClearArmed(false);
+    setClearing(true);
+    try {
+      const r = sourceFilter === 'all'
+        ? await clearAllPaperPositions()
+        : await clearPaperPositionsByIDs(filteredList.map(p => p.id));
+      if (!r.startsWith('success')) {
+        setClearError('清空失败: ' + r);
+        return;
+      }
+      await refresh(true);
+    } finally {
+      setClearing(false);
+    }
+  };
 
   const refresh = useCallback(async (showLoading = false) => {
     if (showLoading) setLoading(true);
@@ -235,7 +273,7 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
     if (!isOpen) { if (timer.current) clearInterval(timer.current); return; }
     // 打开时先按低吸退出纪律自动平仓一次（确认收盘的前向日K），再刷新
     void (async () => { await applyPaperExitRules(); await refresh(true); })();
-    timer.current = setInterval(() => void refresh(false), 12000); // 盘中实时刷新
+    timer.current = setInterval(() => void refresh(false), 6000); // 盘中实时刷新(现价/盈亏/止损线/计分卡全联动)
     return () => { if (timer.current) clearInterval(timer.current); };
   }, [isOpen, refresh]);
 
@@ -338,17 +376,50 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
             <button
               onClick={() => setShowTailFwd(true)}
               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-cyan-400/40 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/20 transition-colors text-xs font-medium whitespace-nowrap"
-              title="尾盘2:30实盘向前验证：实时盘口判可成交，只记能买进的票"
+              title="尾盘2:50实盘向前验证：实时盘口判可成交，只记能买进的票"
             >
               <Radar className="h-3.5 w-3.5" />
-              <span>2:30买点</span>
+              <span>2:50买点</span>
             </button>
             <div className="flex-1 text-center">
               <div className="text-sm font-semibold fin-text-primary">模拟持仓 · 筛选系统胜率验证</div>
-              <div className="text-[11px] fin-text-tertiary">现价×1000股建仓 · 净收益已扣双边成本(≈0.35%) · 仅低吸类自动按低吸纪律平仓 · 草元/波段/手动需单独规则或手动平仓</div>
+              <div className="text-[11px] fin-text-tertiary">现价×1000股建仓 · 净收益已扣双边成本(≈0.35%) · 每策略专属纪律自动平仓:盘中每5分钟实时判定,止损/止盈触线即走;破5日线等收盘口径条款尾盘14:45后当天执行</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => void toggleAutoPaused()}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg border transition-colors text-xs font-medium ${
+                autoPaused
+                  ? 'border-slate-500/60 bg-slate-500/15 text-slate-300'
+                  : 'border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10'
+              }`}
+              title={autoPaused
+                ? '自动入盘已暂停:各策略盘后自动扫描不会往模拟盘建仓(手动添加不受影响)。点击恢复。'
+                : '自动入盘运行中:各策略盘后自动扫描会把命中票加入模拟盘验证胜率。点击暂停全部自动入盘。'}
+            >
+              {autoPaused ? '⏸ 自动入盘·已暂停' : '▶ 自动入盘·开'}
+            </button>
+            {clearError && <span className="text-[11px] text-rose-300 max-w-[260px] truncate" title={clearError}>{clearError}</span>}
+            <button
+              onClick={() => void handleClearAll()}
+              disabled={clearing}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg border transition-colors text-xs font-medium disabled:opacity-50 ${
+                clearArmed
+                  ? 'border-red-500 bg-red-500/25 text-red-200 animate-pulse'
+                  : 'border-red-500/40 text-red-300 hover:bg-red-500/15'
+              }`}
+              title={sourceFilter === 'all'
+                ? '清空全部模拟持仓(含已平仓历史+权益曲线+模拟持仓分组),重新开始。策略账户实盘跟踪随之归零。'
+                : `只清空当前筛选「${SOURCE_LABEL[sourceFilter] || sourceFilter}」下的持仓与已平仓历史(共${filteredList.length}笔),其他来源不受影响。`}
+            >
+              {clearing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+              <span>
+                {clearing ? '清空中…'
+                  : clearArmed ? `再点一次确认清空${sourceFilter === 'all' ? '全部' : `「${SOURCE_LABEL[sourceFilter] || sourceFilter}」`}!`
+                  : `清空${sourceFilter === 'all' ? '重来' : `「${SOURCE_LABEL[sourceFilter] || sourceFilter}」`}`}
+              </span>
+            </button>
             <button onClick={() => refresh(true)} className="p-1.5 rounded fin-hover" title="刷新">
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4 fin-text-secondary" />}
             </button>
@@ -373,7 +444,7 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
             {/* 风控概览 */}
             {risk && risk.positionCount > 0 && (
               <div className="mt-2 px-2.5 py-1.5 rounded-lg border fin-divider flex items-center gap-3 text-xs flex-wrap bg-white/[0.02]">
-                <span className="fin-text-tertiary shrink-0">风控(稳健·自动平+预警)</span>
+                <span className="fin-text-tertiary shrink-0" title="集中度/回撤必须按全部持仓算才有意义,不随下方来源筛选变化——筛选'手动'时这里出现别的策略的票属正常">风控(稳健·自动平+预警)·全组合口径</span>
                 <span className="fin-text-secondary">组合浮盈 <b className={risk.profitPct >= 0 ? 'text-red-400' : 'text-green-400'}>{risk.profitPct >= 0 ? '+' : ''}{risk.profitPct}%</b></span>
                 <span className="fin-text-secondary">最大单票 <b className={risk.maxSinglePct > risk.singleCap ? 'text-amber-400' : ''}>{risk.maxSinglePct}%</b><span className="fin-text-tertiary">/上限{risk.singleCap}%</span></span>
                 {risk.sectorTop[0] && <span className="fin-text-secondary">最大板块 <b className={risk.sectorTop[0].pct > risk.sectorCap ? 'text-amber-400' : ''}>{risk.sectorTop[0].name} {risk.sectorTop[0].pct}%</b><span className="fin-text-tertiary">/上限{risk.sectorCap}%</span></span>}
@@ -454,8 +525,93 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
               <Plus className="h-3.5 w-3.5" />
               新增手动持仓
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShowTipAdd(prev => !prev);
+                setSourceFilter('tip-tianding');
+                setTipError('');
+                setTipResult(null);
+              }}
+              className={`inline-flex items-center gap-1 rounded border px-2.5 py-1.5 font-semibold transition-colors ${
+                showTipAdd
+                  ? 'border-sky-400/40 bg-sky-500/20 text-sky-200'
+                  : dark
+                    ? 'border-slate-700 bg-slate-900/70 text-slate-300 hover:border-sky-400/40 hover:text-sky-200'
+                    : 'border-slate-200 bg-white text-slate-600 hover:border-sky-300 hover:text-sky-700'
+              }`}
+              title="粘贴荐股短信原文，按固定金额批量建仓（成交价=提交时刻实时价，引擎不接管）"
+            >
+              <ClipboardPaste className="h-3.5 w-3.5" />
+              荐股买入
+            </button>
           </div>
         </div>
+
+        {showTipAdd && (
+          <div className={`border-b fin-divider px-5 py-3 text-xs ${dark ? 'bg-slate-950/45' : 'bg-slate-50'}`}>
+            <div className="flex gap-3">
+              <textarea
+                value={tipRaw}
+                onChange={e => { setTipRaw(e.target.value); setTipError(''); }}
+                placeholder={'粘贴荐股原文，只认里面的 6 位代码：\n通富微电 002156\n金牛化工 600722'}
+                rows={4}
+                className={`flex-1 resize-y rounded px-2 py-1.5 font-mono text-[11px] leading-relaxed ${dark ? 'bg-slate-900 text-slate-100 border border-slate-700' : 'bg-white text-slate-800 border border-slate-300'}`}
+              />
+              <div className="flex w-[190px] shrink-0 flex-col gap-1.5">
+                <label className="block">
+                  <span className="mb-0.5 block fin-text-tertiary">每只金额(元)</span>
+                  <input value={tipAmount} onChange={e => setTipAmount(e.target.value)} inputMode="numeric"
+                    className={`w-full rounded px-2 py-1 font-mono ${dark ? 'bg-slate-900 text-slate-100 border border-slate-700' : 'bg-white border border-slate-300'}`} />
+                </label>
+                <label className="block">
+                  <span className="mb-0.5 block fin-text-tertiary">备注(哪家推的)</span>
+                  <input value={tipNote} onChange={e => setTipNote(e.target.value)}
+                    className={`w-full rounded px-2 py-1 ${dark ? 'bg-slate-900 text-slate-100 border border-slate-700' : 'bg-white border border-slate-300'}`} />
+                </label>
+                <button
+                  type="button"
+                  disabled={tipBusy || !tipRaw.trim()}
+                  onClick={async () => {
+                    setTipBusy(true); setTipError(''); setTipResult(null);
+                    try {
+                      const r = await addTipPicks(tipRaw, Number(tipAmount) || 30000, tipNote);
+                      setTipResult(r);
+                      if (r.added > 0) { setTipRaw(''); void refresh(false); }
+                    } catch (e) {
+                      setTipError(e instanceof Error ? e.message : String(e));
+                    } finally { setTipBusy(false); }
+                  }}
+                  className="mt-0.5 rounded bg-sky-500/20 px-2 py-1.5 font-semibold text-sky-300 disabled:opacity-40"
+                >
+                  {tipBusy ? '建仓中…' : '按当前实时价建仓'}
+                </button>
+              </div>
+            </div>
+            {/* 口径写在界面上,免得日后看数据时以为是开盘价 */}
+            <div className="mt-2 rounded border border-amber-500/25 bg-amber-500/10 px-2 py-1.5 text-[10px] leading-relaxed text-amber-300/90">
+              成交价 = <b>按下按钮这一刻的实时价</b>，不是当日开盘价（按开盘价记会白捡开盘到现在的涨跌）。
+              非交易时段、涨停封死买不进的票会被拒绝记入。本来源<b>风控引擎一律不接管</b>，卖出全靠你自己操作。
+              手机上用同一个入口：<span className="font-mono">/tip?token=…</span>
+            </div>
+            {tipError && <div className="mt-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1.5 text-[11px] text-red-300">{tipError}</div>}
+            {tipResult && (
+              <div className="mt-2 space-y-1">
+                <div className="fin-text-tertiary">{tipResult.at} · 记入 <b className="text-sky-300">{tipResult.added}</b> 只，跳过 {tipResult.skipped} 只</div>
+                {tipResult.rows.map(r => (
+                  <div key={r.symbol} className={`rounded border px-2 py-1 text-[11px] ${r.skipped ? 'border-red-500/25 bg-red-500/5 fin-text-tertiary' : 'border-emerald-500/25 bg-emerald-500/5'}`}>
+                    <b>{r.name || r.symbol}</b> <span className="font-mono fin-text-tertiary">{r.symbol}</span>
+                    {r.skipped
+                      ? <span className="ml-2">✗ {r.skipped}</span>
+                      : <span className="ml-2 font-mono">成交 {r.price.toFixed(2)} × {r.shares}股 = {Math.round(r.amount).toLocaleString()} 元
+                          {r.dayOpen > 0 && <span className="fin-text-tertiary">（当日开盘 {r.dayOpen.toFixed(2)}，相差 {((r.price / r.dayOpen - 1) * 100).toFixed(2)}%）</span>}
+                        </span>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {showManualAdd && (
           <div className={`border-b fin-divider px-5 py-2.5 text-xs ${dark ? 'bg-slate-950/45' : 'bg-slate-50'}`}>
@@ -608,10 +764,28 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
                         <div className="text-[10px] font-mono fin-text-tertiary">{p.symbol}</div>
                       </td>
                       <td className={`${td} text-center`}>
-                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${dark ? 'bg-slate-700 text-slate-300' : 'bg-slate-200 text-slate-600'}`}>{SOURCE_LABEL[p.source] || p.source}</span>
+                        <div className="flex flex-col items-center gap-0.5">
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap ${dark ? 'bg-slate-700 text-slate-300' : 'bg-slate-200 text-slate-600'}`}>{SOURCE_LABEL[p.source] || p.source}</span>
+                          <div className="flex items-center gap-1">
+                            {(p.addedBy ? p.addedBy === 'manual' : p.source === 'manual') ? (
+                              <span className="text-[9px] px-1 py-0.5 rounded whitespace-nowrap bg-sky-500/15 text-sky-300" title="你手动添加的">手动</span>
+                            ) : (
+                              <span className="text-[9px] px-1 py-0.5 rounded whitespace-nowrap bg-amber-500/15 text-amber-300/80" title="策略盘后自动扫描加入的(可用右上角总开关暂停)">自动</span>
+                            )}
+                            {p.autoExitOff && isOpen ? (
+                              <button
+                                type="button"
+                                onClick={() => { if (window.confirm(`恢复「${p.name || p.symbol}」的自动风控?\n恢复后引擎按纪律自动止盈止损,若触发条件仍成立可能很快再次平仓。`)) { void setPaperAutoExit(p.id, false).then(() => refresh(false)); } }}
+                                className="text-[9px] px-1 py-0.5 rounded whitespace-nowrap bg-violet-500/20 text-violet-300 hover:bg-violet-500/30"
+                                title="你撤回过这笔自动平仓=已接管:风控引擎不再自动止盈止损,只能手动平仓。点击恢复自动风控"
+                              >已接管</button>
+                            ) : null}
+                          </div>
+                        </div>
                       </td>
                       <td className={`${td} text-center font-mono text-[11px] fin-text-tertiary`}>
-                        {formatOpenDate(p.openDate)}
+                        <div>{openDateLine(p)}</div>
+                        {openTimeLine(p) && <div className="text-[10px] text-amber-300/70">{openTimeLine(p)}</div>}
                       </td>
                       <td className={`${td} text-center font-mono text-[11px] fin-text-secondary`}>
                         {getHoldDays(p.openDate, p.status === 'closed' ? p.closeDate : '')}
@@ -645,12 +819,20 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
                           <span className="inline-flex items-center justify-center gap-2">
                             <span className="text-[10px] fin-text-tertiary">
                               已平 {p.closeDate}
-                              {p.exitReason && <span className="ml-1 px-1 py-0.5 rounded bg-amber-500/15 text-amber-400">{exitReasonText(p.exitReason)}</span>}
+                              {/* 有理由=风控引擎按纪律平的(琥珀);无理由=自己点「平仓」平的(灰)。
+                                  两者必须一眼分得开:计分卡上"纪律执行的结果"和"我拍脑袋卖的结果"混在一起,
+                                  胜率就没法归因到策略头上。 */}
+                              <span
+                                className={`ml-1 px-1 py-0.5 rounded ${p.exitReason ? 'bg-amber-500/15 text-amber-400' : 'bg-slate-500/15 fin-text-tertiary'}`}
+                                title={p.exitReason ? `风控引擎自动平仓 · 触发条款:${exitReasonText(p.exitReason)}` : '手动平仓(你自己点的「平仓」,非风控引擎触发)'}
+                              >
+                                {exitReasonText(p.exitReason)}
+                              </span>
                             </span>
                             <button
                               onClick={() => doReopen(p.id)}
                               className="inline-flex items-center gap-0.5 text-[11px] px-1.5 py-0.5 rounded text-amber-400 hover:bg-amber-500/15"
-                              title="撤回平仓，恢复为未平仓并从计分卡移除"
+                              title="撤回平仓，恢复为未平仓并从计分卡移除;撤回自动平仓的同时接管该票(不再自动止盈止损)"
                             >
                               <Undo2 className="h-3 w-3" />撤回
                             </button>

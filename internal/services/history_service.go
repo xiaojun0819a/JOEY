@@ -31,6 +31,10 @@ type HistoryService struct {
 	autoMu        sync.Mutex
 	autoRunning   bool
 	lastGapCheck  string // 最近一次缺口自愈检查的日期(YYYY-MM-DD)，每天最多跑一次全量回补
+	// strategyReplays 策略历史重算器注册表(策略ID→重算函数,app 层启动时注入;复盘缺留痕时自动调用)
+	strategyReplays map[string]StrategyReplayFunc
+	// afterDailyCollect 每日采集完成后的回调(app 层注入)
+	afterDailyCollect func()
 }
 
 // NewHistoryService creates the local history store under the app data dir.
@@ -42,7 +46,9 @@ func NewHistoryService(dataDir string, marketService *MarketService, configServi
 		return nil, err
 	}
 	dbPath := filepath.Join(dataDir, "history.db")
-	db, err := sql.Open("sqlite", dbPath)
+	// busy_timeout:断层修复/除权刷新是多协程写同库,SQLite 单写者,无超时等待会直接 SQLITE_BUSY
+	// (2026-07-22 断层修复 10/18 只因此失败)。给 8s 等待,写冲突排队而不是报错。
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(8000)")
 	if err != nil {
 		return nil, err
 	}
@@ -93,14 +99,44 @@ func (s *HistoryService) ResolveTradeDateAtOrBefore(date string) (string, error)
 	return asOf, nil
 }
 
+// DailyVolumesBefore 返回 date 前一交易日 全市场 stock_code→成交量(手) 映射,供竞价选股取"昨日量"。
+func (s *HistoryService) DailyVolumesBefore(date string) (map[string]float64, string, error) {
+	if s == nil || s.db == nil {
+		return nil, "", errors.New("history db not ready")
+	}
+	var prev string
+	if err := s.db.QueryRow(`SELECT MAX(trade_date) FROM stock_daily WHERE trade_date < ?`, strings.TrimSpace(date)).Scan(&prev); err != nil {
+		return nil, "", err
+	}
+	if prev == "" {
+		return map[string]float64{}, "", nil
+	}
+	rows, err := s.db.Query(`SELECT stock_code, volume FROM stock_daily WHERE trade_date=? AND volume>0`, prev)
+	if err != nil {
+		return nil, prev, err
+	}
+	defer rows.Close()
+	out := make(map[string]float64, 6000)
+	for rows.Next() {
+		var code string
+		var vol sql.NullFloat64
+		if rows.Scan(&code, &vol) == nil {
+			out[strings.ToLower(code)] = vol.Float64
+		}
+	}
+	return out, prev, rows.Err()
+}
+
 // LoadScanRowsOnDate loads one market snapshot from local stock_daily for replay-style scanners.
 func (s *HistoryService) LoadScanRowsOnDate(date string, includeBeijing bool) ([]ScanSnapshotRow, string, error) {
 	asOf, err := s.ResolveTradeDateAtOrBefore(date)
 	if err != nil {
 		return nil, "", err
 	}
-	rows, err := s.db.Query(`SELECT stock_code, stock_name, industry, close_price, pct_change, amount, turnover,
-			main_net, main_pct, main_source, total_market_cap, float_market_cap
+	// 全列 COALESCE:回补写入的历史行大量列为 NULL(尤其 stock_name/industry/main_*),
+	// 裸 string/float 扫描会整批报错(2026-07-22 五月重算实测踩坑,记忆里早有 NullFloat64 警告)。
+	rows, err := s.db.Query(`SELECT stock_code, COALESCE(stock_name,''), COALESCE(industry,''), close_price, COALESCE(pct_change,0), COALESCE(amount,0), COALESCE(turnover,0),
+			COALESCE(main_net,0), COALESCE(main_pct,0), COALESCE(main_source,''), COALESCE(total_market_cap,0), COALESCE(float_market_cap,0)
 		FROM stock_daily
 		WHERE trade_date=? AND close_price>0 AND amount>0
 		ORDER BY amount DESC`, asOf)
@@ -110,6 +146,7 @@ func (s *HistoryService) LoadScanRowsOnDate(date string, includeBeijing bool) ([
 	defer rows.Close()
 
 	out := make([]ScanSnapshotRow, 0, 6000)
+	missingName := 0
 	for rows.Next() {
 		var row ScanSnapshotRow
 		var industry, source string
@@ -125,15 +162,55 @@ func (s *HistoryService) LoadScanRowsOnDate(date string, includeBeijing bool) ([
 		if !includeBeijing && strings.HasPrefix(row.Symbol, "bj") {
 			continue
 		}
+		if row.Name == "" {
+			missingName++
+		}
 		row.Industry = industry
 		row.MainFlowSource = chooseText(source, "history")
 		row.UpdateTime = asOf
-		if strings.Contains(strings.ToUpper(row.Name), "ST") {
-			row.IsST = true
-		}
 		out = append(out, row)
 	}
-	return out, asOf, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, asOf, err
+	}
+	// 历史行名字缺失(回补行不带名)→ 用库里最新交易日的名字回填,ST 判定才有依据。
+	// 口径披露:ST 状态按最新名字近似(个股摘帽/戴帽跨期会有出入,近月重算基本可靠)。
+	if missingName > 0 {
+		if nameMap := s.latestNameMap(); len(nameMap) > 0 {
+			for i := range out {
+				if out[i].Name == "" {
+					out[i].Name = nameMap[out[i].Symbol]
+				}
+			}
+		}
+	}
+	for i := range out {
+		if strings.Contains(strings.ToUpper(out[i].Name), "ST") {
+			out[i].IsST = true
+		}
+	}
+	return out, asOf, nil
+}
+
+// latestNameMap 库里最新交易日的 代码→名字 表(历史行名字缺失时回填用)。
+func (s *HistoryService) latestNameMap() map[string]string {
+	out := map[string]string{}
+	if s == nil || s.db == nil {
+		return out
+	}
+	rows, err := s.db.Query(`SELECT stock_code, stock_name FROM stock_daily
+		WHERE trade_date=(SELECT MAX(trade_date) FROM stock_daily) AND stock_name IS NOT NULL AND stock_name<>''`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var code, name string
+		if rows.Scan(&code, &name) == nil && code != "" {
+			out[code] = name
+		}
+	}
+	return out
 }
 
 // LoadScanRowsOnDateForReplay 历史回放专用：只要 close>0 即纳入（不依赖成交额），
@@ -194,6 +271,84 @@ func (s *HistoryService) LoadScanRowsOnDateForReplay(date string, includeBeijing
 	return out, asOf, rows.Err()
 }
 
+// TopGainersPerDay 每个交易日按涨幅取前N只(供历史分时按需回补:尾盘3等策略的复盘原料
+// 是"当日涨幅榜",全市场逐日全补没必要,只补榜上的)。逐日小查询,区间最多几十天,快。
+func (s *HistoryService) TopGainersPerDay(start, end string, topN int) []struct {
+	Date  string
+	Codes []string
+} {
+	var out []struct {
+		Date  string
+		Codes []string
+	}
+	if s == nil || s.db == nil || topN <= 0 {
+		return out
+	}
+	dr, err := s.db.Query(`SELECT DISTINCT trade_date FROM stock_daily WHERE trade_date>=? AND trade_date<=? ORDER BY trade_date`, start, end)
+	if err != nil {
+		return out
+	}
+	var days []string
+	for dr.Next() {
+		var d string
+		if dr.Scan(&d) == nil {
+			days = append(days, d)
+		}
+	}
+	dr.Close()
+	for _, d := range days {
+		// topN>=9000 = 全市场模式:不按涨幅筛(也不依赖 pct_change 字段),凡当日有收盘价的全补
+		q := `SELECT stock_code FROM stock_daily WHERE trade_date=? AND pct_change IS NOT NULL AND close_price>0
+			ORDER BY pct_change DESC LIMIT ?`
+		if topN >= 9000 {
+			q = `SELECT stock_code FROM stock_daily WHERE trade_date=? AND close_price>0 ORDER BY stock_code LIMIT ?`
+		}
+		rows, err := s.db.Query(q, d, topN)
+		if err != nil {
+			continue
+		}
+		var codes []string
+		for rows.Next() {
+			var c string
+			if rows.Scan(&c) == nil {
+				codes = append(codes, c)
+			}
+		}
+		rows.Close()
+		if len(codes) > 0 {
+			out = append(out, struct {
+				Date  string
+				Codes []string
+			}{Date: d, Codes: codes})
+		}
+	}
+	return out
+}
+
+// TurnoverRateMap 取某股 stock_daily 里的真实换手率(采集自东财快照),返回 交易日→换手率%。
+// 供 K线接口补换手率:行情源的K线不带这个字段,但本地日线库每天都存了。
+func (s *HistoryService) TurnoverRateMap(code string) map[string]float64 {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	rows, err := s.db.Query(`SELECT trade_date, turnover FROM stock_daily WHERE stock_code=? AND turnover IS NOT NULL AND turnover>0`,
+		strings.ToLower(strings.TrimSpace(code)))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make(map[string]float64, 512)
+	for rows.Next() {
+		var d string
+		var t sql.NullFloat64 // stock_daily 大量列可空,一律 NullFloat64 读
+		if err := rows.Scan(&d, &t); err != nil || !t.Valid || t.Float64 <= 0 {
+			continue
+		}
+		out[d] = t.Float64
+	}
+	return out
+}
+
 // LoadKLineDataUntil returns daily K lines ending at asOf, with no future rows.
 func (s *HistoryService) LoadKLineDataUntil(code string, asOf string, limit int) ([]models.KLineData, error) {
 	if s == nil || s.db == nil {
@@ -215,10 +370,15 @@ func (s *HistoryService) LoadKLineDataUntil(code string, asOf string, limit int)
 	bars := make([]models.KLineData, 0, limit)
 	for rows.Next() {
 		var k models.KLineData
-		var volume float64
-		if err := rows.Scan(&k.Time, &k.Open, &k.High, &k.Low, &k.Close, &volume, &k.Amount, &k.MA5, &k.MA10, &k.MA20); err != nil {
+		// stock_daily 的 open/high/low/amount/ma 常为 NULL,必须用 NullFloat64 承接,否则整股扫描报错被跳过
+		var open, high, low, closeP, volume, amount, ma5, ma10, ma20 sql.NullFloat64
+		if err := rows.Scan(&k.Time, &open, &high, &low, &closeP, &volume, &amount, &ma5, &ma10, &ma20); err != nil {
 			return nil, err
 		}
+		k.Close = closeP.Float64
+		k.Open, k.High, k.Low = open.Float64, high.Float64, low.Float64
+		k.Amount = amount.Float64
+		k.MA5, k.MA10, k.MA20 = ma5.Float64, ma10.Float64, ma20.Float64
 		if k.Open <= 0 {
 			k.Open = k.Close
 		}
@@ -228,7 +388,7 @@ func (s *HistoryService) LoadKLineDataUntil(code string, asOf string, limit int)
 		if k.Low <= 0 {
 			k.Low = math.Min(k.Open, k.Close)
 		}
-		k.Volume = int64(volume)
+		k.Volume = int64(volume.Float64)
 		bars = append(bars, k)
 	}
 	if err := rows.Err(); err != nil {
@@ -489,6 +649,18 @@ func (s *HistoryService) initSchema() error {
 			}
 		}
 	}
+	// 迁移:留痕表补 replayed 列(1=复盘时用历史库重算补写,非当日实盘扫描)。留痕系统上线日判定必须排除
+	// 重算行,否则重算过一个老日期,"最早留痕日"被拉前,别的策略的老日期又被误报成"当日未符合"(2026-07-22)。
+	if _, err := s.db.Exec(`ALTER TABLE strategy_scan_picks ADD COLUMN replayed INTEGER DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			historyLog.Warn("添加列 replayed 失败: %v", err)
+		}
+	} else {
+		// 首次加列成功才需要归类历史数据:扫描时刻晚于信号日=事后补算(波段复盘重算是唯一历史来源)。
+		if _, err := s.db.Exec(`UPDATE strategy_scan_picks SET replayed=1 WHERE substr(COALESCE(scanned_at,''),1,10) > signal_date`); err != nil {
+			historyLog.Warn("归类历史补算留痕失败: %v", err)
+		}
+	}
 	// 迁移：基本面二期补资产负债率/净资产/商誉占净资产/股息率列
 	for _, col := range []string{"debt_ratio", "equity", "goodwill_ratio", "dividend_yield"} {
 		if _, err := s.db.Exec("ALTER TABLE stock_fundamentals ADD COLUMN " + col + " REAL"); err != nil {
@@ -565,6 +737,14 @@ func (s *HistoryService) tryAutoCollectOnce() {
 				}
 			}
 			historyLog.Info("每日快照采集完成: %s (%d 只)", today, result.SavedCount)
+			// 收盘后钩子(app 层注入):策略自学习等依赖"当日行情已定型"的任务。
+			// 放在快照成功分支内,每个交易日只触发一次,而非随分钟 tick 反复调用。
+			if s.afterDailyCollect != nil {
+				go func() {
+					defer func() { _ = recover() }()
+					s.afterDailyCollect()
+				}()
+			}
 		} else {
 			historyLog.Warn("每日快照采集失败: %s", result.Message)
 		}
@@ -580,6 +760,33 @@ func (s *HistoryService) tryAutoCollectOnce() {
 			historyLog.Info("缺口回补结束: %s", res.Message)
 		}
 	}
+}
+
+// SetAfterDailyCollect 注册每日采集完成后的回调(app 层注入,如超跌起爆11自学习)。
+func (s *HistoryService) SetAfterDailyCollect(fn func()) {
+	if s != nil {
+		s.afterDailyCollect = fn
+	}
+}
+
+// TradeDatesSince 返回库里 [since, before) 区间的全部交易日(升序)。
+func (s *HistoryService) TradeDatesSince(since, before string) []string {
+	out := []string{}
+	if s == nil || s.db == nil {
+		return out
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT trade_date FROM stock_daily WHERE trade_date>=? AND trade_date<? ORDER BY trade_date`, since, before)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		if rows.Scan(&d) == nil && d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // detectRecentGapDays 检查最近约 40 个自然日内(不含今天)应有的交易日，
@@ -688,9 +895,9 @@ func (s *HistoryService) CollectDailyHistory(req models.HistoryCollectRequest) m
 		return result
 	}
 	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO stock_daily
-		(stock_code, trade_date, stock_name, industry, close_price, turnover, main_net, main_pct, main_source,
+		(stock_code, trade_date, stock_name, industry, close_price, open_price, high_price, low_price, turnover, main_net, main_pct, main_source,
 		 amount, volume, pct_change, total_market_cap, float_market_cap, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		result.Status = "failed"
@@ -715,6 +922,9 @@ func (s *HistoryService) CollectDailyHistory(req models.HistoryCollectRequest) m
 			stock.Name,
 			stock.Industry,
 			stock.Price,
+			nullablePositive(stock.Open),
+			nullablePositive(stock.High),
+			nullablePositive(stock.Low),
 			stock.TurnoverRate,
 			nullableFloat(stock.MainNetInflow),
 			nullableFloat(stock.MainNetInflowRatio),
@@ -747,6 +957,19 @@ func (s *HistoryService) CollectDailyHistory(req models.HistoryCollectRequest) m
 		result.MAUpdated = true
 		result.Status = "success"
 		result.Message = fmt.Sprintf("已采集 %d 条，写入 %d 条", result.TotalCount, result.SavedCount)
+	}
+	// 除权检测+前复权刷新:今日快照隐含昨收 vs 库中昨收偏差>0.4% 的票,把其历史回调到新前复权口径,
+	// 保持本地库与行情源同口径(否则除权股技术面失真,波段复核会大量否决)。
+	if n := s.DetectExDivAndRefresh(tradeDate, stocks); n > 0 {
+		result.Message += fmt.Sprintf("；除权刷新 %d 只", n)
+	}
+	// 断层自愈:当日检测漏掉的除权(截断/失败/口径异常)会永久固化(次日隐含昨收又对上,再也发现不了),
+	// 这里按"close比值 vs 记录pct"补扫近40天并重建,漏一次也能次日捞回。窗口小查询轻,每日跑得起。
+	if t, err := time.Parse("2006-01-02", tradeDate); err == nil {
+		since := t.AddDate(0, 0, -40).Format("2006-01-02")
+		if found, fixed := s.RepairQfqGaps(since, tradeDate, 120); found > 0 {
+			result.Message += fmt.Sprintf("；断层自愈 %d/%d 只", fixed, found)
+		}
 	}
 	result.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
 	s.finishRun(runID, result)
@@ -1360,6 +1583,15 @@ func avgClose(points []historyClosePoint, n int) float64 {
 
 func nullableFloat(v float64) any {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return nil
+	}
+	return v
+}
+
+// nullablePositive 价格类字段专用:非正数(停牌/竞价时段源给0或"-")写 NULL 而不是 0,
+// 下游据 NULL 判"无真值"走兜底,写0会被当成真价格。
+func nullablePositive(v float64) any {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
 		return nil
 	}
 	return v

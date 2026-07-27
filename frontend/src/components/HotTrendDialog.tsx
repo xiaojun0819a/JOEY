@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, TrendingUp, RefreshCw, ExternalLink } from 'lucide-react';
+import { X, TrendingUp, RefreshCw, ExternalLink, Brain } from 'lucide-react';
 import { GetAllHotTrends, OpenURL } from '../../wailsjs/go/main/App';
 import { hottrend } from '../../wailsjs/go/models';
 import { useTheme } from '../contexts/ThemeContext';
@@ -8,9 +8,10 @@ import { isWailsGoReady, warnWailsUnavailable } from '../utils/wailsEnv';
 interface HotTrendDialogProps {
   isOpen: boolean;
   onClose: () => void;
+  onOpenIntel?: () => void; // 打开情报库(第二大脑),入口从顶部工具栏移到本窗头部
 }
 
-export const HotTrendDialog: React.FC<HotTrendDialogProps> = ({ isOpen, onClose }) => {
+export const HotTrendDialog: React.FC<HotTrendDialogProps> = ({ isOpen, onClose, onOpenIntel }) => {
   const { colors } = useTheme();
   const [results, setResults] = useState<hottrend.HotTrendResult[]>([]);
   const [loading, setLoading] = useState(false);
@@ -55,7 +56,7 @@ export const HotTrendDialog: React.FC<HotTrendDialogProps> = ({ isOpen, onClose 
       {/* 弹窗内容 */}
       <div className="relative w-[900px] h-[600px] fin-panel border fin-divider rounded-xl shadow-2xl flex flex-col overflow-hidden">
         {/* 头部 */}
-        <DialogHeader onClose={onClose} onRefresh={loadHotTrends} loading={loading} />
+        <DialogHeader onClose={onClose} onRefresh={loadHotTrends} loading={loading} onOpenIntel={onOpenIntel} />
 
         {/* 主体 */}
         <div className="flex-1 flex overflow-hidden">
@@ -80,7 +81,8 @@ const DialogHeader: React.FC<{
   onClose: () => void;
   onRefresh: () => void;
   loading: boolean;
-}> = ({ onClose, onRefresh, loading }) => {
+  onOpenIntel?: () => void;
+}> = ({ onClose, onRefresh, loading, onOpenIntel }) => {
   const { colors } = useTheme();
   return (
     <div className="flex items-center justify-between px-5 py-4 border-b fin-divider shrink-0">
@@ -94,6 +96,16 @@ const DialogHeader: React.FC<{
         </div>
       </div>
       <div className="flex items-center gap-2">
+        {onOpenIntel && (
+          <button
+            onClick={onOpenIntel}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border transition-colors text-xs font-medium ${colors.isDark ? 'border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10 hover:text-cyan-200' : 'border-cyan-500/50 text-cyan-700 hover:bg-cyan-50'}`}
+            title="交易情报库 · 第二大脑（信息入库 + 反证晨报）"
+          >
+            <Brain className="h-4 w-4" />
+            <span>情报库</span>
+          </button>
+        )}
         <button
           onClick={onRefresh}
           disabled={loading}

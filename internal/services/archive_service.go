@@ -55,29 +55,29 @@ func (s *ArchiveService) Available() bool {
 
 // ArchiveBar 全列日线记录
 type ArchiveBar struct {
-	Code         string  `json:"code"`
-	TradeDate    string  `json:"tradeDate"`
-	Name         string  `json:"name"`
-	Open         float64 `json:"open"`
-	High         float64 `json:"high"`
-	Low          float64 `json:"low"`
-	Close        float64 `json:"close"`
-	PrevClose    float64 `json:"prevClose"`
-	PctChg       float64 `json:"pctChg"`
-	Volume       float64 `json:"volume"` // 手
-	Amount       float64 `json:"amount"` // 千元
-	Turnover     float64 `json:"turnover"`
-	VolumeRatio  float64 `json:"volumeRatio"`
-	PE           float64 `json:"pe"`
-	PETTM        float64 `json:"peTtm"`
-	PB           float64 `json:"pb"`
-	PS           float64 `json:"ps"`
-	DivYield     float64 `json:"divYield"`
-	TotalMcap    float64 `json:"totalMcap"` // 万元
-	FloatMcap    float64 `json:"floatMcap"` // 万元
-	AdjFactor    float64 `json:"adjFactor"`
-	LimitUp      float64 `json:"limitUp"`
-	LimitDown    float64 `json:"limitDown"`
+	Code        string  `json:"code"`
+	TradeDate   string  `json:"tradeDate"`
+	Name        string  `json:"name"`
+	Open        float64 `json:"open"`
+	High        float64 `json:"high"`
+	Low         float64 `json:"low"`
+	Close       float64 `json:"close"`
+	PrevClose   float64 `json:"prevClose"`
+	PctChg      float64 `json:"pctChg"`
+	Volume      float64 `json:"volume"` // 手
+	Amount      float64 `json:"amount"` // 千元
+	Turnover    float64 `json:"turnover"`
+	VolumeRatio float64 `json:"volumeRatio"`
+	PE          float64 `json:"pe"`
+	PETTM       float64 `json:"peTtm"`
+	PB          float64 `json:"pb"`
+	PS          float64 `json:"ps"`
+	DivYield    float64 `json:"divYield"`
+	TotalMcap   float64 `json:"totalMcap"` // 万元
+	FloatMcap   float64 `json:"floatMcap"` // 万元
+	AdjFactor   float64 `json:"adjFactor"`
+	LimitUp     float64 `json:"limitUp"`
+	LimitDown   float64 `json:"limitDown"`
 }
 
 func nvf(v sql.NullFloat64) float64 {
@@ -174,9 +174,36 @@ func (s *ArchiveService) KLine(code, start, end string, days int) ([]models.KLin
 			Low:    round3(b.Low * r),
 			Close:  round3(b.Close * r),
 			Volume: int64(b.Volume),
+			// 换手率与复权无关(量/流通股本),原样带出
+			TurnoverRate: b.Turnover,
 		})
 	}
 	return out, nil
+}
+
+// TurnoverRateMap 档案里某股的真实换手率(1990→档案截止日),返回 交易日→换手率%。
+// 供 K线补换手率:行情源K线不带此字段,热库 stock_daily 只存近期,更早的日期由档案兜底。
+func (s *ArchiveService) TurnoverRateMap(code string) map[string]float64 {
+	db, err := s.open()
+	if err != nil {
+		return nil
+	}
+	rows, err := db.Query(`SELECT trade_date, turnover FROM stock_history WHERE code=? AND turnover IS NOT NULL AND turnover>0`,
+		strings.ToLower(strings.TrimSpace(code)))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make(map[string]float64, 2048)
+	for rows.Next() {
+		var d string
+		var t sql.NullFloat64
+		if err := rows.Scan(&d, &t); err != nil || !t.Valid || t.Float64 <= 0 {
+			continue
+		}
+		out[d] = t.Float64
+	}
+	return out
 }
 
 func round3(v float64) float64 {

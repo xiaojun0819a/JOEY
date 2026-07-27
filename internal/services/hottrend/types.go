@@ -15,18 +15,18 @@ type HotItem struct {
 
 // HotTrendResult 热点获取结果
 type HotTrendResult struct {
-	Platform    string    `json:"platform"`     // 平台标识
-	PlatformCN  string    `json:"platform_cn"`  // 平台中文名
-	Items       []HotItem `json:"items"`        // 热点列表
-	UpdatedAt   time.Time `json:"updated_at"`   // 更新时间
-	FromCache   bool      `json:"from_cache"`   // 是否来自缓存
-	Error       string    `json:"error"`        // 错误信息
+	Platform   string    `json:"platform"`    // 平台标识
+	PlatformCN string    `json:"platform_cn"` // 平台中文名
+	Items      []HotItem `json:"items"`       // 热点列表
+	UpdatedAt  time.Time `json:"updated_at"`  // 更新时间
+	FromCache  bool      `json:"from_cache"`  // 是否来自缓存
+	Error      string    `json:"error"`       // 错误信息
 }
 
 // PlatformInfo 平台信息
 type PlatformInfo struct {
-	ID     string // 平台标识
-	Name   string // 平台中文名
+	ID      string // 平台标识
+	Name    string // 平台中文名
 	HomeURL string // 平台首页
 }
 

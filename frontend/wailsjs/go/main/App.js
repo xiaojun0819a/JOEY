@@ -10,6 +10,10 @@ export function AddIntelNote(arg1, arg2, arg3) {
   return window['go']['main']['App']['AddIntelNote'](arg1, arg2, arg3);
 }
 
+export function AddIntelNoteFromUpload(arg1, arg2, arg3) {
+  return window['go']['main']['App']['AddIntelNoteFromUpload'](arg1, arg2, arg3);
+}
+
 export function AddMCPServer(arg1) {
   return window['go']['main']['App']['AddMCPServer'](arg1);
 }
@@ -24,6 +28,10 @@ export function AddStockGroupDef(arg1) {
 
 export function AddStrategy(arg1) {
   return window['go']['main']['App']['AddStrategy'](arg1);
+}
+
+export function AddTipPicks(arg1, arg2, arg3) {
+  return window['go']['main']['App']['AddTipPicks'](arg1, arg2, arg3);
 }
 
 export function AddToWatchlist(arg1) {
@@ -46,8 +54,20 @@ export function BackfillHistory(arg1) {
   return window['go']['main']['App']['BackfillHistory'](arg1);
 }
 
+export function BackfillMissingOHLC(arg1) {
+  return window['go']['main']['App']['BackfillMissingOHLC'](arg1);
+}
+
+export function BackfillOversoldLearn(arg1) {
+  return window['go']['main']['App']['BackfillOversoldLearn'](arg1);
+}
+
 export function BackfillWatchlistHistory(arg1) {
   return window['go']['main']['App']['BackfillWatchlistHistory'](arg1);
+}
+
+export function BacktestLimitupRetrace(arg1, arg2) {
+  return window['go']['main']['App']['BacktestLimitupRetrace'](arg1, arg2);
 }
 
 export function CancelInterruptedMeeting(arg1) {
@@ -62,6 +82,14 @@ export function CheckForUpdate() {
   return window['go']['main']['App']['CheckForUpdate']();
 }
 
+export function ClearAllPaperPositions() {
+  return window['go']['main']['App']['ClearAllPaperPositions']();
+}
+
+export function ClearPaperPositionsByIDs(arg1) {
+  return window['go']['main']['App']['ClearPaperPositionsByIDs'](arg1);
+}
+
 export function ClearSessionMessages(arg1) {
   return window['go']['main']['App']['ClearSessionMessages'](arg1);
 }
@@ -72,6 +100,18 @@ export function ClosePaperPosition(arg1, arg2) {
 
 export function CollectDailyHistory(arg1) {
   return window['go']['main']['App']['CollectDailyHistory'](arg1);
+}
+
+export function CountAppInstances() {
+  return window['go']['main']['App']['CountAppInstances']();
+}
+
+export function DebugOversoldIgnite(arg1, arg2) {
+  return window['go']['main']['App']['DebugOversoldIgnite'](arg1, arg2);
+}
+
+export function DecideEvolutionProposal(arg1, arg2) {
+  return window['go']['main']['App']['DecideEvolutionProposal'](arg1, arg2);
 }
 
 export function DeleteAgentConfig(arg1) {
@@ -106,6 +146,10 @@ export function DeleteTradeJournal(arg1) {
   return window['go']['main']['App']['DeleteTradeJournal'](arg1);
 }
 
+export function DiagnoseLimitupRetrace() {
+  return window['go']['main']['App']['DiagnoseLimitupRetrace']();
+}
+
 export function DoUpdate() {
   return window['go']['main']['App']['DoUpdate']();
 }
@@ -126,12 +170,20 @@ export function GenerateBoardReport(arg1) {
   return window['go']['main']['App']['GenerateBoardReport'](arg1);
 }
 
+export function GenerateEvolutionProposalsNow() {
+  return window['go']['main']['App']['GenerateEvolutionProposalsNow']();
+}
+
 export function GenerateIntelDigest(arg1) {
   return window['go']['main']['App']['GenerateIntelDigest'](arg1);
 }
 
 export function GenerateStrategy(arg1) {
   return window['go']['main']['App']['GenerateStrategy'](arg1);
+}
+
+export function GetAIReportCalibration() {
+  return window['go']['main']['App']['GetAIReportCalibration']();
 }
 
 export function GetActiveStrategyID() {
@@ -164,6 +216,14 @@ export function GetArchiveStockInfo(arg1) {
 
 export function GetAuctionFinal(arg1, arg2) {
   return window['go']['main']['App']['GetAuctionFinal'](arg1, arg2);
+}
+
+export function GetAuctionPicksC(arg1) {
+  return window['go']['main']['App']['GetAuctionPicksC'](arg1);
+}
+
+export function GetAuctionPicksG(arg1) {
+  return window['go']['main']['App']['GetAuctionPicksG'](arg1);
 }
 
 export function GetAuditLogs(arg1, arg2, arg3, arg4) {
@@ -206,6 +266,10 @@ export function GetBoardReportStatus(arg1, arg2) {
   return window['go']['main']['App']['GetBoardReportStatus'](arg1, arg2);
 }
 
+export function GetBoardResealWatch() {
+  return window['go']['main']['App']['GetBoardResealWatch']();
+}
+
 export function GetCachedBoardReport(arg1, arg2) {
   return window['go']['main']['App']['GetCachedBoardReport'](arg1, arg2);
 }
@@ -230,6 +294,14 @@ export function GetCurrentVersion() {
   return window['go']['main']['App']['GetCurrentVersion']();
 }
 
+export function GetDrillSession(arg1, arg2) {
+  return window['go']['main']['App']['GetDrillSession'](arg1, arg2);
+}
+
+export function GetEvolutionProposals(arg1) {
+  return window['go']['main']['App']['GetEvolutionProposals'](arg1);
+}
+
 export function GetF10Overview(arg1) {
   return window['go']['main']['App']['GetF10Overview'](arg1);
 }
@@ -250,6 +322,14 @@ export function GetHistoryAutoCollectStatus() {
   return window['go']['main']['App']['GetHistoryAutoCollectStatus']();
 }
 
+export function GetHistoryMinuteBackfillStatus() {
+  return window['go']['main']['App']['GetHistoryMinuteBackfillStatus']();
+}
+
+export function GetHistoryMinuteCoverage() {
+  return window['go']['main']['App']['GetHistoryMinuteCoverage']();
+}
+
 export function GetHotTrend(arg1) {
   return window['go']['main']['App']['GetHotTrend'](arg1);
 }
@@ -264,6 +344,10 @@ export function GetIntradayCoverage() {
 
 export function GetKLineData(arg1, arg2, arg3) {
   return window['go']['main']['App']['GetKLineData'](arg1, arg2, arg3);
+}
+
+export function GetLearnOverview() {
+  return window['go']['main']['App']['GetLearnOverview']();
 }
 
 export function GetLongHuBangDetail(arg1, arg2) {
@@ -310,6 +394,10 @@ export function GetMarketStylePreference() {
   return window['go']['main']['App']['GetMarketStylePreference']();
 }
 
+export function GetMinuteHistory(arg1, arg2) {
+  return window['go']['main']['App']['GetMinuteHistory'](arg1, arg2);
+}
+
 export function GetOpenClawStatus() {
   return window['go']['main']['App']['GetOpenClawStatus']();
 }
@@ -320,6 +408,14 @@ export function GetOrCreateSession(arg1, arg2) {
 
 export function GetOrderBook(arg1) {
   return window['go']['main']['App']['GetOrderBook'](arg1);
+}
+
+export function GetOversoldLearnReport() {
+  return window['go']['main']['App']['GetOversoldLearnReport']();
+}
+
+export function GetPaperAutoPaused() {
+  return window['go']['main']['App']['GetPaperAutoPaused']();
 }
 
 export function GetPaperRiskSummary() {
@@ -370,6 +466,10 @@ export function GetStrategies() {
   return window['go']['main']['App']['GetStrategies']();
 }
 
+export function GetStrategyLearnReport(arg1) {
+  return window['go']['main']['App']['GetStrategyLearnReport'](arg1);
+}
+
 export function GetStrategyNextDayReview(arg1) {
   return window['go']['main']['App']['GetStrategyNextDayReview'](arg1);
 }
@@ -402,12 +502,28 @@ export function GetWatchlist() {
   return window['go']['main']['App']['GetWatchlist']();
 }
 
+export function GetWaveScanStatus() {
+  return window['go']['main']['App']['GetWaveScanStatus']();
+}
+
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
 }
 
+export function ImportAIReport(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['ImportAIReport'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
+}
+
 export function IsTrustedRemoteUser(arg1) {
   return window['go']['main']['App']['IsTrustedRemoteUser'](arg1);
+}
+
+export function LearnAllStrategiesNow() {
+  return window['go']['main']['App']['LearnAllStrategiesNow']();
+}
+
+export function LearnOversoldNow() {
+  return window['go']['main']['App']['LearnOversoldNow']();
 }
 
 export function ListIntelNotes(arg1, arg2) {
@@ -428,6 +544,10 @@ export function Login(arg1, arg2) {
 
 export function NotifyFrontendReady() {
   return window['go']['main']['App']['NotifyFrontendReady']();
+}
+
+export function OpenNewWindow() {
+  return window['go']['main']['App']['OpenNewWindow']();
 }
 
 export function OpenURL(arg1) {
@@ -460,6 +580,10 @@ export function RenameStockGroupDef(arg1, arg2) {
 
 export function ReopenPaperPosition(arg1) {
   return window['go']['main']['App']['ReopenPaperPosition'](arg1);
+}
+
+export function RepairQfqGaps(arg1) {
+  return window['go']['main']['App']['RepairQfqGaps'](arg1);
 }
 
 export function ReprobeBackend() {
@@ -522,6 +646,10 @@ export function RunLimitPullbackScanner(arg1) {
   return window['go']['main']['App']['RunLimitPullbackScanner'](arg1);
 }
 
+export function RunLimitupRetraceScanner(arg1) {
+  return window['go']['main']['App']['RunLimitupRetraceScanner'](arg1);
+}
+
 export function RunLowBuyBatchReplay(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['RunLowBuyBatchReplay'](arg1, arg2, arg3, arg4);
 }
@@ -542,6 +670,10 @@ export function RunMonsterScannerV9(arg1) {
   return window['go']['main']['App']['RunMonsterScannerV9'](arg1);
 }
 
+export function RunOversoldIgniteScanner(arg1) {
+  return window['go']['main']['App']['RunOversoldIgniteScanner'](arg1);
+}
+
 export function RunPaperStrategyAccount(arg1) {
   return window['go']['main']['App']['RunPaperStrategyAccount'](arg1);
 }
@@ -552,6 +684,10 @@ export function RunPortfolioBacktest(arg1) {
 
 export function RunPositionMonitorOnce() {
   return window['go']['main']['App']['RunPositionMonitorOnce']();
+}
+
+export function RunQfqRebuild(arg1) {
+  return window['go']['main']['App']['RunQfqRebuild'](arg1);
 }
 
 export function RunStrategyAccount(arg1, arg2) {
@@ -602,6 +738,10 @@ export function RunWaveScannerWithGate(arg1) {
   return window['go']['main']['App']['RunWaveScannerWithGate'](arg1);
 }
 
+export function RunWaveTimingBacktest(arg1, arg2) {
+  return window['go']['main']['App']['RunWaveTimingBacktest'](arg1, arg2);
+}
+
 export function SaveTradeJournal(arg1) {
   return window['go']['main']['App']['SaveTradeJournal'](arg1);
 }
@@ -620,6 +760,14 @@ export function SendMeetingMessage(arg1) {
 
 export function SetActiveStrategy(arg1) {
   return window['go']['main']['App']['SetActiveStrategy'](arg1);
+}
+
+export function SetPaperAutoExit(arg1, arg2) {
+  return window['go']['main']['App']['SetPaperAutoExit'](arg1, arg2);
+}
+
+export function SetPaperAutoPaused(arg1) {
+  return window['go']['main']['App']['SetPaperAutoPaused'](arg1);
 }
 
 export function SetRegisterInviteCode(arg1) {
@@ -644,6 +792,14 @@ export function SetUserTrusted(arg1, arg2) {
 
 export function StartBoardReport(arg1) {
   return window['go']['main']['App']['StartBoardReport'](arg1);
+}
+
+export function StartDrillTapeBackfill(arg1, arg2) {
+  return window['go']['main']['App']['StartDrillTapeBackfill'](arg1, arg2);
+}
+
+export function StartHistoryMinuteBackfill(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartHistoryMinuteBackfill'](arg1, arg2, arg3);
 }
 
 export function StartResearchReport(arg1, arg2) {
@@ -696,6 +852,10 @@ export function UpdateStrategy(arg1) {
 
 export function WindowClose() {
   return window['go']['main']['App']['WindowClose']();
+}
+
+export function WindowIsFullscreen() {
+  return window['go']['main']['App']['WindowIsFullscreen']();
 }
 
 export function WindowMaximize() {

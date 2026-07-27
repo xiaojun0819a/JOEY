@@ -84,7 +84,7 @@ func (s *CompositeScoreService) StartAutoRun(paper *PaperService) {
 				if shares < 100 {
 					shares = 100
 				}
-				if _, err := paper.Add(r.Symbol, r.Name, "综合评分", r.Price, shares); err != nil {
+				if _, err := paper.Add(r.Symbol, r.Name, "综合评分", r.Price, shares, "auto"); err != nil {
 					log.Warn("综合评分自动开仓失败 %s: %v", r.Symbol, err)
 				} else {
 					opened++

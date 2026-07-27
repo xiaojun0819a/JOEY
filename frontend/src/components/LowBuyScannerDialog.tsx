@@ -1,10 +1,13 @@
+import { getStrategyLearnReport } from '../services/scannerService';
 import React, { useEffect, useState } from 'react';
-import { Database, Loader2, RefreshCw, Search, X, AlertTriangle, CheckCircle2, SlidersHorizontal, BarChart3, Info, Check } from 'lucide-react';
+import { Database, Loader2, RefreshCw, Search, X, AlertTriangle, CheckCircle2, SlidersHorizontal, BarChart3, Info, Check, Gauge } from 'lucide-react';
 import type { Stock } from '../types';
 import { AddToGroupButton } from './AddToGroupButton';
 import { BatchAddToGroupButton } from './BatchAddToGroupButton';
 import { StrategyScorecard } from './StrategyScorecard';
 import { StrategyReviewDialog } from './StrategyReviewDialog';
+import { FeelDrillDialog } from './FeelDrillDialog';
+import { exitReasonLabel } from '../utils/exitReason';
 import { runBacktest, type BacktestResult } from '../services/backtestService';
 import { runTailLazyBatchReplay, type TailLazyBatchResult, runLowBuyBatchReplay, type LowBuyBatchResult } from '../services/scannerService';
 
@@ -127,9 +130,10 @@ interface LowBuyScannerDialogProps {
   onUpdateHistoryAutoCollect: (req: HistoryAutoCollectRequest) => Promise<HistoryAutoCollectStatus | null>;
   onAddToWatchlist: (stock: Stock) => Promise<boolean>;
   watchlistSymbols: string[];
-  onOpenStock?: (stock: Stock) => void | Promise<void>;
+  // asOf 非空 = 体感练习点进来的,全屏图只画到该日为止(防泄题)
+  onOpenStock?: (stock: Stock, asOf?: string) => void | Promise<void>;
   onOpenLateDayChase: () => void;
-  strategyMode?: 'lowbuy' | 'limit-pullback' | 'triple-volume' | 'tail-buy' | 'hot-money' | 'dip-entry' | 'monster' | 'monster-v10' | 'taillazy' | 'caoyuan-standard4a' | 'caoyuan-zhuang4b';
+  strategyMode?: 'lowbuy' | 'limit-pullback' | 'triple-volume' | 'tail-buy' | 'hot-money' | 'dip-entry' | 'monster' | 'monster-v10' | 'taillazy' | 'oversold-ignite' | 'limitup-retrace' | 'caoyuan-standard4a' | 'caoyuan-zhuang4b';
   onReplay?: (date: string) => void;
 }
 
@@ -235,11 +239,14 @@ const TailLazyRulesPopover: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       <Sec title="④ 操作">
         <div>· 买点：<b>尾盘14:30-15:00分批</b>买入</div>
         <div>· 卖点：<b>次日上午冲高5-6点止盈</b>；乏力/平开保本走</div>
-        <div>· 止损：次日走弱或 <b>−3%</b> 离场</div>
+        <div>· 止损：次日走弱或 <b>−5%</b> 离场</div>
       </Sec>
 
       <div className="mt-1 pt-2 border-t fin-divider text-[10px] fin-text-tertiary leading-relaxed">
-        定位：短线动量打板式，适合上班族尾盘挂单、次日上午了结。错亏2-3点、对赚5-6点起。形态那条为系统近似，仍建议人工瞄一眼K线。
+        定位：短线动量打板式，适合上班族尾盘挂单、次日上午了结。错亏5点内、对赚5-6点起。形态那条为系统近似，仍建议人工瞄一眼K线。
+      </div>
+      <div className="mt-1.5 text-[10px] text-amber-400/90 leading-relaxed">
+        ⚠️ 上面「卖点」是手动操作建议。本策略挂在低吸家族的 V1.2 引擎，模拟盘<b>自动</b>平仓按：−5% 止损 / +15% 减半 / 破 MA10 连续 2 日 / 5 日&lt;3% 清。止损两边已一致（均 −5%），止盈口径仍不同。
       </div>
     </div>
   );
@@ -303,7 +310,7 @@ const TripleVolumeRulesPopover: React.FC<{ onClose: () => void }> = ({ onClose }
     <div className="absolute left-0 top-[calc(100%+8px)] z-[80] w-[500px] max-h-[64vh] overflow-auto fin-panel-strong border fin-divider rounded-lg shadow-2xl p-3.5">
       <div className="flex items-start justify-between gap-3 mb-2">
         <div>
-          <div className="text-sm font-semibold fin-text-primary">三倍量策略5 · 规则要点</div>
+          <div className="text-sm font-semibold fin-text-primary">三倍量策略 · 规则要点</div>
           <div className="text-[10px] fin-text-tertiary">主板10cm口径：放量突破多条均线，次日缩量回踩再确认</div>
         </div>
         <button onClick={onClose} className="p-1 rounded fin-hover" title="关闭"><X className="h-3.5 w-3.5 fin-text-tertiary" /></button>
@@ -340,7 +347,7 @@ const TripleVolumeRulesPopover: React.FC<{ onClose: () => void }> = ({ onClose }
 const FormulaKLineRulesPopover: React.FC<{ kind: string; onClose: () => void }> = ({ kind, onClose }) => {
   const profiles: Record<string, { title: string; subtitle: string; sections: Array<{ title: string; lines: string[] }> }> = {
     'tail-buy': {
-      title: '尾盘买入策略6 · 规则要点',
+      title: '尾盘买入策略 · 规则要点',
       subtitle: '昨日资金强势触发，今日阴线回踩，尾盘确认承接',
       sections: [
         { title: '① 选股节奏', lines: ['昨日 WPZY_NP 触发：强势位置、换手>5%、站上强势均线代理', '今日 C<O：不追昨日强阳，只看尾盘回踩承接'] },
@@ -349,7 +356,7 @@ const FormulaKLineRulesPopover: React.FC<{ kind: string; onClose: () => void }> 
       ],
     },
     'hot-money': {
-      title: '游资突破策略7 · 规则要点',
+      title: '游资突破策略 · 规则要点',
       subtitle: '涨停/准涨停结构 + 量能倍率 + 流通股本分档',
       sections: [
         { title: '① 结构信号', lines: ['LZY_11 / LZY_L8 / LZY_1W：涨停、连阳、隔日再启动结构', '收盘贴近最高价，代表游资突破强度'] },
@@ -358,7 +365,7 @@ const FormulaKLineRulesPopover: React.FC<{ kind: string; onClose: () => void }> 
       ],
     },
     'dip-entry': {
-      title: '低吸入场策略8 · 规则要点',
+      title: '低吸入场策略 · 规则要点',
       subtitle: '三类短线反转信号至少2类共振',
       sections: [
         { title: '① 三类信号', lines: ['GQZY_CD：RSI5上穿20，同时上穿RSI8且低于50', 'GQZY_KK：快速RSI上穿11', 'GQZY_8J：动能线低位反转并通过FILTER去重'] },
@@ -367,7 +374,7 @@ const FormulaKLineRulesPopover: React.FC<{ kind: string; onClose: () => void }> 
       ],
     },
     monster: {
-      title: '捉妖策略9 · 规则要点',
+      title: '捉妖策略 · 规则要点',
       subtitle: '原“捉妖选股”公式的可落地复刻',
       sections: [
         { title: '① 信号来源', lines: ['长期沉寂后突然转强', '放量突破前高或突破后第2日确认', '布林收敛后爆发', '60日低点反抽只做辅助，不单独出票'] },
@@ -377,7 +384,7 @@ const FormulaKLineRulesPopover: React.FC<{ kind: string; onClose: () => void }> 
       ],
     },
     'monster-v10': {
-      title: '捉妖策略10 · 规则要点',
+      title: '捉妖(旧v10) · 规则要点',
       subtitle: '通达信公式严格复刻，不沿用策略9代理放宽',
       sections: [
         { title: '① 最终入选', lines: ['只看原公式最后一行：捉妖选股 = GGZY_ZS', 'GGZY_ZS = FILTER(GGZY_IG=1,3)，评分只用于排序展示'] },
@@ -575,6 +582,8 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
   const isDipEntry = strategyMode === 'dip-entry';
   const isMonster = strategyMode === 'monster';
   const isMonsterV10 = strategyMode === 'monster-v10';
+  const isOversoldIgnite = strategyMode === 'oversold-ignite';
+  const isLimitupRetrace = strategyMode === 'limitup-retrace';
   const isFormulaKLine = isTripleVolume || isTailBuy || isHotMoney || isDipEntry || isMonster || isMonsterV10;
   const isCaoYuanStandard = strategyMode === 'caoyuan-standard4a';
   const isCaoYuanZhuang = strategyMode === 'caoyuan-zhuang4b';
@@ -582,14 +591,9 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
   const [replayDate, setReplayDate] = useState('');
   const isReplay = !!result?.items?.[0]?.nextDate;
   const isLbReplay = !!result?.items?.[0]?.replayExitReason;
-  const exitReasonCN = (r?: string): string => {
-    if (!r) return '';
-    const half = r.startsWith('half_');
-    const key = half ? r.slice(5) : r;
-    const m: Record<string, string> = { stop_loss: '止损-5%', ma10: '破10线', turnover: '换手>12%', time_stop: '5日<3%', take_profit: '止盈+15%', window_end: '未到期' };
-    const base = m[key] || key;
-    return half ? `减半·${base}` : base;
-  };
+  // 回放语境:空 = 该笔还没触发离场;window_end 是"回放窗口走完还没走人",不是"到期离场"。
+  const exitReasonCN = (r?: string): string =>
+    r ? exitReasonLabel(r, { window_end: '未到期' }) : '';
   const [showBatch, setShowBatch] = useState(false);
   const [batchStart, setBatchStart] = useState('2024-01-01');
   const [batchEnd, setBatchEnd] = useState(new Date().toISOString().slice(0, 10));
@@ -634,6 +638,9 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
   const [btLoading, setBtLoading] = useState(false);
   const [showRules, setShowRules] = useState(false);
   const [showNextDayReview, setShowNextDayReview] = useState(false);
+  const [showDrill, setShowDrill] = useState(false);
+  const [learnReport, setLearnReport] = useState<string | null>(null);
+  const [learnLoading, setLearnLoading] = useState(false);
   const [batchSelectMode, setBatchSelectMode] = useState(false);
   const [batchSelectedSymbols, setBatchSelectedSymbols] = useState<string[]>([]);
   const strategySource = isTailLazy
@@ -652,6 +659,10 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
         ? 'monster-v9'
       : isMonsterV10
         ? 'monster-v10'
+      : isOversoldIgnite
+        ? 'oversold-ignite-v1'
+      : isLimitupRetrace
+        ? 'limitup-retrace-v12'
       : isCaoYuanStandard
         ? (caoYuanStrict ? 'caoyuan-standard4a-strict' : 'caoyuan-standard4a')
         : isCaoYuanZhuang
@@ -1018,7 +1029,7 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
                 </button>
               </div>
             )}
-            {onReplay && !isCaoYuan && !isLimitPullback && !isFormulaKLine && (
+            {onReplay && !isCaoYuan && !isLimitPullback && !isFormulaKLine && !isOversoldIgnite && (
               <div className="flex items-center gap-1.5 mr-1">
                 <span className="text-[11px] fin-text-tertiary">复盘日</span>
                 <input
@@ -1048,7 +1059,7 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
               </div>
             )}
             <div className="relative">
-              {!isTailLazy && !isCaoYuan && !isLimitPullback && !isFormulaKLine && (
+              {!isTailLazy && !isCaoYuan && !isLimitPullback && !isFormulaKLine && !isOversoldIgnite && (
               <button
                 onClick={toggleHistoryPanel}
                 disabled={loading}
@@ -1063,7 +1074,7 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
                 <span>调节历史维度</span>
               </button>
               )}
-              {!isTailLazy && !isCaoYuan && !isLimitPullback && !isFormulaKLine && showHistoryPanel && (
+              {!isTailLazy && !isCaoYuan && !isLimitPullback && !isFormulaKLine && !isOversoldIgnite && showHistoryPanel && (
                 <div className="absolute right-0 top-[calc(100%+8px)] z-[70] w-[420px] fin-panel-strong border fin-divider rounded-lg shadow-2xl p-3 text-xs">
                   <div className="flex items-start justify-between gap-3 mb-3">
                     <div>
@@ -1379,6 +1390,36 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
               <span>次日复盘</span>
             </button>
             <button
+              type="button"
+              onClick={() => setShowDrill(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border border-sky-400/45 text-sky-200 bg-sky-500/8 hover:bg-sky-500/15 transition-colors"
+              title="盲选练习:只看某日收盘扫描选出的证据挑一只,再用次日真实分时回放、由你自己按卖出,练选股与离场手感"
+            >
+              <Gauge className="h-3.5 w-3.5" />
+              <span>体感练习</span>
+            </button>
+            {(
+              <button
+                type="button"
+                onClick={async () => {
+                  if (learnReport !== null) { setLearnReport(null); return; }
+                  setLearnLoading(true);
+                  try { setLearnReport(await getStrategyLearnReport(strategySource)); } catch (e) { setLearnReport(String(e)); }
+                  setLearnLoading(false);
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border border-violet-400/45 text-violet-200 bg-violet-500/8 hover:bg-violet-500/15 transition-colors"
+                title="每日自动学习:历史入选×次日结果按特征分桶统计,提炼上涨/下跌共同点;硬门槛不自动改,达标发现只作用于评分权重"
+              >
+                <BarChart3 className="h-3.5 w-3.5" />
+                <span>{learnLoading ? '加载中...' : learnReport !== null ? '收起日报' : '学习日报'}</span>
+              </button>
+            )}
+            {learnReport !== null && (
+              <div className="w-full mt-2 p-3 rounded-lg border border-violet-400/30 bg-violet-500/5 max-h-72 overflow-y-auto">
+                <pre className="text-[11px] leading-relaxed whitespace-pre-wrap fin-text-secondary">{learnReport}</pre>
+              </div>
+            )}
+            <button
               onClick={handleCollectHistory}
               disabled={loading || collectingHistory}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border fin-divider hover:border-accent/50 transition-colors"
@@ -1470,7 +1511,7 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
           );
         })()}
 
-        {result && !isTailLazy && !isCaoYuan && !isFormulaKLine && !isLbReplay && (
+        {result && !isTailLazy && !isCaoYuan && !isFormulaKLine && !isOversoldIgnite && !isLbReplay && (
           <div className="px-4 py-2 border-b fin-divider-soft text-xs">
             <div className="flex items-center gap-4 flex-wrap">
             <div className={`inline-flex items-center gap-1 ${result.marketGatePassed ? 'text-emerald-300' : 'text-amber-300'}`}>
@@ -1764,12 +1805,36 @@ export const LowBuyScannerDialog: React.FC<LowBuyScannerDialogProps> = ({
         </div>
       </div>
     </div>
+    <FeelDrillDialog
+      isOpen={showDrill}
+      onClose={() => setShowDrill(false)}
+      strategyId={strategySource}
+      strategyName={reviewStrategyName}
+      onOpenStock={onOpenStock ? (symbol, name, price, asOf) => {
+        // 不关练习弹窗:全屏图在练习模式下层级更高(z-110),关掉图还能接着挑
+        void onOpenStock({
+          symbol, name, price,
+          change: 0, changePercent: 0, volume: 0, amount: 0,
+          marketCap: '', sector: '', open: price, high: price, low: price, preClose: price,
+        } as Stock, asOf);
+      } : undefined}
+    />
     <StrategyReviewDialog
       isOpen={showNextDayReview}
       onClose={() => setShowNextDayReview(false)}
       strategyId={strategySource}
       strategyName={reviewStrategyName}
       signalDate={result?.asOf}
+      onOpenStock={onOpenStock ? (symbol, name, price) => {
+        // 与波段复盘同款:关掉复盘+扫描两层弹窗,直达全屏四窗口(鱼身组合)
+        setShowNextDayReview(false);
+        onClose();
+        void onOpenStock({
+          symbol, name, price,
+          change: 0, changePercent: 0, volume: 0, amount: 0,
+          marketCap: '', sector: '', open: price, high: price, low: price, preClose: price,
+        });
+      } : undefined}
     />
     </>
   );

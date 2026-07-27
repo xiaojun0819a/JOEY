@@ -206,7 +206,7 @@ func evaluateTailLazyBtRow(rows []btRow, ri int) (bool, int, float64, float64, [
 
 // tailBatchAcc 批量复盘累加器
 type tailBatchAcc struct {
-	n, hit3, hit5, win        int
+	n, hit3, hit5, win                 int
 	sumHigh, sumOpen, sumClose, sumNet float64
 }
 
@@ -363,8 +363,12 @@ func (s *HistoryService) ScanLowBuyOnDate(date string, limit int, maxChangePct f
 			break
 		}
 	}
-	if di < 0 || di >= len(dates)-1 {
-		return nil, asOf, "该日不是交易日或无次日数据"
+	if di < 0 {
+		return nil, asOf, "该日不是交易日"
+	}
+	if di >= len(dates)-1 {
+		// 拆开说:此前和"不是交易日"合并成一句,导致最新交易日复盘被误读成"这天休市"。
+		return nil, asOf, asOf + " 是库里最新交易日,还没有次日行情——本复盘算的是 T+1 开盘进场的持有结果,要等下一个交易日收盘后才能出;先看更早的日期"
 	}
 	items := make([]models.LowBuyScannerItem, 0, limit)
 	for _, c := range dayCandidates(series, asOf, 0, limit) {
@@ -474,7 +478,7 @@ func (s *HistoryService) ScanTailLazyOnDate(date string, limit int) ([]models.Lo
 			TriggerCount: len(triggers), Triggers: triggers, Reasons: reasons, RiskFlags: risks,
 			BuyPointHint:  "尾盘14:30-15:00分批买入，次日上午冲高止盈",
 			SellPointHint: "次日上午冲高5-6个点止盈；冲高乏力/平开即保本走",
-			StopLossHint:  "次日走弱或跌破买入价-3%，止损离场",
+			StopLossHint:  "次日走弱或跌破买入价-5%，止损离场",
 			MA10:          ma10, MA10Status: ma10Status,
 		}
 		// 次日表现（以当日收盘为买入价）

@@ -91,37 +91,38 @@ type GenerateBoardReportResponse struct {
 
 // App struct
 type App struct {
-	ctx               context.Context
-	remoteMode        bool   // true=桌面探测到 NAS 后端可达,本地进瘦身模式(不启调度器),前端路由到 NAS
-	remoteConfigured  bool   // true=配置了 remoteBackendUrl(不论是否连上);连不上则回落但需提示用户
-	remoteURL         string // 解析后的远程后端地址
-	guestUsername     string // 非空 = 本实例是某访客的分身(headless 多用户隔离),个人数据服务指向该用户私有目录
-	guestDataDir      string // 访客私有数据目录(dataDir/users/<name>);主人实例为空
-	configService     *services.ConfigService
-	marketService     *services.MarketService
-	newsService       *services.NewsService
-	f10Service        *services.F10Service
-	historyService    *services.HistoryService
-	archiveService    *services.ArchiveService // 1991-2025 全量历史档案(archive.db)
-	intradayService   *services.IntradayService // 竞价/分时实时采集(intraday.db)
-	pushService       *services.PushService
-	monitorService    *services.MonitorService
-	journalService    *services.JournalService
-	paperService      *services.PaperService
-	hotTrendService   *hottrend.HotTrendService
-	longHuBangService *services.LongHuBangService
+	ctx                   context.Context
+	remoteMode            bool      // true=桌面探测到 NAS 后端可达,本地进瘦身模式(不启调度器),前端路由到 NAS
+	remoteConfigured      bool      // true=配置了 remoteBackendUrl(不论是否连上);连不上则回落但需提示用户
+	remoteURL             string    // 解析后的远程后端地址
+	lastBackendProbe      time.Time // 上次真实探测后端的时刻;GetBackendMode 据此去重,免得刚探完又探(真离线时白白多等几秒)
+	guestUsername         string    // 非空 = 本实例是某访客的分身(headless 多用户隔离),个人数据服务指向该用户私有目录
+	guestDataDir          string    // 访客私有数据目录(dataDir/users/<name>);主人实例为空
+	configService         *services.ConfigService
+	marketService         *services.MarketService
+	newsService           *services.NewsService
+	f10Service            *services.F10Service
+	historyService        *services.HistoryService
+	archiveService        *services.ArchiveService  // 1991-2025 全量历史档案(archive.db)
+	intradayService       *services.IntradayService // 竞价/分时实时采集(intraday.db)
+	pushService           *services.PushService
+	monitorService        *services.MonitorService
+	journalService        *services.JournalService
+	paperService          *services.PaperService
+	hotTrendService       *hottrend.HotTrendService
+	longHuBangService     *services.LongHuBangService
 	compositeScoreService *services.CompositeScoreService // 综合评分选股(惰性初始化)
-	backupService     *services.BackupService             // 数据备份(惰性初始化)
-	marketPusher      *services.MarketDataPusher
-	meetingService    *meeting.Service
-	sessionService    *services.SessionService
-	strategyService   *services.StrategyService
-	agentContainer    *agent.Container
-	toolRegistry      *tools.Registry
-	mcpManager        *mcp.Manager
-	memoryManager     *memory.Manager
-	updateService     *services.UpdateService
-	openClawServer    *openclaw.Server
+	backupService         *services.BackupService         // 数据备份(惰性初始化)
+	marketPusher          *services.MarketDataPusher
+	meetingService        *meeting.Service
+	sessionService        *services.SessionService
+	strategyService       *services.StrategyService
+	agentContainer        *agent.Container
+	toolRegistry          *tools.Registry
+	mcpManager            *mcp.Manager
+	memoryManager         *memory.Manager
+	updateService         *services.UpdateService
+	openClawServer        *openclaw.Server
 
 	// 会议取消管理
 	meetingCancels   map[string]context.CancelFunc
@@ -375,6 +376,13 @@ func (a *App) startup(ctx context.Context) {
 
 	// 初始化并启动市场数据推送服务（需要 context）
 	a.marketPusher = services.NewMarketDataPusher(a.marketService, a.configService, a.newsService)
+	// 推送与 App.GetKLineData 同口径:否则推来的日K没有换手率,整体覆盖前端已补好的数据
+	a.marketPusher.SetKLineEnricher(func(code, period string, data []models.KLineData) []models.KLineData {
+		if period != "1d" {
+			return data // 换手率只补日K(周/月K末根与日K同形,补了就是错的口径)
+		}
+		return a.fillTurnoverRate(code, data)
+	})
 	a.marketPusher.Start(ctx)
 	log.Info("市场数据推送服务已启动")
 
@@ -397,6 +405,36 @@ func (a *App) startup(ctx context.Context) {
 		a.intradayService.Start(ctx)
 	}
 
+	// 超跌起爆11自学习:每日收盘采集完成后,自动把昨日入选×次日结果配对入学习库并刷新学习日报。
+	if a.historyService != nil {
+		a.historyService.SetAfterDailyCollect(func() {
+			a.LearnAllStrategiesNow() // 全策略共享自学习(2026-07-24 由11泛化)
+			if n, summary := a.historyService.GenerateEvolutionProposals(strategyReviewName); n > 0 {
+				rt.LogInfof("策略进化提案 %d 条待确认:\n%s", n, summary)
+				if a.pushService != nil {
+					a.pushService.Push(models.PushSignal{
+						Type: "strategy-evolve", Level: "active", StockCode: "evolve", StockName: "策略进化",
+						Message: fmt.Sprintf("🧬 策略进化提案 %d 条待确认(数据依据见学习日报/提案列表):\n%s", n, summary),
+					})
+				}
+			}
+		})
+	}
+
+	// 策略历史重算注册:复盘选到无留痕日期(含留痕系统上线前)时,用本地前复权日K按线上同口径重算。
+	// 波段在 rebuild 里内置;这里注册可诚实重算的纯日K策略(2026-07-22 用户定"都可以")。
+	// 尾盘3/低吸系/游资7 依赖实时盘口(涨幅榜分时确认/盘口封单),不可诚实重算,不注册。
+	if a.historyService != nil {
+		a.historyService.SetStrategyReplay("triple-volume-v5", a.replayTripleVolumeOnDate)
+		a.historyService.SetStrategyReplay("limit-pullback-v1", a.replayLimitPullbackOnDate)
+		a.historyService.SetStrategyReplay("tail-buy-v6", a.replayFormulaStrategyOnDate("tail-buy-v6", "尾盘买入策略", a.RunTailBuyScannerV6))
+		a.historyService.SetStrategyReplay("monster-v9", a.replayFormulaStrategyOnDate("monster-v9", "捉妖策略", a.RunMonsterScannerV9))
+		a.historyService.SetStrategyReplay("monster-v10", a.replayFormulaStrategyOnDate("monster-v10", "捉妖(旧v10)", a.RunMonsterScannerV10))
+		// 尾盘3:实时盘口型,但全市场历史分时已回补(2026-05 全市场/1-6月涨幅榜前100),可诚实回放14:50时点
+		a.historyService.SetStrategyReplay("latechase-v3", a.replayLateChaseOnDate)
+		a.historyService.SetStrategyReplay("oversold-ignite-v1", a.replayOversoldIgniteOnDate)
+	}
+
 	// 启动时对模拟持仓按低吸退出纪律自动平仓一次（用真实前向日K，仅确认收盘）
 	if a.paperService != nil {
 		go func() {
@@ -407,19 +445,26 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	if a.monitorService != nil {
+		// 注入游资炸板回封状态机(封死→炸板→回封买入,成文规则v1,盘中每分钟)
+		a.monitorService.SetBoardResealFunc(a.checkBoardReseal)
+		// 注入模拟持仓风控巡检(盘中每5分钟:止损/止盈实时触线;尾盘14:45后收盘口径条款当天执行)
+		a.monitorService.SetPaperExitFunc(func() {
+			if n := a.ApplyPaperExitRules(); n > 0 {
+				log.Info("盘中风控巡检自动平仓 %d 笔", n)
+			}
+		})
 		// 注入尾盘买点扫描回调（14:00 触发，扫描内部已按 Top3 推送）
 		a.monitorService.SetBuyScanFunc(func() {
 			a.RunLowBuyScannerV1(models.LowBuyScannerRequest{Limit: 5})
 		})
-		// 注入盘后波段策略扫描回调（17:30 触发，全A、加闸门、Top5 推送）
-		a.monitorService.SetWaveScanFunc(func() {
-			a.RunWaveScanner()
-		})
+		// 波段扫描已改纯手动(2026-07-20 用户定):不再注入 17:30 自动扫描回调。
+		// monitor 的 wavescan 定时窗仍在,但 waveScan==nil 时是空转。
+		// 注意:复盘留痕依赖"当天扫过一次"——手动模式下哪天没扫,当天就没有波段留痕/复盘数据。
 		a.monitorService.Start(ctx)
 		log.Info("盘中信号监控服务已启动")
 	}
 	a.startTailForwardScheduler()
-	log.Info("2:30实盘向前验证调度器已启动")
+	log.Info("2:50实盘向前验证调度器已启动(2026-07-21 由14:30改为14:50)")
 
 	// 启动 OpenClaw 服务（如果已启用）
 	cfg := a.configService.GetConfig()
@@ -447,36 +492,43 @@ func (a *App) ReprobeBackend() BackendMode {
 	return a.GetBackendMode()
 }
 
-// detectRemoteBackend 探测配置的远程后端(NAS)是否可达。短超时，不阻塞启动。
-func (a *App) detectRemoteBackend() {
-	if !allowRemoteBackend {
-		return // headless 后端：永不委托给远程
+// probeBackendHealth 探一次远程后端 /health,通=true。
+func probeBackendHealth(base string, timeout time.Duration) bool {
+	base = strings.TrimRight(base, "/")
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(base + "/health")
+	if err != nil {
+		return false
 	}
-	var lanURL, pubURL string
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// remoteBackendURLs 取配置里的内网/公网后端地址。
+// 两个都没配 = 分发出去的机器,用内置默认公网地址,保证 exe 单独双击也连服务器。
+func (a *App) remoteBackendURLs() (lanURL, pubURL string) {
 	if a.configService != nil {
 		cfg := a.configService.GetConfig()
 		lanURL = strings.TrimSpace(cfg.RemoteBackendURL)
 		pubURL = strings.TrimSpace(cfg.RemoteBackendPublicURL)
 	}
-	// config 完全没配地址时,用内置分发默认(公网 NAS),保证 exe 单独双击也连服务器。
 	if lanURL == "" && pubURL == "" {
 		pubURL = defaultRemoteBackendPublicURL
 	}
+	return
+}
+
+// detectRemoteBackend 探测配置的远程后端(NAS)是否可达。短超时，不阻塞启动。
+func (a *App) detectRemoteBackend() {
+	if !allowRemoteBackend {
+		return // headless 后端：永不委托给远程
+	}
+	defer func() { a.lastBackendProbe = time.Now() }()
+	lanURL, pubURL := a.remoteBackendURLs()
 	a.remoteConfigured = true
 
-	probe := func(base string, timeout time.Duration) bool {
-		base = strings.TrimRight(base, "/")
-		client := &http.Client{Timeout: timeout}
-		resp, err := client.Get(base + "/health")
-		if err != nil {
-			return false
-		}
-		defer resp.Body.Close()
-		return resp.StatusCode == http.StatusOK
-	}
-
 	// 先内网(快):主人在家走局域网
-	if lanURL != "" && probe(lanURL, 2*time.Second) {
+	if lanURL != "" && probeBackendHealth(lanURL, 2*time.Second) {
 		a.remoteMode = true
 		a.remoteURL = strings.TrimRight(lanURL, "/")
 		return
@@ -496,7 +548,7 @@ func (a *App) detectRemoteBackend() {
 	// 主人显式配的公网地址(在外时):探测+重试(冷启动 DNS/TLS/CF 慢,单次 8s 常不够)
 	if pubURL != "" {
 		for _, to := range []time.Duration{8 * time.Second, 12 * time.Second} {
-			if probe(pubURL, to) {
+			if probeBackendHealth(pubURL, to) {
 				a.remoteMode = true
 				a.remoteURL = strings.TrimRight(pubURL, "/")
 				log.Info("走公网隧道后端: %s", a.remoteURL)
@@ -528,6 +580,22 @@ func (a *App) GetBackendMode() BackendMode {
 	token := ""
 	if a.configService != nil {
 		token = strings.TrimSpace(a.configService.GetConfig().RemoteBackendToken)
+	}
+	// 记为离线时先现探一次再答。remoteMode 只是缓存标志:NAS 重启的几十秒空窗会让前端连续
+	// 请求失败→自愈调 ReprobeBackend→标志被打成 false 并一直挂着;后端早已恢复,可页面一旦
+	// 重载,本函数照读旧标志就误报离线、回落本地旧数据(2026-07-25 实测:后端 13:21 就活了,
+	// 14:20 重载仍弹离线横幅)。这里补一次快探(内网2s/公网4s 单次,不走公网重试阶梯免拖慢启动),
+	// 真离线仍如实回 fallback。
+	// 30s 去重:启动探测/ReprobeBackend 刚探过就别重复探——真离线时那是白等,启动会多几秒白屏。
+	if !a.remoteMode && a.remoteConfigured && allowRemoteBackend && time.Since(a.lastBackendProbe) > 30*time.Second {
+		lanURL, pubURL := a.remoteBackendURLs()
+		if lanURL != "" && probeBackendHealth(lanURL, 2*time.Second) {
+			a.remoteMode, a.remoteURL = true, strings.TrimRight(lanURL, "/")
+			log.Info("后端复探通过,恢复远程模式: %s", a.remoteURL)
+		} else if pubURL != "" && probeBackendHealth(pubURL, 4*time.Second) {
+			a.remoteMode, a.remoteURL = true, strings.TrimRight(pubURL, "/")
+			log.Info("后端复探通过,恢复远程模式(公网): %s", a.remoteURL)
+		}
 	}
 	if a.remoteMode {
 		return BackendMode{Mode: "remote", URL: a.remoteURL, Token: token}
@@ -1135,11 +1203,95 @@ func (a *App) GetKLineData(code string, period string, days int) []models.KLineD
 	// 档案止于 2025-12-31,近期部分用行情源补齐并在衔接日按收盘价比例对齐前复权口径。
 	if period == "1d" && days > 500 && a.archiveService != nil && a.archiveService.Available() {
 		if merged := a.klineFromArchive(code, days); len(merged) > 0 {
-			return merged
+			return a.fillTurnoverRate(code, merged)
 		}
 	}
 	data, _ := a.marketService.GetKLineData(code, period, days)
+	// 换手率只补日K:周/月K的末根 time 与日K同形(实测周K末根也是 "2026-07-17"),
+	// 一旦放宽这个判断,单日换手率会被静默写进周/月K —— 数值合法、语义全错。
+	if period == "1d" {
+		data = a.fillTurnoverRate(code, data)
+	}
 	return data
+}
+
+// fillTurnoverRate 用真实换手率补齐日K(行情源K线不带此字段)。三级数据源,全部是真实值不估算:
+//  1. 热库 stock_daily(近420根,东财采集口径;当日要等收盘16:00采集才有)
+//  2. 档案 archive.db(1990→2025-12-31,tushare 口径)
+//  3. 当日实时(东财估值接口现算 量/流通股本,3分钟缓存)——只补"末根且日期是今天"这一根
+//
+// 取不到就留 0(前端显示 --),不用流通股本估算历史值——送转/解禁会让历史换手率失真。
+// 注意:全市场扫描走的是 marketService.GetKLineData(不经此处),不会被第3级的实时请求拖累。
+func (a *App) fillTurnoverRate(code string, data []models.KLineData) []models.KLineData {
+	if len(data) == 0 {
+		return data
+	}
+	// 行情源缓存命中时返回的是缓存切片本身(market_service.go 的 klineCache),就地改写会与
+	// 其他并发消费者(推送/扫描)争同一底层数组 → data race。先拷贝再填。
+	data = append([]models.KLineData(nil), data...)
+	apply := func(rates map[string]float64) string {
+		earliestMiss := ""
+		for i := range data {
+			if data[i].TurnoverRate > 0 {
+				continue // 已有真实值,不覆盖
+			}
+			if r, ok := rates[data[i].Time]; ok {
+				data[i].TurnoverRate = r
+				continue
+			}
+			if earliestMiss == "" || data[i].Time < earliestMiss {
+				earliestMiss = data[i].Time
+			}
+		}
+		return earliestMiss // 补完仍缺的最早日期("" = 全齐)
+	}
+
+	// 1) 热库
+	miss := ""
+	local := map[string]float64{}
+	if a.historyService != nil {
+		local = a.historyService.TurnoverRateMap(code)
+		miss = apply(local)
+	}
+
+	// 2) 档案兜底:只针对"比热库最早记录还早"的日期——热库存不下的早期段(拼接时行情源覆盖了档案段,
+	//    换手率随之丢失)。热库时间范围内仍缺的(当天采集失败/停牌),档案同样没有,不做无谓全表查询。
+	if miss != "" && a.archiveService != nil && a.archiveService.Available() {
+		earliestLocal := ""
+		for d := range local {
+			if earliestLocal == "" || d < earliestLocal {
+				earliestLocal = d
+			}
+		}
+		if earliestLocal == "" || miss < earliestLocal {
+			apply(a.archiveService.TurnoverRateMap(code))
+		}
+	}
+
+	// 3) 当日实时
+	a.fillTodayTurnoverRate(code, data)
+	return data
+}
+
+// fillTodayTurnoverRate 补当日那根的换手率:热库当天要等收盘16:00采集、档案更是历史,
+// 盘中只能取实时值(东财估值接口按 量/流通股本 现算,3分钟缓存,实测延迟<1分钟)。
+// 严格限定"末根 且 日期==今天"才补——实时换手率是"此刻累计"的,标到任何历史K线上都是错的。
+func (a *App) fillTodayTurnoverRate(code string, data []models.KLineData) {
+	n := len(data)
+	if n == 0 || data[n-1].TurnoverRate > 0 {
+		return
+	}
+	// 日期比对必须用 CST:服务器可能跑在 UTC 时区,裸 time.Now() 在 CST 00:00-08:00 会滑到前一天,
+	// 把"此刻的实时换手率"错标到昨天那根上。(全仓库日期敏感处一律 FixedZone)
+	if data[n-1].Time != time.Now().In(time.FixedZone("CST", 8*60*60)).Format("2006-01-02") {
+		return // 末根不是今天(盘前/非交易日):此刻的实时换手率不属于它
+	}
+	if data[n-1].Volume <= 0 {
+		return // 盘前占位根(收=昨收/量=0)也能挂着今天的日期,给它标昨天的换手率就是假数据
+	}
+	if v := a.GetF10Valuation(code); v.TurnoverRate > 0 {
+		data[n-1].TurnoverRate = v.TurnoverRate
+	}
 }
 
 // klineFromArchive 档案K线 + 行情源近期数据拼接(前复权口径对齐)。
@@ -1375,15 +1527,63 @@ func (a *App) RunWaveBacktest(req models.BacktestRequest) models.BacktestResult 
 	return a.historyService.RunWaveBacktest(req)
 }
 
+// waveScanMu 波段扫描单飞锁:全市场扫描重(几十秒~分钟级),客户端超时放弃后服务端仍在跑,
+// 重复触发会叠加把 NAS 拖死(实测 3 个并发扫描连轻量 RPC 都堵超时)。进行中就直接拒绝。
+var waveScanMu sync.Mutex
+
 // RunWaveScanner 波段策略1.0选股扫描，全A、加闸门，并把命中标的推送(source=wave)
 func (a *App) RunWaveScanner() models.WaveScanResult {
 	if a.historyService == nil {
 		return models.WaveScanResult{Message: "历史服务未初始化"}
 	}
+	if !waveScanMu.TryLock() {
+		return models.WaveScanResult{Message: "已有一次波段扫描正在进行,请等它结束后再试(约1-2分钟)"}
+	}
+	defer waveScanMu.Unlock()
 	res := a.historyService.ScanWaveCandidates(10, true)
 	a.saveWaveStrategyPicks("wave-v1", "波段策略 1.0", res)
 	a.pushWaveSignals(res.Items)
+	cacheWaveScanResult(res)
 	return res
+}
+
+// waveScanLast 最近一次扫描结果缓存。扫描要跑1-2分钟,走公网隧道的客户端常被中途掐线(Cloudflare
+// 边缘连接几分钟一抖),但服务端扫描会照常完成——存这里,前端断线后轮询 GetWaveScanStatus 找回。
+var waveScanLast struct {
+	mu  sync.Mutex
+	res *models.WaveScanResult
+	at  time.Time
+}
+
+func cacheWaveScanResult(res models.WaveScanResult) {
+	waveScanLast.mu.Lock()
+	defer waveScanLast.mu.Unlock()
+	waveScanLast.res = &res
+	waveScanLast.at = time.Now()
+}
+
+// WaveScanStatus 波段扫描状态(供断线找回轮询)
+type WaveScanStatus struct {
+	Running bool                   `json:"running"`
+	AgeSec  int                    `json:"ageSec"` // 最近一次完成距今秒数,-1=从未完成
+	Result  *models.WaveScanResult `json:"result,omitempty"`
+}
+
+// GetWaveScanStatus 查询扫描是否进行中 + 最近一次完成的结果(轻量,断线后前端轮询用)。
+func (a *App) GetWaveScanStatus() WaveScanStatus {
+	st := WaveScanStatus{AgeSec: -1}
+	if waveScanMu.TryLock() {
+		waveScanMu.Unlock()
+	} else {
+		st.Running = true
+	}
+	waveScanLast.mu.Lock()
+	defer waveScanLast.mu.Unlock()
+	if waveScanLast.res != nil {
+		st.Result = waveScanLast.res
+		st.AgeSec = int(time.Since(waveScanLast.at).Seconds())
+	}
+	return st
 }
 
 // RunWaveScannerWithGate 波段策略1.0选股扫描。useGate=false 时仅临时绕过大盘闸门，不改全局规则、不推送。
@@ -1391,6 +1591,10 @@ func (a *App) RunWaveScannerWithGate(useGate bool) models.WaveScanResult {
 	if a.historyService == nil {
 		return models.WaveScanResult{Message: "历史服务未初始化"}
 	}
+	if !waveScanMu.TryLock() {
+		return models.WaveScanResult{Message: "已有一次波段扫描正在进行,请等它结束后再试(约1-2分钟)"}
+	}
+	defer waveScanMu.Unlock()
 	res := a.historyService.ScanWaveCandidates(10, useGate)
 	if !useGate {
 		res.GatePassed = false
@@ -1401,11 +1605,96 @@ func (a *App) RunWaveScannerWithGate(useGate bool) models.WaveScanResult {
 			res.Message += "；已临时打开闸门，仅作观察"
 		}
 		a.saveWaveStrategyPicks("wave-v1", "波段策略 1.0", res)
+		cacheWaveScanResult(res)
 		return res
 	}
 	a.pushWaveSignals(res.Items)
 	a.saveWaveStrategyPicks("wave-v1", "波段策略 1.0", res)
+	cacheWaveScanResult(res)
 	return res
+}
+
+// StartHistoryMinuteBackfill 启动历史分时回补(后台):每交易日补"当日涨幅榜前topN"的TDX分钟分时。
+// 用途:尾盘3等实时型策略的历史复盘原料。进度用 GetHistoryMinuteBackfillStatus 查。
+func (a *App) StartHistoryMinuteBackfill(start, end string, topN int) string {
+	if a.intradayService == nil || a.historyService == nil {
+		return "服务未就绪"
+	}
+	if topN <= 0 {
+		topN = 100
+	}
+	days := a.historyService.TopGainersPerDay(start, end, topN)
+	if len(days) == 0 {
+		return "区间内无交易日数据"
+	}
+	plan := make([]services.MinuteHistoryPlanDay, 0, len(days))
+	total := 0
+	for _, d := range days {
+		plan = append(plan, services.MinuteHistoryPlanDay{Date: d.Date, Codes: d.Codes})
+		total += len(d.Codes)
+	}
+	go func() {
+		if err := a.intradayService.BackfillMinuteHistory(plan); err != nil {
+			log.Warn("历史分时回补: %v", err)
+		}
+	}()
+	return fmt.Sprintf("已启动:%d个交易日 × 每日前%d只,共%d股日(约%.0f分钟),进度查 GetHistoryMinuteBackfillStatus", len(days), topN, total, float64(total)*0.05/60*60/60)
+}
+
+// GetHistoryMinuteBackfillStatus 历史分时回补进度。
+func (a *App) GetHistoryMinuteBackfillStatus() services.MinuteHistoryBackfillStatus {
+	if a.intradayService == nil {
+		return services.MinuteHistoryBackfillStatus{}
+	}
+	return a.intradayService.GetMinuteHistoryBackfillStatus()
+}
+
+// GetHistoryMinuteCoverage 历史分时覆盖概况。
+func (a *App) GetHistoryMinuteCoverage() map[string]any {
+	if a.intradayService == nil {
+		return map[string]any{}
+	}
+	return a.intradayService.MinuteHistoryCoverage()
+}
+
+// GetMinuteHistory 读取某股某日的历史分时。
+func (a *App) GetMinuteHistory(code, date string) []services.PriceMinute {
+	if a.intradayService == nil {
+		return nil
+	}
+	out, _ := a.intradayService.LoadMinuteHistory(code, date)
+	return out
+}
+
+// RepairQfqGaps 手动触发前复权断层修复:扫 since 起的"close比值 vs 记录pct"断层股并逐只重建(420根窗口)。
+// 当天的盘前采集占位行(close=昨收)天然假断层,固定排除。
+func (a *App) RepairQfqGaps(since string) string {
+	if a == nil || a.historyService == nil {
+		return "历史服务未就绪"
+	}
+	if strings.TrimSpace(since) == "" {
+		since = "2026-01-01"
+	}
+	today := time.Now().Format("2006-01-02")
+	found, fixed := a.historyService.RepairQfqGaps(since, today, 0)
+	return fmt.Sprintf("断层检测 %d 只,修复 %d 只(范围 %s 起,重建窗口420根)", found, fixed, since)
+}
+
+// BackfillMissingOHLC 一次性回补最近 days 个交易日内缺 开/高/低 的 stock_daily 行
+// (治日常快照只写收盘价的历史欠账;days<=0 默认40)。重任务,全市场约十几分钟。
+func (a *App) BackfillMissingOHLC(days int) services.OHLCBackfillResult {
+	if a == nil || a.historyService == nil {
+		return services.OHLCBackfillResult{Message: "历史服务未就绪"}
+	}
+	return a.historyService.BackfillMissingOHLC(days, 2)
+}
+
+// RunWaveTimingBacktest 波段执行时点对比回测:A=信号日收盘买(近似2:30)次日开盘卖 vs B=次日开盘买第三日开盘卖。
+func (a *App) RunWaveTimingBacktest(months, topN int) services.WaveTimingBacktestResult {
+	if a.historyService == nil {
+		return services.WaveTimingBacktestResult{Notes: []string{"历史服务未就绪"}}
+	}
+	return a.historyService.RunWaveTimingBacktest(months, topN)
 }
 
 // pushWaveSignals 把波段命中标的异步推送为买点信号（与低吸独立，复用防重）
@@ -1869,6 +2158,9 @@ func (a *App) RunLowBuyScannerV1(req models.LowBuyScannerRequest) models.LowBuyS
 	// 为最终展示的候选并发计算 MA10 状态（站上/跌破），作界面直观提示（仅展示，不淘汰）
 	a.fillLowBuyMA10Status(candidates)
 
+	candidates = a.applyLearnedTuning("lowbuy-v1", candidates)
+	candidates = annotateAndDemoteSealed(candidates)
+	candidates = a.annotateIntelHits(candidates)
 	result.Items = candidates
 	result.SelectedCount = len(candidates)
 	result.Warning = combineWarnings(result.Warning, fmt.Sprintf("已启用V1.1筛选：剔除300/688开头、行业黑名单、涨幅[-3%%,%.1f%%]、换手<=8%%、主力强度>=1%%且净流入>=800万（真实源）、单行业最多3只", maxChangePct))
@@ -1894,7 +2186,7 @@ func (a *App) RunLowBuyScannerV1(req models.LowBuyScannerRequest) models.LowBuyS
 		result.Warning = combineWarnings(result.Warning, "主力数据已补齐腾讯资金流接口（真实主力净流入）")
 	}
 
-	a.saveLowBuyStrategyPicks("lowbuy-v1", "低吸选股策略1", result)
+	a.saveLowBuyStrategyPicks("lowbuy-v1", "低吸选股策略", result)
 	// 扫描入选标的异步推送为买点信号（复用 24h 防重，推送未开启时内部直接跳过）
 	a.pushScannerSignals(result.Items)
 
@@ -1993,49 +2285,28 @@ func (a *App) RunLimitPullbackScanner(req models.LowBuyScannerRequest) models.Lo
 	result.MarketGateReasons = marketReasons
 
 	industryMap := buildIndustryMapFromEmbedded()
-	candidates := make([]models.LowBuyScannerItem, 0, 128)
-	checkedDaily := 0
-	dailyFailed := 0
-
-	for _, row := range snapshots {
-		if row.Price <= 0 || row.Amount <= 0 || row.IsST {
-			continue
-		}
-		if strings.HasPrefix(strings.ToLower(row.Symbol), "bj") && !req.IncludeBeijing {
-			continue
-		}
-		// 图中模型偏强势启动后的回踩，先剔除连续加速和高波动板，主战场放在沪深主板。
-		if isLimitPullbackBlockedBoard(row.Symbol) {
-			continue
-		}
-		if row.ChangePercent > 5.5 || row.ChangePercent < -5.0 {
-			continue
-		}
-		if row.TurnoverRate > 14 {
-			continue
-		}
-
-		daily, err := a.marketService.GetKLineData(row.Symbol, "1d", 72)
-		if err != nil || len(daily) < 65 {
-			dailyFailed++
-			continue
-		}
-		checkedDaily++
-
-		industry := industryMap[row.Symbol]
-		if industry == "" {
-			industry = row.Industry
-		}
-		if industry == "" {
-			industry = "未知"
-		}
-
-		item, ok := evaluateLimitPullbackRow(row, industry, daily, result.AsOf)
-		if !ok {
-			continue
-		}
-		candidates = append(candidates, item)
-	}
+	// 并行池取代原串行 for(>200s → ~40s);评估逻辑/短路条件/数据源全不变,选股结果与原串行一致。
+	candidates, checkedDaily, dailyFailed, droppedDaily := a.runParallelDailyScan(snapshots, industryMap, result.AsOf, parallelDailyScanSpec{
+		klineDays: 72,
+		minBars:   65,
+		prefilter: func(row services.ScanSnapshotRow) bool {
+			if row.Price <= 0 || row.Amount <= 0 || row.IsST {
+				return false
+			}
+			if strings.HasPrefix(strings.ToLower(row.Symbol), "bj") && !req.IncludeBeijing {
+				return false
+			}
+			// 图中模型偏强势启动后的回踩，先剔除连续加速和高波动板，主战场放在沪深主板。
+			if isLimitPullbackBlockedBoard(row.Symbol) {
+				return false
+			}
+			if row.ChangePercent > 5.5 || row.ChangePercent < -5.0 {
+				return false
+			}
+			return row.TurnoverRate <= 14
+		},
+		evaluate: evaluateLimitPullbackRow,
+	})
 
 	result.CandidateCount = len(candidates)
 	sort.Slice(candidates, func(i, j int) bool {
@@ -2051,11 +2322,99 @@ func (a *App) RunLimitPullbackScanner(req models.LowBuyScannerRequest) models.Lo
 		candidates = candidates[:limit]
 	}
 
+	candidates = a.applyLearnedTuning("limit-pullback-v1", candidates)
+	candidates = annotateAndDemoteSealed(candidates)
+	candidates = a.annotateIntelHits(candidates)
 	result.Items = candidates
 	result.SelectedCount = len(candidates)
-	result.Warning = combineWarnings(result.Warning, fmt.Sprintf("涨停回调低吸：已加入趋势闸门，剔除震荡下跌/空头排列中的涨停反抽；近2-8日涨停/准涨停，启动日放量，涨停后缩量回调且收盘站稳5/10日线；已验证日K%d只，日K失败%d只", checkedDaily, dailyFailed))
-	a.saveLowBuyStrategyPicks("limit-pullback-v1", "涨停回调低吸4", result)
+	limitPullbackDropNote := ""
+	if droppedDaily > 0 {
+		limitPullbackDropNote = fmt.Sprintf("，另有%d只因取数超预算未评估(降级丢尾)", droppedDaily)
+	}
+	result.Warning = combineWarnings(result.Warning, fmt.Sprintf("涨停回调低吸：已加入趋势闸门，剔除震荡下跌/空头排列中的涨停反抽；近2-8日涨停/准涨停，启动日放量，涨停后缩量回调且收盘站稳5/10日线；已验证日K%d只，日K失败%d只%s", checkedDaily, dailyFailed, limitPullbackDropNote))
+	a.saveLowBuyStrategyPicks("limit-pullback-v1", "涨停回调低吸", result)
 	return result
+}
+
+// parallelDailyScanSpec 描述一次"逐股拉日K→纯内存评估"的并行扫描参数(供三倍量/涨停回调等复用)。
+type parallelDailyScanSpec struct {
+	klineDays int                                     // 拉多少根日K
+	minBars   int                                     // 少于此根数丢弃
+	prefilter func(row services.ScanSnapshotRow) bool // 便宜快照过滤(true=进重路径),取K前先筛
+	evaluate  func(row services.ScanSnapshotRow, industry string, daily []models.KLineData, asOf string) (models.LowBuyScannerItem, bool)
+}
+
+// runParallelDailyScan 把"全市场逐股拉日K评估"从串行改成并发池(与 runFormulaScanner 同款 28 路),
+// 并加预算护栏(单只 8s 硬超时 + 总 90s deadline + 超时丢尾,宁缺毋混)。
+// 数据源不变(仍 GetKLineData=腾讯qfq,含今日盘中bar)→ 选股结果与原串行逐字节一致,只是快。
+// 返回:命中候选(未排序)、已验证数、失败数、因超预算丢弃数。
+func (a *App) runParallelDailyScan(snapshots []services.ScanSnapshotRow, industryMap map[string]string, asOf string, spec parallelDailyScanSpec) ([]models.LowBuyScannerItem, int, int, int) {
+	const workers = 28
+	deadline := time.Now().Add(90 * time.Second)
+	var mu sync.Mutex
+	candidates := make([]models.LowBuyScannerItem, 0, 128)
+	checked, failed, dropped := 0, 0, 0
+
+	jobs := make(chan services.ScanSnapshotRow, workers*2)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for row := range jobs {
+				if spec.prefilter != nil && !spec.prefilter(row) {
+					continue
+				}
+				if time.Now().After(deadline) { // 超总预算:剩余票按"丢尾"处理,保证 2:30 窗口内返回
+					mu.Lock()
+					dropped++
+					mu.Unlock()
+					continue
+				}
+				daily, derr := a.klineWithTimeout(row.Symbol, spec.klineDays, 8*time.Second)
+				if derr != nil || len(daily) < spec.minBars {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					continue
+				}
+				industry := chooseFirstNonEmpty(industryMap[row.Symbol], row.Industry, "未知")
+				item, ok := spec.evaluate(row, industry, daily, asOf)
+				mu.Lock()
+				checked++
+				if ok {
+					candidates = append(candidates, item)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, row := range snapshots {
+		jobs <- row
+	}
+	close(jobs)
+	wg.Wait()
+	return candidates, checked, failed, dropped
+}
+
+// klineWithTimeout 给单只 GetKLineData 套硬超时:降级态(腾讯WAF/超时逐级回落)单只能拖到10s+,
+// 并发池里几只卡住就把整个策略拖垮,超时即当失败跳过(宁缺毋混,好过整轮卡死)。
+func (a *App) klineWithTimeout(symbol string, days int, timeout time.Duration) ([]models.KLineData, error) {
+	type res struct {
+		data []models.KLineData
+		err  error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		d, err := a.marketService.GetKLineData(symbol, "1d", days)
+		ch <- res{d, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("单只日K取数超时(%s)", symbol)
+	}
 }
 
 // RunTripleVolumeScannerV5 三倍量策略5：未涨停阳线 + 成交量>=前一日3倍 + 一阳穿5/10/20/30日线。
@@ -2071,7 +2430,7 @@ func (a *App) RunTripleVolumeScannerV5(req models.LowBuyScannerRequest) models.L
 
 	result := models.LowBuyScannerResult{
 		AsOf:        start.Format("2006-01-02 15:04:05"),
-		RuleVersion: "三倍量策略5（主板10cm口径：未涨停阳线 + 成交量>=前一日3倍 + 一阳穿MA5/10/20/30）",
+		RuleVersion: "三倍量策略（主板10cm口径：未涨停阳线 + 成交量≥前一日2.7倍[3倍正档/2.7-3放宽档并标记] + 一阳穿MA5/10/20/30）",
 		Items:       []models.LowBuyScannerItem{},
 	}
 	if a == nil || a.marketService == nil {
@@ -2096,35 +2455,21 @@ func (a *App) RunTripleVolumeScannerV5(req models.LowBuyScannerRequest) models.L
 	}
 
 	industryMap := buildIndustryMapFromEmbedded()
-	candidates := make([]models.LowBuyScannerItem, 0, 128)
-	checkedDaily := 0
-	dailyFailed := 0
-
-	for _, row := range snapshots {
-		if row.Price <= 0 || row.Amount <= 0 || row.IsST {
-			continue
-		}
-		if strings.HasPrefix(strings.ToLower(row.Symbol), "bj") && !req.IncludeBeijing {
-			continue
-		}
-		if isTripleVolumeBlockedBoard(row.Symbol) {
-			continue
-		}
-
-		daily, derr := a.marketService.GetKLineData(row.Symbol, "1d", 45)
-		if derr != nil || len(daily) < 31 {
-			dailyFailed++
-			continue
-		}
-		checkedDaily++
-
-		industry := chooseFirstNonEmpty(industryMap[row.Symbol], row.Industry, "未知")
-		item, ok := evaluateTripleVolumeRow(row, industry, daily, result.AsOf)
-		if !ok {
-			continue
-		}
-		candidates = append(candidates, item)
-	}
+	// 并行池取代原串行 for(>200s → ~40s);评估逻辑/短路条件/数据源全不变,选股结果与原串行一致。
+	candidates, checkedDaily, dailyFailed, droppedDaily := a.runParallelDailyScan(snapshots, industryMap, result.AsOf, parallelDailyScanSpec{
+		klineDays: 45,
+		minBars:   31,
+		prefilter: func(row services.ScanSnapshotRow) bool {
+			if row.Price <= 0 || row.Amount <= 0 || row.IsST {
+				return false
+			}
+			if strings.HasPrefix(strings.ToLower(row.Symbol), "bj") && !req.IncludeBeijing {
+				return false
+			}
+			return !isTripleVolumeBlockedBoard(row.Symbol)
+		},
+		evaluate: evaluateTripleVolumeRow,
+	})
 
 	result.CandidateCount = len(candidates)
 	sort.Slice(candidates, func(i, j int) bool {
@@ -2140,10 +2485,17 @@ func (a *App) RunTripleVolumeScannerV5(req models.LowBuyScannerRequest) models.L
 		candidates = candidates[:limit]
 	}
 
+	candidates = a.applyLearnedTuning("triple-volume-v5", candidates)
+	candidates = annotateAndDemoteSealed(candidates)
+	candidates = a.annotateIntelHits(candidates)
 	result.Items = candidates
 	result.SelectedCount = len(candidates)
-	result.Warning = combineWarnings(result.Warning, fmt.Sprintf("三倍量策略5：主板10cm口径，剔除ST/北交/创业板/科创板；日K验证%d只，日K失败%d只。买点不追当天突破，重点看次日缩量回调不破突破成本线", checkedDaily, dailyFailed))
-	a.saveLowBuyStrategyPicks("triple-volume-v5", "三倍量策略5", result)
+	droppedNote := ""
+	if droppedDaily > 0 {
+		droppedNote = fmt.Sprintf("，另有%d只因取数超预算未评估(降级丢尾)", droppedDaily)
+	}
+	result.Warning = combineWarnings(result.Warning, fmt.Sprintf("三倍量策略：主板10cm口径，剔除ST/北交/创业板/科创板；日K验证%d只，日K失败%d只%s。买点不追当天突破，重点看次日缩量回调不破突破成本线", checkedDaily, dailyFailed, droppedNote))
+	a.saveLowBuyStrategyPicks("triple-volume-v5", "三倍量策略", result)
 	return result
 }
 
@@ -2151,10 +2503,10 @@ func (a *App) RunTripleVolumeScannerV5(req models.LowBuyScannerRequest) models.L
 func (a *App) RunTailBuyScannerV6(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
 	return a.runFormulaScanner(req, formulaScannerSpec{
 		ID:          "tail-buy-v6",
-		Name:        "尾盘买入策略6",
-		RuleVersion: "尾盘买入策略6（昨日资金强势触发 + 今日阴线回踩，尾盘确认承接）",
+		Name:        "尾盘买入策略",
+		RuleVersion: "尾盘买入策略（昨日资金强势触发 + 今日阴线回踩，尾盘确认承接）",
 		KLineDays:   280,
-		Warning:     "尾盘买入策略6：按通达信公式本地复刻，CAPITAL 用流通市值/价格估算，主板口径自动剔除ST/北交/300/301/688/689",
+		Warning:     "尾盘买入策略：按通达信公式本地复刻，CAPITAL 用流通市值/价格估算，主板口径自动剔除ST/北交/300/301/688/689",
 		Evaluate:    evaluateTailBuyV6Row,
 	})
 }
@@ -2163,10 +2515,10 @@ func (a *App) RunTailBuyScannerV6(req models.LowBuyScannerRequest) models.LowBuy
 func (a *App) RunHotMoneyBreakoutScannerV7(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
 	return a.runFormulaScanner(req, formulaScannerSpec{
 		ID:          "hot-money-v7",
-		Name:        "游资突破策略7",
-		RuleVersion: "游资突破策略7（游资涨停结构 + 量能倍率1-5 + 流通股本分档）",
+		Name:        "游资突破策略",
+		RuleVersion: "游资突破策略（游资涨停结构 + 量能倍率1-5 + 流通股本分档）",
 		KLineDays:   48,
-		Warning:     "游资突破策略7：DYNAINFO(58) 用流通股本(万股)代理；按主板10cm涨停结构执行，自动剔除ST/北交/300/301/688/689",
+		Warning:     "游资突破策略：DYNAINFO(58) 用流通股本(万股)代理；按主板10cm涨停结构执行，自动剔除ST/北交/300/301/688/689",
 		Evaluate:    evaluateHotMoneyV7Row,
 	})
 }
@@ -2175,10 +2527,10 @@ func (a *App) RunHotMoneyBreakoutScannerV7(req models.LowBuyScannerRequest) mode
 func (a *App) RunDipEntryScannerV8(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
 	return a.runFormulaScanner(req, formulaScannerSpec{
 		ID:          "dip-entry-v8",
-		Name:        "低吸入场策略8",
-		RuleVersion: "低吸入场策略8（RSI短线反转 + 快速RSI过线 + 动能底背离，三选二）",
+		Name:        "低吸入场策略",
+		RuleVersion: "低吸入场策略（RSI短线反转 + 快速RSI过线 + 动能底背离，三选二）",
 		KLineDays:   96,
-		Warning:     "低吸入场策略8：按通达信SMA/EMA逻辑复刻，自动剔除ST/北交/300/301/688/689；信号是反转入场，不等同于追涨突破",
+		Warning:     "低吸入场策略：按通达信SMA/EMA逻辑复刻，自动剔除ST/北交/300/301/688/689；信号是反转入场，不等同于追涨突破",
 		Evaluate:    evaluateDipEntryV8Row,
 	})
 }
@@ -2187,10 +2539,10 @@ func (a *App) RunDipEntryScannerV8(req models.LowBuyScannerRequest) models.LowBu
 func (a *App) RunMonsterScannerV9(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
 	return a.runFormulaScanner(req, formulaScannerSpec{
 		ID:          "monster-v9",
-		Name:        "捉妖策略9",
-		RuleVersion: "捉妖策略9（代理修正版：放量突破前高 + 突破后第2日确认 + 精选60日低点反抽）",
+		Name:        "捉妖策略",
+		RuleVersion: "捉妖策略（代理修正版：放量突破前高 + 突破后第2日确认 + 精选60日低点反抽）",
 		KLineDays:   320,
-		Warning:     "捉妖策略9：恢复此前可出票的代理复刻逻辑；60日低点反抽加成交额/换手/跌幅阀门防止泛滥；自动剔除ST/北交/300/301/688/689",
+		Warning:     "捉妖策略：恢复此前可出票的代理复刻逻辑；60日低点反抽加成交额/换手/跌幅阀门防止泛滥；自动剔除ST/北交/300/301/688/689",
 		Evaluate:    evaluateMonsterV9Row,
 	})
 }
@@ -2199,10 +2551,10 @@ func (a *App) RunMonsterScannerV9(req models.LowBuyScannerRequest) models.LowBuy
 func (a *App) RunMonsterScannerV10(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
 	return a.runFormulaScanner(req, formulaScannerSpec{
 		ID:          "monster-v10",
-		Name:        "捉妖策略10",
-		RuleVersion: "捉妖策略10（通达信公式严格复刻：GGZY_ZS=FILTER(GGZY_IG=1,3)）",
+		Name:        "捉妖(旧v10)",
+		RuleVersion: "捉妖(旧v10)（通达信公式严格复刻：GGZY_ZS=FILTER(GGZY_IG=1,3)）",
 		KLineDays:   360,
-		Warning:     "捉妖策略10：按通达信公式逐项复刻；MACD.GGZY_A8按标准MACD柱承接，BOLL.UB为20日布林上轨，CAPITAL用流通市值/价格估算；自动剔除ST/北交/300/301/688/689",
+		Warning:     "捉妖(旧v10)：按通达信公式逐项复刻；MACD.GGZY_A8按标准MACD柱承接，BOLL.UB为20日布林上轨，CAPITAL用流通市值/价格估算；自动剔除ST/北交/300/301/688/689",
 		Evaluate:    evaluateMonsterV10Row,
 	})
 }
@@ -2240,7 +2592,9 @@ func (a *App) runFormulaScanner(req models.LowBuyScannerRequest, spec formulaSca
 	}
 
 	historyPickDate := strings.TrimSpace(req.HistoryPickDate)
-	useHistoryPick := spec.ID == "monster-v9" && historyPickDate != ""
+	// 历史时间选股白名单:纯日K判定、历史快照字段齐备的策略(2026-07-22 从捉妖9专用放开,供复盘历史重算)
+	formulaHistoryPickOK := map[string]bool{"monster-v9": true, "monster-v10": true, "tail-buy-v6": true}
+	useHistoryPick := formulaHistoryPickOK[spec.ID] && historyPickDate != ""
 	var snapshots []services.ScanSnapshotRow
 	var historyAsOf string
 	var err error
@@ -2344,13 +2698,18 @@ func (a *App) runFormulaScanner(req models.LowBuyScannerRequest, spec formulaSca
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
+	candidates = a.applyLearnedTuning(spec.ID, candidates)
+	candidates = annotateAndDemoteSealed(candidates)
+	candidates = a.annotateIntelHits(candidates)
 	result.Items = candidates
 	result.SelectedCount = len(candidates)
 	if useHistoryPick {
 		result.Warning = combineWarnings(result.Warning, fmt.Sprintf("%s；历史时间选股=%s，仅使用%s及以前数据；日K验证%d只，日K失败%d只", spec.Warning, historyPickDate, historyAsOf, checkedDaily, dailyFailed))
-	} else {
-		result.Warning = combineWarnings(result.Warning, fmt.Sprintf("%s；日K验证%d只，日K失败%d只", spec.Warning, checkedDaily, dailyFailed))
+		// 历史模式不写留痕:SaveStrategyPicks 会 DELETE+重写该日名单,曾把当天真实实盘留痕整日覆盖掉
+		// (捉妖9 历史选股旧行为,2026-07-22 修)。复盘重算的持久化由 rebuild 流程负责并打 replayed 标记。
+		return result
 	}
+	result.Warning = combineWarnings(result.Warning, fmt.Sprintf("%s；日K验证%d只，日K失败%d只", spec.Warning, checkedDaily, dailyFailed))
 	a.saveLowBuyStrategyPicks(spec.ID, spec.Name, result)
 	return result
 }
@@ -2503,6 +2862,9 @@ func (a *App) runCaoYuanScanner(req models.LowBuyScannerRequest, mode string) mo
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
+	candidates = a.applyLearnedTuning("caoyuan-zhuang4b", candidates)
+	candidates = annotateAndDemoteSealed(candidates)
+	candidates = a.annotateIntelHits(candidates)
 	result.Items = candidates
 	result.SelectedCount = len(candidates)
 
@@ -3203,7 +3565,7 @@ func (a *App) RunTailLazyScannerV2(req models.LowBuyScannerRequest) models.LowBu
 			RiskFlags:      risks,
 			BuyPointHint:   "尾盘14:30-15:00分批买入，次日上午冲高止盈",
 			SellPointHint:  "次日上午冲高5-6个点止盈；冲高乏力/平开即保本走",
-			StopLossHint:   "次日不冲高反走弱，或跌破买入价-3%，止损离场",
+			StopLossHint:   "次日不冲高反走弱，或跌破买入价-5%，止损离场",
 			MA10:           ma10,
 			MA10Status:     ma10Status,
 			UpdatedAt:      start.Format("15:04:05"),
@@ -3214,12 +3576,15 @@ func (a *App) RunTailLazyScannerV2(req models.LowBuyScannerRequest) models.LowBu
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
+	candidates = a.applyLearnedTuning("taillazy-v2", candidates)
+	candidates = annotateAndDemoteSealed(candidates)
+	candidates = a.annotateIntelHits(candidates)
 	result.Items = candidates
 	result.SelectedCount = len(candidates)
 	result.Warning = combineWarnings(result.Warning, fmt.Sprintf(
 		"尾盘懒人V2：量比(1,2.5)/涨幅(3%%,6%%)/换手(5%%,10%%) 粗筛 %d 只，日K技术验证后入选 %d 只（剔除创业板/科创/北交所）",
 		result.CandidateCount, result.SelectedCount))
-	a.saveLowBuyStrategyPicks("taillazy-v2", "低吸尾盘策略2", result)
+	a.saveLowBuyStrategyPicks("taillazy-v2", "低吸尾盘策略", result)
 	return result
 }
 
@@ -3375,9 +3740,13 @@ func (a *App) RunTailForwardScan(strategy string, autoBuy bool) models.TailForwa
 			res.BuyableCount++
 		} else {
 			res.SealedCount++
+			// 游资突破7·炸板回封(成文v1):封死买不进的票入当日观察名单,炸板后回封则自动买入
+			if source == "hot-money-v7" && it.ChangePercent >= 9.8 {
+				a.watchBoardReseal(it.Symbol, it.Name, it.Price)
+			}
 		}
-		if autoBuy && buyable && !c.AlreadyHeld && it.Price > 0 && a.paperService != nil {
-			if _, err := a.paperService.Add(it.Symbol, it.Name, source, it.Price, 1000); err == nil {
+		if autoBuy && buyable && !c.AlreadyHeld && it.Price > 0 && a.paperService != nil && !a.paperService.AutoPaused() && a.canAutoBuyNow() {
+			if _, err := a.paperService.Add(it.Symbol, it.Name, source, it.Price, 1000, "auto"); err == nil {
 				c.Added = true
 				res.AddedCount++
 				held[strings.ToLower(it.Symbol)] = true
@@ -3402,19 +3771,34 @@ func (a *App) SetTailForwardConfig(enabled, auto bool) string {
 		return "配置服务未就绪"
 	}
 	cfg := a.configService.GetConfig()
-	cfg.TailForward = models.TailForwardConfig{Enabled: enabled, Auto: auto}
+	cfg.TailForward = models.TailForwardConfig{Enabled: enabled, Auto: auto, LastFiredDate: cfg.TailForward.LastFiredDate}
 	if err := a.configService.UpdateConfig(cfg); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-// startTailForwardScheduler 交易日 14:30 自动触发 2:30 向前验证(按配置 auto/清单)。
+// persistTailForwardFired 把「当天已触发」写进配置文件,重启后不再补跑(防二次留痕污染复盘)。
+func (a *App) persistTailForwardFired(day string) {
+	if a == nil || a.configService == nil {
+		return
+	}
+	cfg := a.configService.GetConfig()
+	if cfg.TailForward.LastFiredDate == day {
+		return
+	}
+	cfg.TailForward.LastFiredDate = day
+	if err := a.configService.UpdateConfig(cfg); err != nil {
+		rt.LogInfof("2:50触发标记持久化失败(不影响本次扫描): %v", err)
+	}
+}
+
+// startTailForwardScheduler 交易日 14:50 自动触发向前验证(按配置 auto/清单)。
 // 每分钟检查一次，命中窗口且当日未触发则执行。
 func (a *App) startTailForwardScheduler() {
 	go func() {
 		cst := time.FixedZone("CST", 8*3600)
-		lastFired := ""
+		lastFired := a.GetTailForwardConfig().LastFiredDate // 持久化恢复:重启不再当天补跑
 		tk := time.NewTicker(30 * time.Second)
 		defer tk.Stop()
 		for {
@@ -3422,25 +3806,29 @@ func (a *App) startTailForwardScheduler() {
 			now := time.Now().In(cst)
 			today := now.Format("2006-01-02")
 			mins := now.Hour()*60 + now.Minute()
-			// 14:30 之后、当天未跑过、且开启 → 触发（窗口放宽到 14:30 起，错过也补跑一次，避免漏掉整天）
-			if cfg.Enabled && lastFired != today && mins >= 14*60+30 {
+			// 14:50 之后、当天未跑过、且开启 → 触发(2026-07-21 用户定:从14:30改到14:50,更贴收盘、
+			// 信号更接近当日定型;整轮2-4分钟,依然赶在15:00收盘前完成买入,超时未完成的部分被
+			// canAutoBuyNow 的15:00闸如实挡掉——买不到就不记,不补假单)。错过窗口当天补跑一次。
+			if cfg.Enabled && lastFired != today && mins >= 14*60+50 {
 				if a.marketService != nil {
 					if st := a.marketService.GetMarketStatus(); !st.IsTradeDay {
 						lastFired = today
+						a.persistTailForwardFired(today)
 						if a.ctx != nil {
-							rt.LogInfof("2:30自动选股: 今日非交易日(%s)，跳过", st.StatusText)
+							rt.LogInfof("2:50自动选股: 今日非交易日(%s)，跳过", st.StatusText)
 						}
 						<-tk.C
 						continue
 					}
 				}
 				lastFired = today // 先占位，避免长扫描期间重复触发
+				a.persistTailForwardFired(today)
 				if a.ctx != nil {
-					rt.LogInfof("2:30多策略自动选股开始(%s)…", now.Format("15:04"))
+					rt.LogInfof("2:50多策略自动选股开始(%s)…", now.Format("15:04"))
 				}
 				res := a.RunTailForwardScanAll(cfg.Auto)
 				if a.ctx != nil {
-					rt.LogInfof("2:30多策略自动选股已触发(%s): 可买%d 封死%d 自动记入%d(auto=%v)",
+					rt.LogInfof("2:50多策略自动选股已触发(%s): 可买%d 封死%d 自动记入%d(auto=%v)",
 						now.Format("15:04"), res.BuyableCount, res.SealedCount, res.AddedCount, cfg.Auto)
 				}
 			}
@@ -3456,20 +3844,46 @@ type tailScanSpec struct {
 	scan          func(models.LowBuyScannerRequest) models.LowBuyScannerResult
 }
 
+// runLateChaseForTailScan 尾盘3 接进 2:30 自动清单的适配器:它的扫描器返回类型与其它策略不同,
+// 这里转成通用 LowBuyScannerResult(只保留自动入盘需要的字段)。参数用尾盘追涨弹窗的同款默认值,
+// 保证自动扫描与手动扫描口径一致(涨3-5%/量比≥1/换手5-10%/流通50-200亿)。
+func (a *App) runLateChaseForTailScan(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
+	res := a.RunLateDayChaseScanner(models.LateDayChaseScannerRequest{
+		Limit: req.Limit, RankLimit: 60, IncludeBeijing: req.IncludeBeijing,
+		MinChangePct: 3, MaxChangePct: 5, MinVolumeRatio: 1,
+		MinTurnoverRate: 5, MaxTurnoverRate: 10,
+		MinFloatCap: 50e8, MaxFloatCap: 200e8,
+	})
+	out := models.LowBuyScannerResult{AsOf: res.AsOf, UniverseCount: res.UniverseCount, SelectedCount: res.SelectedCount}
+	for _, it := range res.Items {
+		out.Items = append(out.Items, models.LowBuyScannerItem{
+			Symbol: it.Symbol, Name: it.Name, Price: it.Price,
+			ChangePercent: it.ChangePercent, Score: it.Score, Industry: it.Industry,
+		})
+	}
+	return out
+}
+
 // tailScanSpecs 全部参与 2:30 自动选股的技术策略（基本面是长线，不在每日尾盘闭环里）。
 func (a *App) tailScanSpecs() []tailScanSpec {
 	return []tailScanSpec{
-		{"lowbuy-v1", "低吸1", 3, a.RunLowBuyScannerV1},
-		{"taillazy-v2", "低吸2", 3, a.RunTailLazyScannerV2},
-		{"limit-pullback-v1", "涨停回调4", 3, a.RunLimitPullbackScanner},
-		{"triple-volume-v5", "三倍量5", 3, a.RunTripleVolumeScannerV5},
-		{"tail-buy-v6", "尾盘买入6", 3, a.RunTailBuyScannerV6},
-		{"hot-money-v7", "游资突破7", 3, a.RunHotMoneyBreakoutScannerV7},
-		{"dip-entry-v8", "低吸入场8", 3, a.RunDipEntryScannerV8},
-		{"monster-v9", "捉妖9", 3, a.RunMonsterScannerV9},
-		{"monster-v10", "捉妖10", 3, a.RunMonsterScannerV10},
+		// ⚠️低吸选股1 与 捉妖10 已于 2026-07-26 停用(用户决定):学习库扣费超额显著为负
+		// (低吸1 −0.52%/笔 n=273、捉妖10 −0.61%/笔 n=239),继续跑只是稳定地跑输全市场中位。
+		// 只是从自动扫描和菜单里摘掉,**代码与历史留痕/学习样本全部保留**,想复活把这两行放回来即可。
+		{"taillazy-v2", "低吸尾盘", 3, a.RunTailLazyScannerV2},
+		{"limit-pullback-v1", "涨停回调低吸", 3, a.RunLimitPullbackScanner},
+		{"triple-volume-v5", "三倍量", 3, a.RunTripleVolumeScannerV5},
+		{"latechase-v3", "尾盘强势", 3, a.runLateChaseForTailScan},
+		{"tail-buy-v6", "尾盘买入", 3, a.RunTailBuyScannerV6},
+		{"hot-money-v7", "游资突破", 3, a.RunHotMoneyBreakoutScannerV7},
+		{"dip-entry-v8", "低吸入场", 3, a.RunDipEntryScannerV8},
+		{"monster-v9", "捉妖", 3, a.RunMonsterScannerV9},
 	}
 }
+
+// tailScanAllMu 全量扫描单飞锁:每轮 10 策略×28 并发已把 NAS 内存吃到边缘,重复点击/定时器
+// 与手动叠加会把进程干到 2GB 被内核 OOM 杀掉(2026-07-20 实测被杀)。宁可拒绝,不可叠跑。
+var tailScanAllMu sync.Mutex
 
 // RunTailForwardScanAll 2:30 多策略自动选股：每个技术策略各取 TopN → 实时盘口判可成交 →
 // (autoBuy 时)按策略来源记入模拟持仓。风控引擎负责后续止盈止损平仓。
@@ -3479,6 +3893,11 @@ func (a *App) RunTailForwardScanAll(autoBuy bool) models.TailForwardResult {
 		res.Warning = "行情服务未就绪"
 		return res
 	}
+	if !tailScanAllMu.TryLock() {
+		res.Warning = "已有一轮全量扫描正在进行(约2-4分钟),请等它结束——重复叠跑会把服务器内存打爆"
+		return res
+	}
+	defer tailScanAllMu.Unlock()
 	held := map[string]bool{}
 	if a.paperService != nil {
 		for _, p := range a.paperService.OpenPositions() {
@@ -3503,9 +3922,13 @@ func (a *App) RunTailForwardScanAll(autoBuy bool) models.TailForwardResult {
 				res.BuyableCount++
 			} else {
 				res.SealedCount++
+				// 游资突破7·炸板回封(成文v1):封死买不进的票入当日观察名单,炸板后回封则自动买入
+				if spec.source == "hot-money-v7" && it.ChangePercent >= 9.8 {
+					a.watchBoardReseal(it.Symbol, it.Name, it.Price)
+				}
 			}
-			if autoBuy && buyable && !c.AlreadyHeld && it.Price > 0 && a.paperService != nil {
-				if _, err := a.paperService.Add(it.Symbol, it.Name, spec.source, it.Price, 1000); err == nil {
+			if autoBuy && buyable && !c.AlreadyHeld && it.Price > 0 && a.paperService != nil && !a.paperService.AutoPaused() && a.canAutoBuyNow() {
+				if _, err := a.paperService.Add(it.Symbol, it.Name, spec.source, it.Price, 1000, "auto"); err == nil {
 					c.Added = true
 					res.AddedCount++
 					held[key] = true
@@ -3516,6 +3939,139 @@ func (a *App) RunTailForwardScanAll(autoBuy bool) models.TailForwardResult {
 		}
 	}
 	return res
+}
+
+// ===== 游资突破7·炸板回封买入(成文规则 v1,2026-07-20 用户定) =====
+// ① 14:30 扫描命中但涨停封死买不进的票 → 进当日"回封观察名单"(只观察当天,收盘清空);
+// ② 盘中每分钟盯:涨停板被砸开(现价跌破涨停价) → 标记"已炸板";
+// ③ 已炸板的票在收盘前重新回到涨停价(回封) → 以涨停价自动买入模拟盘(来源仍记游资突破7);
+// ④ 炸板后到收盘未回封 → 放弃不买(炸板不回封=弱势);
+// ⑤ 全程封死到收盘 → 维持"买不到就不买"原则;
+// ⑥ 受自动入盘总开关控制;同票同源已持仓不重复买。
+// 诚实口径:买价记涨停价——炸板期间实际能以更低价买到,记涨停价成本偏保守,不虚增收益。
+// 观察名单是内存态,NAS 当日重启会丢当天名单(次日 14:30 重建,可接受)。
+type boardResealWatch struct {
+	Symbol  string  `json:"symbol"`
+	Name    string  `json:"name"`
+	LimitUp float64 `json:"limitUp"` // 涨停价(昨收×1.1 四舍五入到分;游资已剔创业/科创/北交/ST,全 10cm)
+	Broken  bool    `json:"broken"`  // 是否已炸板
+	Day     string  `json:"day"`
+}
+
+var (
+	boardResealMu   sync.Mutex
+	boardResealPool = map[string]*boardResealWatch{}
+)
+
+// watchBoardReseal 把封死买不进的游资候选加入当日回封观察名单。
+// limitUp 直接取扫描时的现价——封死涨停的票现价就是涨停价,比用昨收×1.1 反推更准。
+func (a *App) watchBoardReseal(symbol, name string, limitUp float64) {
+	if limitUp <= 0 || !inTradingSession() {
+		return
+	}
+	boardResealMu.Lock()
+	defer boardResealMu.Unlock()
+	key := strings.ToLower(strings.TrimSpace(symbol))
+	if _, ok := boardResealPool[key]; ok {
+		return
+	}
+	boardResealPool[key] = &boardResealWatch{Symbol: key, Name: name, LimitUp: limitUp, Day: time.Now().Format("2006-01-02")}
+	log.Info("炸板回封观察: %s(%s) 涨停价%.2f 已入当日名单", name, key, limitUp)
+}
+
+// GetBoardResealWatch 查看当日回封观察名单(调试/透明用)。
+func (a *App) GetBoardResealWatch() []boardResealWatch {
+	boardResealMu.Lock()
+	defer boardResealMu.Unlock()
+	out := make([]boardResealWatch, 0, len(boardResealPool))
+	for _, w := range boardResealPool {
+		out = append(out, *w)
+	}
+	return out
+}
+
+// checkBoardReseal 每分钟状态机:封住→炸板→回封买入。由监控服务盘中节拍驱动。
+func (a *App) checkBoardReseal() {
+	today := time.Now().Format("2006-01-02")
+	boardResealMu.Lock()
+	codes := make([]string, 0, len(boardResealPool))
+	for k, w := range boardResealPool {
+		if w.Day != today { // 跨日残留清掉
+			delete(boardResealPool, k)
+			continue
+		}
+		codes = append(codes, k)
+	}
+	boardResealMu.Unlock()
+	if len(codes) == 0 || !inTradingSession() {
+		return
+	}
+	stocks, err := a.marketService.GetStockRealTimeData(codes...)
+	if err != nil || len(stocks) == 0 {
+		return
+	}
+	for _, st := range stocks {
+		key := strings.ToLower(strings.TrimSpace(st.Symbol))
+		boardResealMu.Lock()
+		w, ok := boardResealPool[key]
+		boardResealMu.Unlock()
+		if !ok || st.Price <= 0 {
+			continue
+		}
+		switch {
+		case !w.Broken && st.Price < w.LimitUp-0.001:
+			// 炸板:涨停价守不住了
+			w.Broken = true
+			log.Info("炸板: %s(%s) 现价%.2f < 涨停%.2f,等待回封", w.Name, key, st.Price, w.LimitUp)
+		case w.Broken && st.Price >= w.LimitUp-0.001:
+			// 回封:炸板后重新站回涨停价 → 按成文规则以涨停价买入
+			if a.paperService == nil || a.paperService.AutoPaused() || !a.canAutoBuyNow() {
+				continue
+			}
+			held := false
+			for _, p := range a.paperService.OpenPositions() {
+				if strings.EqualFold(p.Symbol, key) && p.Source == "hot-money-v7" {
+					held = true
+					break
+				}
+			}
+			if held {
+				boardResealMu.Lock()
+				delete(boardResealPool, key)
+				boardResealMu.Unlock()
+				continue
+			}
+			if _, err := a.paperService.Add(key, w.Name, "hot-money-v7", w.LimitUp, 1000, "auto"); err == nil {
+				log.Info("炸板回封买入: %s(%s) 涨停价%.2f 入模拟盘(游资突破7)", w.Name, key, w.LimitUp)
+				if a.pushService != nil {
+					a.pushService.Push(models.PushSignal{
+						StockCode: key, StockName: w.Name, Type: models.PushTypeBuyPoint,
+						Message: fmt.Sprintf("【游资突破7·炸板回封】%s 炸板后回封,按涨停价 %.2f 买入模拟盘\n纪律:-7%%止损/+8%%保本/+30%%封顶,5日<3%%清", w.Name, w.LimitUp),
+						Level:   "timeSensitive",
+					})
+				}
+			}
+			boardResealMu.Lock()
+			delete(boardResealPool, key)
+			boardResealMu.Unlock()
+		}
+	}
+}
+
+// canAutoBuyNow 自动入盘的时段闸(模拟实盘可成交性,2026-07-20 用户定):
+// 只允许 交易日 09:25(竞价定型)~ 15:00(收盘)之间自动建仓。
+//   - 09:25 前:行情源的"现价"还是上一交易日收盘价,拿它建仓=前视偏差(白捡跳空与全天涨幅);
+//   - 15:00 后:市场已收盘,现实中根本买不进——"按收盘价买入"看似一致实则永不可成交,
+//     会把当天已知的收盘信息当成交价,污染胜率(实例:07-20 16:42 两笔低吸按收盘价建仓,已清除)。
+//
+// 手动添加不走此闸(用户自担口径);盘中自动买用实时价,真实可成交。
+func (a *App) canAutoBuyNow() bool {
+	now := time.Now().In(time.FixedZone("CST", 8*60*60))
+	if a.marketService != nil && !a.marketService.IsTradingDay(now) {
+		return false
+	}
+	hm := now.Hour()*60 + now.Minute()
+	return hm >= 9*60+25 && hm < 15*60
 }
 
 // isBuyableNow 判断当前能否买进：非涨停一律可买；涨停则看盘口是否还有卖盘(封死=无卖盘=买不进)。
@@ -3892,9 +4448,9 @@ type formulaAccountSpec struct {
 
 // formulaAccountSpecs 已接入策略账户的公式型策略。key 与前端 StrategyAccountDialog 的 STRATS 对应。
 var formulaAccountSpecs = map[string]formulaAccountSpec{
-	"hotmoney": {eval: evaluateHotMoneyV7Row, lookback: 30, topN: 3}, // 游资突破策略7
-	"monster":  {eval: evaluateMonsterV9Row, lookback: 320, topN: 3}, // 捉妖策略9
-	"dipentry": {eval: evaluateDipEntryV8Row, lookback: 96, topN: 3}, // 低吸入场策略8
+	"hotmoney": {eval: evaluateHotMoneyV7Row, lookback: 30, topN: 3}, // 游资突破策略
+	"monster":  {eval: evaluateMonsterV9Row, lookback: 320, topN: 3}, // 捉妖策略
+	"dipentry": {eval: evaluateDipEntryV8Row, lookback: 96, topN: 3}, // 低吸入场策略
 }
 
 // computeFormulaSignals 在内存中逐交易日跑公式型评估器，算出每日 TopN 候选信号。
@@ -4236,7 +4792,7 @@ func (a *App) RunLateDayChaseScanner(req models.LateDayChaseScannerRequest) mode
 			Reasons:                reasons,
 			RiskFlags:              risks,
 			BuyPointHint:           lateDayBuyPointHint(intradayEval.BuySignalReady),
-			StopLossHint:           "次日不冲高或跌破尾盘均价线先减；跌破买入价-3%执行止损",
+			StopLossHint:           "次日不冲高或跌破尾盘均价线先减；跌破买入价-5%执行止损",
 			UpdatedAt:              chooseFirstNonEmpty(row.UpdateTime, result.AsOf),
 		}
 		items = append(items, item)
@@ -4274,7 +4830,7 @@ func (a *App) RunLateDayChaseScanner(req models.LateDayChaseScannerRequest) mode
 	if opts.RequireBuySignal {
 		result.Warning = combineWarnings(result.Warning, "已开启只看尾盘买点触发")
 	}
-	a.saveLateDayStrategyPicks("latechase-v3", "尾盘强势策略3", result)
+	a.saveLateDayStrategyPicks("latechase-v3", "尾盘强势策略", result)
 	return result
 }
 
@@ -4294,6 +4850,9 @@ func (a *App) pushScannerSignals(items []models.LowBuyScannerItem) {
 		for i, item := range batch {
 			if strings.TrimSpace(item.Symbol) == "" {
 				continue
+			}
+			if isPriceAtLimitUp(item.Symbol, item.Name, item.ChangePercent) {
+				continue // 成文总纪律:到板买不进的不推送
 			}
 			a.pushService.Push(models.PushSignal{
 				StockCode: item.Symbol,
@@ -4317,8 +4876,17 @@ func buildScannerPushMessage(item models.LowBuyScannerItem) string {
 		fmt.Fprintf(&b, " · %s", item.Industry)
 	}
 	fmt.Fprintf(&b, "\n评分 %.1f · 命中 %d 条", item.Score, item.TriggerCount)
-	if len(item.Reasons) > 0 {
-		fmt.Fprintf(&b, "\n理由：%s", strings.Join(item.Reasons, "；"))
+	// 情报库命中单独成行:埋在一长串理由里等于没有(2026-07-27 第二大脑打通)
+	plain := make([]string, 0, len(item.Reasons))
+	for _, r := range item.Reasons {
+		if strings.HasPrefix(r, "📌情报库") {
+			fmt.Fprintf(&b, "\n%s", r)
+		} else {
+			plain = append(plain, r)
+		}
+	}
+	if len(plain) > 0 {
+		fmt.Fprintf(&b, "\n理由：%s", strings.Join(plain, "；"))
 	}
 	if strings.TrimSpace(item.BuyPointHint) != "" {
 		fmt.Fprintf(&b, "\n买点：%s", item.BuyPointHint)
@@ -4629,22 +5197,27 @@ func paperSourceMatchesStrategy(strategyID string, source string) bool {
 	if strategyID == source {
 		return true
 	}
+	// ⚠️这张别名表必须**同时保留新旧名字**:历史留痕/模拟持仓里存的是带编号的旧名(如"超跌起爆11"),
+	// 界面显示名 2026-07-27 去了编号,两边都要能认出来。批量改名时别把这里的旧名一起替换掉。
 	aliases := map[string][]string{
-		"lowbuy-v1":                 {"lowbuy", "低吸1", "低吸选股策略1"},
-		"limit-pullback-v1":         {"limit-pullback", "涨停回调", "涨停回调低吸4"},
-		"triple-volume-v5":          {"triple-volume", "三倍量", "三倍量策略5"},
-		"tail-buy-v6":               {"tail-buy", "尾盘买入", "尾盘买入策略6"},
-		"hot-money-v7":              {"hot-money", "游资突破", "游资突破策略7"},
-		"dip-entry-v8":              {"dip-entry", "低吸入场", "低吸入场策略8"},
-		"monster-v9":                {"monster", "捉妖", "捉妖策略9", "捉妖策略6"},
-		"monster-v10":               {"monster-v10", "捉妖10", "捉妖策略10"},
-		"taillazy-v2":               {"taillazy", "低吸2", "低吸尾盘策略2"},
-		"latechase-v3":              {"latechase", "尾盘3", "尾盘强势策略3"},
+		"lowbuy-v1":                 {"lowbuy", "低吸1", "低吸选股策略", "低吸选股策略1"},
+		"oversold-ignite-v1":        {"oversold-ignite", "超跌起爆", "超跌起爆11", "超跌鱼身起爆11", "超跌鱼身起爆"},
+		"limit-pullback-v1":         {"limit-pullback", "涨停回调", "涨停回调低吸", "涨停回调低吸4"},
+		"triple-volume-v5":          {"triple-volume", "三倍量", "三倍量策略", "三倍量策略5"},
+		"tail-buy-v6":               {"tail-buy", "尾盘买入", "尾盘买入策略", "尾盘买入策略6"},
+		"hot-money-v7":              {"hot-money", "游资突破", "游资突破策略", "游资突破策略7"},
+		"dip-entry-v8":              {"dip-entry", "低吸入场", "低吸入场策略", "低吸入场策略8"},
+		"monster-v9":                {"monster", "捉妖", "捉妖策略", "捉妖策略9", "捉妖策略6"},
+		"monster-v10":               {"monster-v10", "捉妖10", "捉妖策略10", "捉妖(旧v10)"},
+		"taillazy-v2":               {"taillazy", "低吸2", "低吸尾盘策略", "低吸尾盘策略2"},
+		"latechase-v3":              {"latechase", "尾盘3", "尾盘强势策略", "尾盘强势策略3"},
 		"wave-v1":                   {"wave", "波段", "波段策略1.0"},
 		"caoyuan-standard4a":        {"草元标准", "草元标准4a", "草元标准 4a"},
 		"caoyuan-standard4a-strict": {"草元标准", "草元标准严选", "草元标准4a严选", "草元标准 4a 严选"},
 		"caoyuan-zhuang4b":          {"草元抓庄", "草元抓庄4b", "草元抓庄 4b"},
 		"caoyuan-zhuang4b-strict":   {"草元抓庄", "草元抓庄严选", "草元抓庄4b严选", "草元抓庄 4b 严选"},
+		// 外部荐股跟单(2026-07-27):不是自研策略,是拿别人的推荐攒真实前向样本,见 app_tip_picks.go
+		"tip-tianding": {"天鼎早盘推荐", "天鼎", "外部荐股"},
 	}
 	for _, alias := range aliases[strategyID] {
 		if source == alias {
@@ -4658,12 +5231,15 @@ func (a *App) saveLowBuyStrategyPicks(strategyID string, strategyName string, re
 	if a == nil || a.historyService == nil || len(result.Items) == 0 {
 		return
 	}
+	// ⚠️信号日不能用 result.AsOf(那是 time.Now()):凌晨/周末跑扫描时数据其实是上一交易日的,
+	// 盖成"今天"会让留痕、复盘、自学习、体感练习整体错位一天(见 app_signal_date.go)。
+	sigDate := a.effectiveSignalDate()
 	picks := make([]models.StrategyPickSnapshot, 0, len(result.Items))
 	for idx, item := range result.Items {
 		picks = append(picks, models.StrategyPickSnapshot{
 			StrategyID:       strategyID,
 			StrategyName:     strategyName,
-			SignalDate:       result.AsOf,
+			SignalDate:       sigDate,
 			ScannedAt:        result.AsOf,
 			Symbol:           item.Symbol,
 			Name:             item.Name,
@@ -4682,7 +5258,7 @@ func (a *App) saveLowBuyStrategyPicks(strategyID string, strategyName string, re
 			RiskFlags:        item.RiskFlags,
 		})
 	}
-	if err := a.historyService.SaveStrategyPicks(strategyID, strategyName, result.AsOf, result.AsOf, picks); err != nil {
+	if err := a.historyService.SaveStrategyPicks(strategyID, strategyName, sigDate, "", picks); err != nil { // scannedAt 传空→底层用当前时刻(真时间戳,供同日多次扫描区分先后)
 		log.Warn("保存策略扫描留痕失败[%s]: %v", strategyID, err)
 	}
 }
@@ -4691,12 +5267,13 @@ func (a *App) saveLateDayStrategyPicks(strategyID string, strategyName string, r
 	if a == nil || a.historyService == nil || len(result.Items) == 0 {
 		return
 	}
+	sigDate := a.effectiveSignalDate() // 同上:不能用 result.AsOf(=time.Now())
 	picks := make([]models.StrategyPickSnapshot, 0, len(result.Items))
 	for idx, item := range result.Items {
 		picks = append(picks, models.StrategyPickSnapshot{
 			StrategyID:     strategyID,
 			StrategyName:   strategyName,
-			SignalDate:     result.AsOf,
+			SignalDate:     sigDate,
 			ScannedAt:      result.AsOf,
 			Symbol:         item.Symbol,
 			Name:           item.Name,
@@ -4713,7 +5290,7 @@ func (a *App) saveLateDayStrategyPicks(strategyID string, strategyName string, r
 			MainFlowSource: "scan-snapshot",
 		})
 	}
-	if err := a.historyService.SaveStrategyPicks(strategyID, strategyName, result.AsOf, result.AsOf, picks); err != nil {
+	if err := a.historyService.SaveStrategyPicks(strategyID, strategyName, sigDate, "", picks); err != nil { // scannedAt 传空→底层用当前时刻(真时间戳,供同日多次扫描区分先后)
 		log.Warn("保存策略扫描留痕失败[%s]: %v", strategyID, err)
 	}
 }
@@ -4722,7 +5299,8 @@ func (a *App) saveWaveStrategyPicks(strategyID string, strategyName string, resu
 	if a == nil || a.historyService == nil || len(result.Items) == 0 {
 		return
 	}
-	signalDate := chooseFirstNonEmpty(result.AsOf, result.SnapshotAsOf, time.Now().Format("2006-01-02"))
+	// 波段同理:AsOf/SnapshotAsOf 都是运行时刻,凌晨或周末跑会错标一天
+	signalDate := a.effectiveSignalDate()
 	picks := make([]models.StrategyPickSnapshot, 0, len(result.Items))
 	for idx, item := range result.Items {
 		reasons := append([]string{}, item.Reasons...)
@@ -4754,6 +5332,10 @@ func (a *App) saveWaveStrategyPicks(strategyID string, strategyName string, resu
 		if item.GZ {
 			triggers = append(triggers, "五灯共振")
 		}
+		if item.KeyLayout {
+			// 放最前:复盘卡片只显示前几个触发标签,重点布局必须可见(供历史复盘筛选)
+			triggers = append([]string{"★重点布局"}, triggers...)
+		}
 		picks = append(picks, models.StrategyPickSnapshot{
 			StrategyID:       strategyID,
 			StrategyName:     strategyName,
@@ -4771,7 +5353,7 @@ func (a *App) saveWaveStrategyPicks(strategyID string, strategyName string, resu
 			RiskFlags:        item.Risks,
 		})
 	}
-	if err := a.historyService.SaveStrategyPicks(strategyID, strategyName, signalDate, result.AsOf, picks); err != nil {
+	if err := a.historyService.SaveStrategyPicks(strategyID, strategyName, signalDate, "", picks); err != nil { // scannedAt 传空→底层用当前时刻
 		log.Warn("保存策略扫描留痕失败[%s]: %v", strategyID, err)
 	}
 }
@@ -4779,25 +5361,25 @@ func (a *App) saveWaveStrategyPicks(strategyID string, strategyName string, resu
 func strategyReviewName(strategyID string) string {
 	switch strings.TrimSpace(strategyID) {
 	case "lowbuy-v1":
-		return "低吸选股策略1"
+		return "低吸选股"
 	case "taillazy-v2":
-		return "低吸尾盘策略2"
+		return "低吸尾盘"
 	case "latechase-v3":
-		return "尾盘强势策略3"
+		return "尾盘强势"
 	case "limit-pullback-v1":
-		return "涨停回调低吸4"
+		return "涨停回调低吸"
 	case "triple-volume-v5":
-		return "三倍量策略5"
+		return "三倍量"
 	case "tail-buy-v6":
-		return "尾盘买入策略6"
+		return "尾盘买入"
 	case "hot-money-v7":
-		return "游资突破策略7"
+		return "游资突破"
 	case "dip-entry-v8":
-		return "低吸入场策略8"
+		return "低吸入场"
 	case "monster-v9":
-		return "捉妖策略9"
+		return "捉妖"
 	case "monster-v10":
-		return "捉妖策略10"
+		return "捉妖(旧v10·已停用)"
 	case "caoyuan-standard4a":
 		return "草元标准 4A"
 	case "caoyuan-standard4a-strict":
@@ -4829,6 +5411,172 @@ func (a *App) GetF10Overview(code string) models.F10Overview {
 		}
 	}
 	return result
+}
+
+// isPriceAtLimitUp 现价已到涨停价位(封死或触停排队)——当下实际买不进。
+// 按板别近似限幅:688/689/300/301=20cm、北交=30cm、ST含B股口径按名称=5cm、其余主板10cm;
+// 涨幅≥限幅-0.05个百分点视为到板。成文总纪律(2026-07-24 用户定):所有策略模拟实际交易规则,
+// 到板票不推送、不自动入盘、列表标记并下沉(保留展示是因为多数策略纪律的买点=次日回踩)。
+func isPriceAtLimitUp(symbol, name string, changePct float64) bool {
+	sym := strings.ToLower(strings.TrimSpace(symbol))
+	limit := 10.0
+	code := sym
+	if len(code) >= 2 && (strings.HasPrefix(code, "sh") || strings.HasPrefix(code, "sz") || strings.HasPrefix(code, "bj")) {
+		code = code[2:]
+	}
+	switch {
+	case strings.HasPrefix(sym, "bj"):
+		limit = 30
+	case strings.HasPrefix(code, "688") || strings.HasPrefix(code, "689") || strings.HasPrefix(code, "300") || strings.HasPrefix(code, "301"):
+		limit = 20
+	}
+	if strings.Contains(strings.ToUpper(name), "ST") {
+		limit = 5
+	}
+	return changePct >= limit-0.05
+}
+
+// annotateAndDemoteSealed 对扫描结果统一执行"到板票标记并下沉":
+// 可买的保持原序在前,到板的整体挪到列表尾部并打上明确标签/风险提示。所有策略共用。
+func annotateAndDemoteSealed(items []models.LowBuyScannerItem) []models.LowBuyScannerItem {
+	if len(items) == 0 {
+		return items
+	}
+	buyable := make([]models.LowBuyScannerItem, 0, len(items))
+	sealed := make([]models.LowBuyScannerItem, 0, 4)
+	for _, it := range items {
+		if isPriceAtLimitUp(it.Symbol, it.Name, it.ChangePercent) {
+			it.Triggers = append(it.Triggers, "⚠️涨停到板·当日买不进")
+			it.RiskFlags = append([]string{"已到涨停价位,当日实际无法买入;按纪律等次日回踩或炸板机会"}, it.RiskFlags...)
+			sealed = append(sealed, it)
+		} else {
+			buyable = append(buyable, it)
+		}
+	}
+	return append(buyable, sealed...)
+}
+
+// applyLearnedTuning 把该策略"已确认的进化调优"应用到扫描结果评分层:命中桶加分、理由标注来源与版本,
+// 然后按新分重排。桶判定只用条目现场字段(换手/涨幅档/主力方向/共振数),不重载K线。
+func (a *App) applyLearnedTuning(strategyID string, items []models.LowBuyScannerItem) []models.LowBuyScannerItem {
+	if a == nil || a.historyService == nil || len(items) == 0 {
+		return items
+	}
+	tunings := a.historyService.LoadScoreTunings(strategyID)
+	if len(tunings) == 0 {
+		return items
+	}
+	today := time.Now().Format("2006-01-02")
+	touched := false
+	for i := range items {
+		it := &items[i]
+		for _, t := range tunings {
+			hit := false
+			switch t.Dim {
+			case "换手率":
+				switch t.Bucket {
+				case "≥15%":
+					hit = it.TurnoverRate >= 15
+				case "8-15%":
+					hit = it.TurnoverRate >= 8 && it.TurnoverRate < 15
+				case "<8%":
+					hit = it.TurnoverRate > 0 && it.TurnoverRate < 8
+				}
+			case "信号日涨幅":
+				switch t.Bucket {
+				case "涨停级":
+					hit = isPriceAtLimitUp(it.Symbol, it.Name, it.ChangePercent)
+				case "5-9.5%":
+					hit = it.ChangePercent >= 5 && !isPriceAtLimitUp(it.Symbol, it.Name, it.ChangePercent)
+				case "0-5%":
+					hit = it.ChangePercent >= 0 && it.ChangePercent < 5
+				case "收跌":
+					hit = it.ChangePercent < 0
+				}
+			case "主力资金":
+				hasFlow := it.MainNetInflow != 0 || it.MainNetInflowRatio != 0
+				switch t.Bucket {
+				case "净流入":
+					hit = hasFlow && it.MainNetInflowRatio > 0
+				case "净流出":
+					hit = hasFlow && it.MainNetInflowRatio <= 0
+				}
+			case "其他策略共振":
+				n := a.historyService.CountCrossHitsOn(it.Symbol, today, strategyID)
+				switch t.Bucket {
+				case "独家":
+					hit = n == 0
+				case "1策略共振":
+					hit = n == 1
+				case "≥2策略共振":
+					hit = n >= 2
+				}
+			}
+			if hit {
+				it.Score = math.Round(clamp(it.Score+t.Delta, 0, 100)*10) / 10
+				it.Reasons = append(it.Reasons, fmt.Sprintf("进化调优v%d(%s确认): %s[%s] +%.1f分 — 依据:%s", t.Version, t.ConfirmedAt[:10], t.Dim, t.Bucket, t.Delta, t.Evidence))
+				touched = true
+			}
+		}
+	}
+	if touched {
+		sort.Slice(items, func(i, j int) bool { return items[i].Score > items[j].Score })
+	}
+	return items
+}
+
+// ImportAIReport 导入一份AI诊断报告摘录(scripts/import_ai_report.sh 解析docx后调用)。
+func (a *App) ImportAIReport(code, name, reportDate string, fishIndex, prob float64, rating, phase string) string {
+	if a == nil || a.historyService == nil {
+		return "未就绪"
+	}
+	created, matched, err := a.historyService.UpsertAIReport(services.AIReportNote{
+		Code: code, Name: name, ReportDate: reportDate, FishIndex: fishIndex, Prob: prob, Rating: rating, Phase: phase,
+	})
+	if err != nil {
+		return err.Error()
+	}
+	verb := "更新"
+	if created {
+		verb = "入库"
+	}
+	return fmt.Sprintf("报告%s: %s(%s) %s 鱼身%.0f 主升浪%.0f%% [%s];学习库已匹配AI因子样本 %d 笔", verb, name, code, reportDate, fishIndex, prob, rating, matched)
+}
+
+// GetAIReportCalibration AI报告概率校准审计。
+func (a *App) GetAIReportCalibration() string {
+	if a == nil || a.historyService == nil {
+		return "未就绪"
+	}
+	return a.historyService.AIReportCalibration()
+}
+
+// GenerateEvolutionProposalsNow 手动触发提案生成(每日学习后也会自动跑)。
+func (a *App) GenerateEvolutionProposalsNow() string {
+	if a == nil || a.historyService == nil {
+		return "未就绪"
+	}
+	n, summary := a.historyService.GenerateEvolutionProposals(strategyReviewName)
+	if n == 0 {
+		return "本轮无新进化提案(现有达标发现均已提案或已应用)"
+	}
+	return fmt.Sprintf("新增 %d 条进化提案,等你确认:\n%s", n, summary)
+}
+
+// GetEvolutionProposals 列出提案(status 传空串=全部,常用 pending)。
+func (a *App) GetEvolutionProposals(status string) string {
+	if a == nil || a.historyService == nil {
+		return "未就绪"
+	}
+	return a.historyService.ListEvolutionProposals(strings.TrimSpace(status), strategyReviewName)
+}
+
+// DecideEvolutionProposal 裁决提案:accept=true 确认(score类即刻生效),false 拒绝。
+func (a *App) DecideEvolutionProposal(id int, accept bool) string {
+	if a == nil || a.historyService == nil {
+		return "未就绪"
+	}
+	return a.historyService.DecideEvolutionProposal(int64(id), accept)
 }
 
 func classifyCapBucket(totalCap float64) string {
@@ -5663,13 +6411,1127 @@ type tripleVolumeMetrics struct {
 	StopLoss       float64
 }
 
+// ===== 超跌鱼身起爆11 (oversold-ignite-v1) =====
+// 参考形态(2026-07,用户给的两只样板):米奥会展 07-17 首爆、格林精密 07-16 首爆——
+// 长期阴跌(250日高点回撤≥38%)+ 底部地量枯竭(20日均量≤年均量65%)+ 突然爆量首阳(≥3倍量,涨幅≥6%,
+// 收复MA5/MA10)+ 波段鱼身引擎共振(异动点火/吃鱼身必须;短线能量/五灯/控盘度计分)。
+// 定位:候选发现工具。⚠️未经滚动逐年回测验证,不接自动买入;短线公式策略全家族已证伪的教训在前,
+// 本策略的价值假设(超跌+地量+爆量=主力进场)同样需要留痕攒样本后再判。
+
+// evaluateOversoldIgniteRow 单股判定:daily 为升序日K(≥120根),最后一根=信号日。
+func evaluateOversoldIgniteRow(row services.ScanSnapshotRow, industry string, daily []models.KLineData, asOf string) (models.LowBuyScannerItem, bool) {
+	n := len(daily)
+	if n < 120 {
+		return models.LowBuyScannerItem{}, false
+	}
+	li := n - 1
+	cur := daily[li]
+	prev := daily[li-1]
+	if cur.Close <= 0 || cur.Open <= 0 || prev.Close <= 0 || cur.Volume <= 0 {
+		return models.LowBuyScannerItem{}, false
+	}
+	pct := (cur.Close/prev.Close - 1) * 100
+	// C5 爆发阳线:涨幅≥6% 且阳线。日采集行开盘价常缺(NULL→加载器兜底开=收),
+	// 此时阳线退化按涨幅判(2026-07-24 实测:07-23 全部389只因假"开=收"被误拒)。
+	realCandle := cur.Open > 0 && cur.Open != cur.Close
+	if pct < 6 || (realCandle && cur.Close <= cur.Open) {
+		return models.LowBuyScannerItem{}, false
+	}
+	// C6 收复短均线
+	ma5, ok5 := klineMAAt(daily, li, 5)
+	ma10, ok10 := klineMAAt(daily, li, 10)
+	if !ok5 || !ok10 || cur.Close <= ma5 || cur.Close <= ma10 {
+		return models.LowBuyScannerItem{}, false
+	}
+	// C4 爆量≥3×。基准=前40日成交量中位数(剔除信号日前2日):中位数不被近期零星活跃日抬高,
+	// 也不被极端地量拉低——样板实测:米奥4.8×/格林3.25×(若用20日均值,格林只有2.3×被误杀)。
+	baseEnd := li - 2
+	baseVols := make([]float64, 0, 40)
+	for i := baseEnd - 40; i < baseEnd; i++ {
+		if i >= 0 && daily[i].Volume > 0 {
+			baseVols = append(baseVols, float64(daily[i].Volume))
+		}
+	}
+	if len(baseVols) < 25 {
+		return models.LowBuyScannerItem{}, false
+	}
+	sort.Float64s(baseVols)
+	baseVol := baseVols[len(baseVols)/2]
+	volMult := float64(cur.Volume) / baseVol
+	if volMult < 3 {
+		return models.LowBuyScannerItem{}, false
+	}
+	// 地量度(计分项,不设硬门):沉寂期量/年均量,越干越加分。整年阴跌的票年均量本身就低,
+	// 硬卡比值会把样板误杀(米奥0.81/格林0.77),深跌+爆量+共振已足够定义形态。
+	yearVol := 0.0
+	ycnt := 0
+	yearStart := 0
+	if n > 250 {
+		yearStart = n - 250
+	}
+	for i := yearStart; i < baseEnd; i++ {
+		if daily[i].Volume > 0 {
+			yearVol += float64(daily[i].Volume)
+			ycnt++
+		}
+	}
+	if ycnt < 60 {
+		return models.LowBuyScannerItem{}, false
+	}
+	yearVol /= float64(ycnt)
+	volDry := baseVol / yearVol
+	// C1 深度回撤:250日高点(不含最近5根) → 近40日低点(不含信号日) 回撤≥38%
+	hi := 0.0
+	for i := yearStart; i < li-5; i++ {
+		if daily[i].High > hi {
+			hi = daily[i].High
+		}
+	}
+	base := math.MaxFloat64
+	for i := li - 40; i < li; i++ {
+		if i >= 0 && daily[i].Low > 0 && daily[i].Low < base {
+			base = daily[i].Low
+		}
+	}
+	if hi <= 0 || base >= math.MaxFloat64 {
+		return models.LowBuyScannerItem{}, false
+	}
+	drawdown := (hi - base) / hi * 100
+	if drawdown < 38 {
+		return models.LowBuyScannerItem{}, false
+	}
+	// C2 还没涨飞:信号日收盘距底部≤35%(样板首爆日 +26%/+33%;二连板后+68%不追)
+	riseFromBase := (cur.Close/base - 1) * 100
+	if riseFromBase > 40 { // 样板校准:首爆日+26~32%,次日+37%(格林D2);二连板后+68%依然拒(不追飞)
+		return models.LowBuyScannerItem{}, false
+	}
+	// C7 波段鱼身引擎共振(同源 computeWaveV1Signals):点火/吃鱼身至少一样(涨停日宽口径也认)
+	ds := make([]string, n)
+	o := make([]float64, n)
+	hh := make([]float64, n)
+	ll := make([]float64, n)
+	cc := make([]float64, n)
+	vv := make([]float64, n)
+	aa := make([]float64, n)
+	for i, k := range daily {
+		t := strings.TrimSpace(k.Time)
+		if len(t) >= 10 {
+			t = t[:10]
+		}
+		ds[i], o[i], hh[i], ll[i], cc[i], vv[i], aa[i] = t, k.Open, k.High, k.Low, k.Close, float64(k.Volume), k.Amount
+		if aa[i] <= 0 && cc[i] > 0 && vv[i] > 0 {
+			aa[i] = cc[i] * vv[i] // 历史行 amount 常为 NULL,点火族条件全依赖成交额——用 收盘×量(股) 近似,单位=元
+		}
+	}
+	wr := services.WaveResonanceAtLast(ds, o, hh, ll, cc, vv, aa)
+	limitUpish := pct >= 9.5 // 主板涨停/创业板大半程,视作情绪确认
+	if !wr.StrictIgnite && !wr.EatFish && !wr.MainOpenFish && !(wr.RelaxedIgnite && limitUpish) && !(limitUpish && wr.Lamps >= 4) {
+		return models.LowBuyScannerItem{}, false
+	}
+
+	score := 50.0
+	score += clamp((drawdown-38)/22*10, 0, 10) // 跌得越深越加分(38→60%)
+	score += clamp((0.9-volDry)/0.5*8, 0, 8)   // 量缩得越干越加分(0.9→0.4)
+	score += clamp((volMult-3)*1.6, 0, 12)     // 爆量倍数(3→10.5倍)
+	if wr.MainOpenFish {
+		score += 8
+	} else if wr.StrictIgnite {
+		score += 8
+	} else if wr.EatFish {
+		score += 6
+	} else {
+		score += 4 // 宽口径+涨停
+	}
+	switch {
+	case wr.StrongCount >= 3:
+		score += 10
+	case wr.StrongCount == 2:
+		score += 7
+	case wr.StrongCount == 1 || wr.MainRise:
+		score += 4
+	}
+	score += float64(wr.Lamps) * 2
+	if wr.AllLamps {
+		score += 4
+	}
+	score += clamp((wr.Kongpan-50)*0.3, 0, 8)
+	// 学习调优v1.1(2026-07-22,学习库n=147首个达标发现):信号日换手≥15%红盘率57%(n=30) vs <8%仅42%(n=53)。
+	// 按纪律仅动评分层:换手8%→15%线性加0→6分。硬门槛未动。
+	score += clamp((row.TurnoverRate-8)/7*6, 0, 6)
+	risks := make([]string, 0, 4)
+	if riseFromBase > 30 {
+		score -= 6
+		risks = append(risks, "距底部已超30%,起爆段后半场,回踩风险大")
+	}
+	upperShadow := 0.0
+	if cur.High > cur.Close {
+		upperShadow = (cur.High - cur.Close) / cur.Close * 100
+	}
+	if upperShadow > 5 {
+		score -= 4
+		risks = append(risks, "上影线偏长,尾盘有抛压")
+	}
+	if volMult > 12 {
+		score -= 3
+		risks = append(risks, "量能过度放大,防一日游")
+	}
+	score = math.Round(clamp(score, 0, 100)*10) / 10
+
+	igniteDesc := "涨停+五灯共振"
+	if wr.RelaxedIgnite {
+		igniteDesc = "宽口径点火+涨停"
+	}
+	switch {
+	case wr.MainOpenFish:
+		igniteDesc = "开仓吃鱼"
+	case wr.StrictIgnite:
+		igniteDesc = "异动点火·强口径"
+	case wr.EatFish:
+		igniteDesc = "吃鱼身"
+	}
+	triggers := []string{"250日回撤≥38%", "爆量≥3倍(40日中位量基准)", "大阳≥6%收复MA5/10", igniteDesc}
+	if wr.Lamps >= 4 {
+		triggers = append(triggers, fmt.Sprintf("五灯%d红", wr.Lamps))
+	}
+	reasons := []string{
+		fmt.Sprintf("超跌基座:250日高点 %.2f → 底部 %.2f,回撤 %.1f%%;信号日距底 +%.1f%%", hi, base, drawdown, riseFromBase),
+		fmt.Sprintf("地量→爆量:沉寂期(40日中位)量为年均量的 %.0f%%,信号日放量 %.1f 倍", volDry*100, volMult),
+		fmt.Sprintf("鱼身引擎:%s;短线能量强势次数 %d;五灯 %d/5 红;控盘度 %.1f", igniteDesc, wr.StrongCount, wr.Lamps, wr.Kongpan),
+		fmt.Sprintf("K线:涨幅 %.2f%%,收 %.2f 站上 MA5 %.2f / MA10 %.2f", pct, cur.Close, ma5, ma10),
+	}
+	displayPrice := row.Price
+	if displayPrice <= 0 {
+		displayPrice = cur.Close
+	}
+	displayChange := row.ChangePercent
+	if math.Abs(displayChange) < 0.0001 {
+		displayChange = pct
+	}
+	return models.LowBuyScannerItem{
+		Symbol: row.Symbol, Name: row.Name,
+		Price: displayPrice, ChangePercent: displayChange,
+		Amount: row.Amount, TurnoverRate: row.TurnoverRate,
+		MainNetInflow: row.MainNetInflow, MainNetInflowRatio: row.MainNetInflowRatio,
+		MainFlowSource: chooseFirstNonEmpty(row.MainFlowSource, "not-required"),
+		TotalMarketCap: row.TotalMarketCap, FloatMarketCap: row.FloatMarketCap,
+		CapBucket: classifyCapBucket(row.TotalMarketCap), Industry: industry,
+		Score: score, TriggerCount: len(triggers), Triggers: triggers, Reasons: reasons, RiskFlags: risks,
+		BuyPointHint:  "首爆日/次日回踩不破起爆阳线实体下沿低吸;连板后距底>35%不追",
+		SellPointHint: "冲高沿途分批;放量滞涨/长上影先减",
+		StopLossHint:  "跌破起爆日最低价=形态失效,离场",
+	}, true
+}
+
+// computeOversoldFeatures 提取信号日特征(与 evaluateOversoldIgniteRow 同一套公式的镜像,
+// 供自学习库回填——改判定公式时两处必须同步改)。daily 升序,最后一根=信号日。
+func computeOversoldFeatures(daily []models.KLineData) (services.OversoldLearnSample, bool) {
+	var m services.OversoldLearnSample
+	n := len(daily)
+	if n < 120 {
+		return m, false
+	}
+	li := n - 1
+	cur := daily[li]
+	if cur.Close <= 0 || daily[li-1].Close <= 0 {
+		return m, false
+	}
+	m.Pct = (cur.Close/daily[li-1].Close - 1) * 100
+	if m.Pct >= 9.5 {
+		m.LimitUp = 1
+	}
+	ma5, _ := klineMAAt(daily, li, 5)
+	ma10, _ := klineMAAt(daily, li, 10)
+	if ma5 > 0 {
+		m.MA5Dist = (cur.Close/ma5 - 1) * 100
+	}
+	if ma10 > 0 {
+		m.MA10Dist = (cur.Close/ma10 - 1) * 100
+	}
+	baseEnd := li - 2
+	baseVols := make([]float64, 0, 40)
+	for i := baseEnd - 40; i < baseEnd; i++ {
+		if i >= 0 && daily[i].Volume > 0 {
+			baseVols = append(baseVols, float64(daily[i].Volume))
+		}
+	}
+	if len(baseVols) < 25 {
+		return m, false
+	}
+	sort.Float64s(baseVols)
+	baseVol := baseVols[len(baseVols)/2]
+	if baseVol > 0 {
+		m.VolMult = float64(cur.Volume) / baseVol
+	}
+	yearStart := 0
+	if n > 250 {
+		yearStart = n - 250
+	}
+	yearVol, ycnt := 0.0, 0
+	for i := yearStart; i < baseEnd; i++ {
+		if daily[i].Volume > 0 {
+			yearVol += float64(daily[i].Volume)
+			ycnt++
+		}
+	}
+	if ycnt > 0 && yearVol > 0 {
+		m.VolDry = baseVol / (yearVol / float64(ycnt))
+	}
+	hi := 0.0
+	for i := yearStart; i < li-5; i++ {
+		if daily[i].High > hi {
+			hi = daily[i].High
+		}
+	}
+	base := math.MaxFloat64
+	for i := li - 40; i < li; i++ {
+		if i >= 0 && daily[i].Low > 0 && daily[i].Low < base {
+			base = daily[i].Low
+		}
+	}
+	if hi > 0 && base < math.MaxFloat64 {
+		m.Drawdown = (hi - base) / hi * 100
+		m.RiseFromBase = (cur.Close/base - 1) * 100
+	}
+	if cur.High > cur.Close && cur.Close > 0 {
+		m.UpperShadow = (cur.High - cur.Close) / cur.Close * 100
+	}
+	ds := make([]string, n)
+	o := make([]float64, n)
+	hh := make([]float64, n)
+	ll := make([]float64, n)
+	cc := make([]float64, n)
+	vv := make([]float64, n)
+	aa := make([]float64, n)
+	for i, k := range daily {
+		t := strings.TrimSpace(k.Time)
+		if len(t) >= 10 {
+			t = t[:10]
+		}
+		ds[i], o[i], hh[i], ll[i], cc[i], vv[i], aa[i] = t, k.Open, k.High, k.Low, k.Close, float64(k.Volume), k.Amount
+		if aa[i] <= 0 && cc[i] > 0 && vv[i] > 0 {
+			aa[i] = cc[i] * vv[i]
+		}
+	}
+	wr := services.WaveResonanceAtLast(ds, o, hh, ll, cc, vv, aa)
+	m.Lamps = wr.Lamps
+	m.Kongpan = wr.Kongpan
+	m.StrongCount = wr.StrongCount
+	return m, true
+}
+
+// LearnAllStrategiesNow 全策略共享自学习:把每个策略留痕中"次日已定型且未入库"的入选
+// 配对成样本(特征提取与11同一套,策略无关),再统一刷因子/基准,并对最新交易日的入选匹配快讯。
+func (a *App) LearnAllStrategiesNow() string {
+	if a == nil || a.historyService == nil {
+		return "历史服务未就绪"
+	}
+	if n := a.historyService.MigrateOversoldLearnToShared(); n > 0 {
+		rt.LogInfof("学习库迁移: 11的旧样本并入共享表 %d 笔", n)
+	}
+	ids := a.historyService.LearnableStrategyIDs()
+	totalAdded := 0
+	latestDate := ""
+	type newsKey struct{ id, date, sym, name string }
+	latestPicks := []newsKey{}
+	perStrategy := map[string]int{}
+	for _, sid := range ids {
+		pending := a.historyService.StrategyLearnPending(sid)
+		for _, p := range pending {
+			daily, err := a.historyService.LoadKLineDataUntil(p.Symbol, p.SignalDate, 270)
+			if err != nil || len(daily) < 120 {
+				continue
+			}
+			if lt := daily[len(daily)-1].Time; len(lt) >= 10 && lt[:10] != p.SignalDate {
+				continue
+			}
+			m, ok := computeOversoldFeatures(daily)
+			if !ok {
+				continue
+			}
+			sigClose, nOpen, nHigh, nClose, ok2 := a.historyService.NextDayBar(p.Symbol, p.SignalDate)
+			if !ok2 || sigClose <= 0 {
+				continue
+			}
+			m.SignalDate, m.Symbol, m.Name = p.SignalDate, p.Symbol, p.Name
+			if to := a.historyService.TurnoverOn(p.Symbol, p.SignalDate); to > 0 {
+				m.Turnover = to
+			}
+			m.CrossHits, m.Lhb, m.NewsCount, m.MainPct, m.BenchRet = -1, -1, -1, -999, -999
+			m.NextOpenRet = (nOpen/sigClose - 1) * 100
+			m.NextHighRet = (nHigh/sigClose - 1) * 100
+			m.NextCloseRet = (nClose/sigClose - 1) * 100
+			if a.historyService.InsertStrategyLearnSample(sid, m) == nil {
+				totalAdded++
+				perStrategy[sid]++
+				if p.SignalDate > latestDate {
+					latestDate = p.SignalDate
+				}
+				latestPicks = append(latestPicks, newsKey{sid, p.SignalDate, p.Symbol, p.Name})
+			}
+		}
+	}
+	a.historyService.RefreshStrategyLearnFactors()
+	a.historyService.RefreshStrategyLearnBenchmarks()
+	if latestDate != "" {
+		news := a.GetTelegraphList()
+		if len(news) > 0 {
+			for _, k := range latestPicks {
+				if k.date != latestDate || len([]rune(k.name)) < 2 {
+					continue
+				}
+				cnt := 0
+				for _, n := range news {
+					if strings.Contains(n.Content, k.name) {
+						cnt++
+					}
+				}
+				a.historyService.SetStrategyLearnNewsCount(k.id, k.date, k.sym, cnt)
+			}
+		}
+	}
+	parts := []string{}
+	for sid, n := range perStrategy {
+		parts = append(parts, fmt.Sprintf("%s+%d", strategyReviewName(sid), n))
+	}
+	sort.Strings(parts)
+	msg := fmt.Sprintf("全策略学习入库 %d 笔(%s)", totalAdded, strings.Join(parts, " "))
+	rt.LogInfof("共享自学习: %s", msg)
+	return msg
+}
+
+// LearnOversoldNow 兼容旧RPC名:现在等价于全策略学习。
+func (a *App) LearnOversoldNow() string {
+	return a.LearnAllStrategiesNow()
+}
+
+// GetStrategyLearnReport 任一策略的学习日报。
+func (a *App) GetStrategyLearnReport(strategyID string) string {
+	if a == nil || a.historyService == nil {
+		return "历史服务未就绪"
+	}
+	strategyID = strings.TrimSpace(strategyID)
+	if strategyID == "" {
+		return "未指定策略"
+	}
+	text, _, _ := a.historyService.BuildStrategyLearnReportFor(strategyID, strategyReviewName(strategyID))
+	return text
+}
+
+// GetLearnOverview 全策略学习总览。
+func (a *App) GetLearnOverview() string {
+	if a == nil || a.historyService == nil {
+		return "历史服务未就绪"
+	}
+	return a.historyService.BuildLearnOverview(strategyReviewName)
+}
+
+// GetOversoldLearnReport 兼容旧RPC名:委托共享学习报告。
+func (a *App) GetOversoldLearnReport() string {
+	return a.GetStrategyLearnReport("oversold-ignite-v1")
+}
+
+var oversoldBackfillMu sync.Mutex
+
+// BackfillOversoldLearn 用历史重算把近 months 个月每个交易日的超跌起爆11信号补出来并入学习库(后台跑)。
+func (a *App) BackfillOversoldLearn(months int) string {
+	if a == nil || a.historyService == nil {
+		return "历史服务未就绪"
+	}
+	if months <= 0 || months > 12 {
+		months = 3
+	}
+	if !oversoldBackfillMu.TryLock() {
+		return "已有一轮学习回放在进行,看 server.log 进度"
+	}
+	since := time.Now().AddDate(0, -months, 0).Format("2006-01-02")
+	today := time.Now().Format("2006-01-02")
+	dates := a.historyService.TradeDatesSince(since, today)
+	go func() {
+		defer oversoldBackfillMu.Unlock()
+		start := time.Now()
+		replayed := 0
+		for i, d := range dates {
+			if a.historyService.CountStrategyPicks("oversold-ignite-v1", d) > 0 {
+				continue // 已有留痕(实盘或此前重算过)
+			}
+			picks, _ := a.replayOversoldIgniteOnDate(d, 10)
+			if len(picks) > 0 {
+				if a.historyService.SaveStrategyPicks("oversold-ignite-v1", "超跌起爆", d, "", picks) == nil {
+					a.historyService.MarkPicksReplayedPublic("oversold-ignite-v1", d)
+				}
+			}
+			replayed++
+			if (i+1)%10 == 0 {
+				rt.LogInfof("超跌起爆学习回放进度 %d/%d (耗时%.0f分)", i+1, len(dates), time.Since(start).Minutes())
+			}
+		}
+		msg := a.LearnOversoldNow()
+		rt.LogInfof("超跌起爆学习回放完成: 覆盖%d个交易日(重算%d天,耗时%.0f分) → %s", len(dates), replayed, time.Since(start).Minutes(), msg)
+	}()
+	return fmt.Sprintf("学习回放已启动: %d 个交易日(%s起),逐日重算约20-50秒/天,完成后自动入学习库,进度看日志", len(dates), since)
+}
+
+// DebugOversoldIgnite 诊断某股某日各条件真值(调参用,不写留痕)。
+func (a *App) DebugOversoldIgnite(code, date string) map[string]any {
+	out := map[string]any{"code": code, "date": date}
+	if a == nil || a.historyService == nil {
+		out["err"] = "服务未就绪"
+		return out
+	}
+	daily, err := a.historyService.LoadKLineDataUntil(code, date, 270)
+	if err != nil || len(daily) < 120 {
+		out["err"] = fmt.Sprintf("日K不足: %v len=%d", err, len(daily))
+		return out
+	}
+	n := len(daily)
+	li := n - 1
+	ds := make([]string, n)
+	o := make([]float64, n)
+	hh := make([]float64, n)
+	ll := make([]float64, n)
+	cc := make([]float64, n)
+	vv := make([]float64, n)
+	aa := make([]float64, n)
+	for i, k := range daily {
+		t := strings.TrimSpace(k.Time)
+		if len(t) >= 10 {
+			t = t[:10]
+		}
+		ds[i], o[i], hh[i], ll[i], cc[i], vv[i], aa[i] = t, k.Open, k.High, k.Low, k.Close, float64(k.Volume), k.Amount
+		if aa[i] <= 0 && cc[i] > 0 && vv[i] > 0 {
+			aa[i] = cc[i] * vv[i]
+		}
+	}
+	wr := services.WaveResonanceAtLast(ds, o, hh, ll, cc, vv, aa)
+	out["lastBar"] = daily[li].Time
+	out["amountYuan"] = daily[li].Amount
+	out["wave"] = map[string]any{
+		"strictIgnite": wr.StrictIgnite, "relaxedIgnite": wr.RelaxedIgnite,
+		"eatFish": wr.EatFish, "mainOpenFish": wr.MainOpenFish,
+		"mainRise": wr.MainRise, "strongCount": wr.StrongCount,
+		"lamps": wr.Lamps, "kongpan": wr.Kongpan, "level": wr.Level,
+	}
+	row := services.ScanSnapshotRow{Symbol: code, Price: daily[li].Close, Amount: daily[li].Amount}
+	if item, ok := evaluateOversoldIgniteRow(row, "调试", daily, date); ok {
+		out["hit"] = true
+		out["score"] = item.Score
+		out["reasons"] = item.Reasons
+	} else {
+		out["hit"] = false
+	}
+	return out
+}
+
+// RunOversoldIgniteScanner 超跌鱼身起爆11 全市场扫描(实时)。
+func (a *App) RunOversoldIgniteScanner(req models.LowBuyScannerRequest) models.LowBuyScannerResult {
+	start := time.Now()
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	result := models.LowBuyScannerResult{
+		AsOf:        start.Format("2006-01-02 15:04:05"),
+		RuleVersion: "超跌鱼身起爆(250日回撤≥38% + 爆量≥3倍[40日中位量基准]大阳≥6%收复MA5/10 + 距底≤35% + 波段鱼身引擎共振;地量度计分)",
+		Items:       []models.LowBuyScannerItem{},
+	}
+	if a == nil || a.marketService == nil {
+		result.Warning = "行情服务未初始化"
+		return result
+	}
+	snapshots, err := a.marketService.GetAllAStockSnapshot(req.IncludeBeijing)
+	if err != nil {
+		result.Warning = combineWarnings(result.Warning, "全A快照获取失败："+err.Error())
+		return result
+	}
+	result.UniverseCount = len(snapshots)
+	industryMap := buildIndustryMapFromEmbedded()
+	candidates, checkedDaily, dailyFailed, droppedDaily := a.runParallelDailyScan(snapshots, industryMap, result.AsOf, parallelDailyScanSpec{
+		klineDays: 270,
+		minBars:   120,
+		prefilter: func(row services.ScanSnapshotRow) bool {
+			if row.Price <= 0 || row.Amount <= 0 || row.IsST {
+				return false
+			}
+			if strings.HasPrefix(strings.ToLower(row.Symbol), "bj") && !req.IncludeBeijing {
+				return false
+			}
+			return row.ChangePercent >= 5.5 // 粗筛:目标形态信号日≥6%,快照口径给0.5%容差
+		},
+		evaluate: evaluateOversoldIgniteRow,
+	})
+	result.CandidateCount = len(candidates)
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Score == candidates[j].Score {
+			if candidates[i].TriggerCount == candidates[j].TriggerCount {
+				return candidates[i].Amount > candidates[j].Amount
+			}
+			return candidates[i].TriggerCount > candidates[j].TriggerCount
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	candidates = a.applyLearnedTuning("oversold-ignite-v1", candidates)
+	candidates = annotateAndDemoteSealed(candidates)
+	candidates = a.annotateIntelHits(candidates)
+	result.Items = candidates
+	result.SelectedCount = len(candidates)
+	result.Warning = combineWarnings(result.Warning, fmt.Sprintf(
+		"参考形态:米奥会展07-17/格林精密07-16 首爆;日K验证%d只,失败%d只,丢尾%d只;新策略未经回测验证,定位=候选发现,不接自动买入",
+		checkedDaily, dailyFailed, droppedDaily))
+	a.saveLowBuyStrategyPicks("oversold-ignite-v1", "超跌起爆", result)
+	if _, total, wr := a.historyService.BuildOversoldLearnReport(); total > 0 {
+		result.Warning = combineWarnings(result.Warning, fmt.Sprintf("学习库:%d笔样本,扣费超额胜率%.1f%%(超额=跑赢全市场中位数并扣往返费用,详见「学习日报」)", total, wr))
+	}
+	return result
+}
+
+// replayOversoldIgniteOnDate 超跌起爆11历史重算(纯日K,与线上同一 evaluateOversoldIgniteRow)。
+func (a *App) replayOversoldIgniteOnDate(signalDate string, topN int) ([]models.StrategyPickSnapshot, string) {
+	if a == nil || a.historyService == nil {
+		return nil, ""
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+	start := time.Now()
+	rows, asOf, err := a.historyService.LoadScanRowsOnDateForReplay(signalDate, false)
+	if err != nil {
+		return nil, "超跌起爆 历史重算读取快照失败:" + err.Error()
+	}
+	if asOf != signalDate {
+		return nil, fmt.Sprintf("超跌起爆 没有找到 %s 的原始扫描留痕;历史库该日无快照(最近可用为 %s),无法重算", signalDate, asOf)
+	}
+	industryMap := buildIndustryMapFromEmbedded()
+	scanned := 0
+	var hits []models.LowBuyScannerItem
+	for _, row := range rows {
+		if row.Price <= 0 || row.IsST || row.ChangePercent < 5.5 { // amount 不作硬拒:历史行常缺,量能在 evaluate 里判
+			continue
+		}
+		daily, derr := a.historyService.LoadKLineDataUntil(row.Symbol, signalDate, 270)
+		if derr != nil || len(daily) < 120 {
+			continue
+		}
+		if last := daily[len(daily)-1].Time; len(last) >= 10 && last[:10] != signalDate {
+			continue
+		}
+		scanned++
+		if item, ok := evaluateOversoldIgniteRow(row, chooseFirstNonEmpty(industryMap[row.Symbol], row.Industry, "未知"), daily, signalDate); ok {
+			hits = append(hits, item)
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].Score == hits[j].Score {
+			return hits[i].Amount > hits[j].Amount
+		}
+		return hits[i].Score > hits[j].Score
+	})
+	if len(hits) > topN {
+		hits = hits[:topN]
+	}
+	elapsed := time.Since(start).Seconds()
+	nowTS := time.Now().Format("2006-01-02 15:04:05")
+	picks := make([]models.StrategyPickSnapshot, 0, len(hits))
+	for idx, item := range hits {
+		picks = append(picks, models.StrategyPickSnapshot{
+			StrategyID: "oversold-ignite-v1", StrategyName: "超跌起爆",
+			SignalDate: signalDate, ScannedAt: nowTS,
+			Symbol: item.Symbol, Name: item.Name, Rank: idx + 1,
+			Price: item.Price, ChangePercent: item.ChangePercent, Score: item.Score,
+			Industry: item.Industry, Amount: item.Amount, TurnoverRate: item.TurnoverRate,
+			MainNetInflow: item.MainNetInflow, MainNetInflowPct: item.MainNetInflowRatio,
+			MainFlowSource: chooseFirstNonEmpty(item.MainFlowSource, "replay"),
+			Triggers:       item.Triggers, Reasons: item.Reasons, RiskFlags: item.RiskFlags,
+		})
+	}
+	if len(picks) == 0 {
+		return nil, fmt.Sprintf("超跌起爆 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算(评估%d只,耗时%.0fs):该日确实无股票符合(真·当日未符合)", signalDate, scanned, elapsed)
+	}
+	return picks, fmt.Sprintf("超跌起爆 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算命中 %d 只(评估%d只,耗时%.0fs)", signalDate, len(picks), scanned, elapsed)
+}
+
+// buildReplayIntradayBars 把历史分时(分钟价/量)转成分时K线序列(截至 cutMinute),
+// Avg=逐分钟累计成交额/累计量(VWAP,与实时分时均价线同义;量纲在比值里消掉)。
+// 已知粒度差异:历史分时每分钟只有一个价,High/Low/Close 同值(实时分钟bar有真实高低),回踩判定略粗。
+func buildReplayIntradayBars(date string, mins []services.PriceMinute, cutMinute string) []models.KLineData {
+	bars := make([]models.KLineData, 0, len(mins))
+	cumPV, cumV := 0.0, 0.0
+	prev := 0.0
+	for _, m := range mins {
+		if m.Minute > cutMinute {
+			break
+		}
+		if m.Price <= 0 {
+			continue
+		}
+		open := prev
+		if open <= 0 {
+			open = m.Price
+		}
+		cumPV += m.Price * float64(m.Volume)
+		cumV += float64(m.Volume)
+		avg := m.Price
+		if cumV > 0 {
+			avg = cumPV / cumV
+		}
+		bars = append(bars, models.KLineData{
+			Time: date + " " + m.Minute + ":00", // isLateDayMinute 按尾部 "HH:MM:SS" 取时分,格式必须带秒
+			Open: open, High: m.Price, Low: m.Price, Close: m.Price,
+			Volume: m.Volume, Avg: avg,
+		})
+		prev = m.Price
+	}
+	return bars
+}
+
+// replayLateChaseOnDate 尾盘强势3历史回放:用回补的全市场历史分时重演当日 14:50 时点的完整判定——
+// 14:50价/涨幅(分时比例×日K真实涨幅换算,免复权口径冲突)、14:50换手(全天真实换手×分时量进度,单位天然消掉)、
+// 量比(当日分钟均量/前5日分钟均量,全部取自 stock_daily 同源日量,230=14:50时已开盘分钟数)、
+// 流通市值(stock_daily 当日真值),再跑与实盘同一套 evaluateLateDay*(日K台阶/均线多头/分时站均价线/尾盘新高回踩)。
+// 如实披露的差异:①当日上证分时库里没有→走实盘既有的降级路径(仅按站上均价线判定,强弱对比缺省);
+// ②历史分时分钟内无高低价,回踩判定略粗;③ST 按最新名字近似。
+func (a *App) replayLateChaseOnDate(signalDate string, topN int) ([]models.StrategyPickSnapshot, string) {
+	if a == nil || a.historyService == nil || a.intradayService == nil {
+		return nil, ""
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+	const cutMinute = "14:50" // 与 14:50 定时扫描同时点
+	start := time.Now()
+	rows, asOf, err := a.historyService.LoadScanRowsOnDate(signalDate, false)
+	if err != nil {
+		return nil, "尾盘强势策略 历史回放读取快照失败:" + err.Error()
+	}
+	if asOf != signalDate {
+		return nil, fmt.Sprintf("尾盘强势策略 没有找到 %s 的原始扫描留痕;历史库该日无快照(最近可用为 %s,可能不是交易日),无法回放", signalDate, asOf)
+	}
+	opts := normalizeLateDayChaseRequest(models.LateDayChaseScannerRequest{Limit: topN, RankLimit: 60,
+		MinChangePct: 3, MaxChangePct: 5, MinVolumeRatio: 1, MinTurnoverRate: 5, MaxTurnoverRate: 10,
+		MinFloatCap: 50e8, MaxFloatCap: 200e8}) // 与 14:50 定时扫描完全同参
+
+	type lateCand struct {
+		row  services.ScanSnapshotRow
+		mins []services.PriceMinute
+	}
+	withMinutes := 0
+	cands := make([]lateCand, 0, 128)
+	for _, row := range rows {
+		if row.Price <= 0 || row.Amount <= 0 || row.IsST {
+			continue
+		}
+		mins := a.GetMinuteHistory(row.Symbol, signalDate)
+		if len(mins) < 100 {
+			continue // 该股当日无分时(未回补/停牌)
+		}
+		withMinutes++
+		var p1450, cumV, volDay float64
+		close15 := mins[len(mins)-1].Price
+		for _, m := range mins {
+			volDay += float64(m.Volume)
+			if m.Minute <= cutMinute && m.Price > 0 {
+				p1450 = m.Price
+				cumV += float64(m.Volume)
+			}
+		}
+		if p1450 <= 0 || close15 <= 0 || cumV <= 0 || volDay <= 0 {
+			continue
+		}
+		_, _, _, c, v, _, ds, _ := a.historyService.SeriesRecentUntil(row.Symbol, signalDate, 7)
+		li := len(c) - 1
+		if li < 5 || ds[li] != signalDate || c[li-1] <= 0 {
+			continue // 上市不足6日或当日无日K,量比/涨幅口径都立不住
+		}
+		pctDay := (c[li]/c[li-1] - 1) * 100
+		chg1450 := ((1+pctDay/100)*(p1450/close15) - 1) * 100
+		if chg1450 < opts.MinChangePct || chg1450 > opts.MaxChangePct {
+			continue
+		}
+		progress := cumV / volDay
+		to1450 := row.TurnoverRate * progress // stock_daily 全天真实换手 × 截至14:50量能进度
+		if to1450 < opts.MinTurnoverRate || to1450 > opts.MaxTurnoverRate {
+			continue
+		}
+		if row.FloatMarketCap < opts.MinFloatCap || row.FloatMarketCap > opts.MaxFloatCap {
+			continue
+		}
+		avg5 := 0.0
+		for _, vol := range v[li-5 : li] {
+			avg5 += vol
+		}
+		avg5 /= 5
+		if avg5 <= 0 {
+			continue
+		}
+		volRatio := (v[li] * progress / 230.0) / (avg5 / 240.0) // 14:50 已开盘230分钟
+		if volRatio < opts.MinVolumeRatio {
+			continue
+		}
+		row.Price = p1450
+		row.ChangePercent = chg1450
+		row.TurnoverRate = to1450
+		row.VolumeRatio = volRatio
+		row.UpdateTime = signalDate + " " + cutMinute
+		cands = append(cands, lateCand{row: row, mins: mins})
+	}
+	if withMinutes < 3000 {
+		return nil, fmt.Sprintf("尾盘强势策略 没有找到 %s 的原始扫描留痕;该日历史分时仅覆盖 %d 只(非全市场,诚实回放要求全市场分时以免漏票)——先把该日全市场分时补齐再复盘", signalDate, withMinutes)
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].row.ChangePercent == cands[j].row.ChangePercent {
+			return cands[i].row.Amount > cands[j].row.Amount
+		}
+		return cands[i].row.ChangePercent > cands[j].row.ChangePercent
+	})
+	coarseCount := len(cands)
+	if len(cands) > opts.RankLimit {
+		cands = cands[:opts.RankLimit]
+	}
+	industryMap := buildIndustryMapFromEmbedded()
+	checked, failed := 0, 0
+	type scored struct {
+		item models.StrategyPickSnapshot
+		key  [3]float64 // score / buyReady / volRatio 排序键(与实盘结果排序一致)
+	}
+	hits := make([]scored, 0, opts.Limit)
+	for rank, cand := range cands {
+		row := cand.row
+		daily, derr := a.historyService.LoadKLineDataUntil(row.Symbol, signalDate, 45)
+		if derr != nil || len(daily) < 20 {
+			failed++
+			continue
+		}
+		checked++
+		bars := buildReplayIntradayBars(signalDate, cand.mins, cutMinute)
+		qfqClose := daily[len(daily)-1].Close
+		var close15 = cand.mins[len(cand.mins)-1].Price
+		priceQfqFrame := qfqClose * (row.Price / close15) // 把14:50位置换算到与日K同一复权坐标再比均线
+		volumePassed, volumeReason, volumeRisk := evaluateLateDayVolumeStep(daily)
+		maPassed, _, _, _, maReason, maRisk := evaluateLateDayMABullish(daily, priceQfqFrame)
+		ev := evaluateLateDayIntraday(bars, 0)
+		intradayPassed := ev.AboveAvgPassed // 大盘分时不可用→与实盘同一降级:仅按站上均价线判定
+		ev.Reasons = append(ev.Reasons, "历史回放:当日上证分时库中缺失,已按实盘既有降级口径(仅站上均价线)判定")
+		if !volumePassed || !maPassed || !intradayPassed {
+			continue
+		}
+		score := scoreLateDayChase(row, ev, 0, volumePassed, maPassed)
+		// 入选价必须落在前复权坐标(与 stock_daily/复盘/图表同口径)——存分时原始价的话,
+		// 个股此后一除权,复盘"收盘收益"就会算出-45%级幻影亏损(2026-07-22 锦富技术实例);
+		// 复权口径的收益也才是除权送股后的真实收益。
+		row.Price = priceQfqFrame
+		reasons := []string{
+			fmt.Sprintf("涨幅榜第%d名(14:50口径),涨幅 %.2f%%,量比 %.2f", rank+1, row.ChangePercent, row.VolumeRatio),
+			fmt.Sprintf("换手 %.2f%%(14:50),流通市值 %.1f 亿", row.TurnoverRate, row.FloatMarketCap/1e8),
+			volumeReason, maReason,
+		}
+		reasons = append(reasons, ev.Reasons...)
+		risks := make([]string, 0, 4)
+		if volumeRisk != "" {
+			risks = append(risks, volumeRisk)
+		}
+		if maRisk != "" {
+			risks = append(risks, maRisk)
+		}
+		risks = append(risks, ev.RiskFlags...)
+		triggers := []string{"涨幅3%-5%", "量比>=1", "换手5%-10%", "流通市值50-200亿", "成交量台阶式上升", "均线多头排列", "分时站上均价线"}
+		if ev.BuySignalReady {
+			triggers = append(triggers, "尾盘新高回踩均价线不破")
+		}
+		buyReady := 0.0
+		if ev.BuySignalReady {
+			buyReady = 1
+		}
+		hits = append(hits, scored{key: [3]float64{score, buyReady, row.VolumeRatio}, item: models.StrategyPickSnapshot{
+			StrategyID: "latechase-v3", StrategyName: "尾盘强势策略", SignalDate: signalDate,
+			ScannedAt: time.Now().Format("2006-01-02 15:04:05"),
+			Symbol:    row.Symbol, Name: row.Name,
+			Price: row.Price, ChangePercent: row.ChangePercent, Score: score,
+			Industry: chooseFirstNonEmpty(industryMap[row.Symbol], row.Industry, "未知"),
+			Amount:   row.Amount, TurnoverRate: row.TurnoverRate,
+			MainFlowSource: "replay-minute",
+			Triggers:       triggers, Reasons: reasons, RiskFlags: risks,
+		}})
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].key[0] == hits[j].key[0] {
+			if hits[i].key[1] == hits[j].key[1] {
+				return hits[i].key[2] > hits[j].key[2]
+			}
+			return hits[i].key[1] > hits[j].key[1]
+		}
+		return hits[i].key[0] > hits[j].key[0]
+	})
+	if len(hits) > opts.Limit {
+		hits = hits[:opts.Limit]
+	}
+	picks := make([]models.StrategyPickSnapshot, 0, len(hits))
+	for idx, h := range hits {
+		h.item.Rank = idx + 1
+		picks = append(picks, h.item)
+	}
+	elapsed := time.Since(start).Seconds()
+	if len(picks) == 0 {
+		return nil, fmt.Sprintf("尾盘强势策略 没有找到 %s 的原始扫描留痕;已用全市场历史分时按线上同口径回放14:50时点(分时覆盖%d只,粗筛%d只,技术验证%d只,耗时%.0fs):该日确实无股票符合(真·当日未符合;上证分时缺失按降级口径判定)", signalDate, withMinutes, coarseCount, checked, elapsed)
+	}
+	return picks, fmt.Sprintf("尾盘强势策略 没有找到 %s 的原始扫描留痕;已用全市场历史分时按线上同口径回放14:50时点,命中 %d 只(分时覆盖%d只,粗筛%d只,技术验证%d只,耗时%.0fs;上证分时缺失按实盘降级口径判定,分钟级无高低价回踩判定略粗)", signalDate, len(picks), withMinutes, coarseCount, checked, elapsed)
+}
+
+// replayFormulaStrategyOnDate 公式系策略(尾盘6/捉妖9/捉妖10)历史重算包装:直接复用 runFormulaScanner
+// 的历史时间选股通道——历史快照行(当日真实价/涨幅/换手/市值/资金流)+LoadKLineDataUntil 截断日K,
+// 预筛/评估与实盘同一段代码。返回 StrategyReplayFunc 供复盘缺留痕时调用。
+func (a *App) replayFormulaStrategyOnDate(strategyID, strategyName string, run func(models.LowBuyScannerRequest) models.LowBuyScannerResult) services.StrategyReplayFunc {
+	return func(signalDate string, topN int) ([]models.StrategyPickSnapshot, string) {
+		if a == nil {
+			return nil, ""
+		}
+		if topN <= 0 {
+			topN = 10
+		}
+		start := time.Now()
+		res := run(models.LowBuyScannerRequest{Limit: topN, HistoryPickDate: signalDate})
+		asOfDay := res.AsOf
+		if len(asOfDay) >= 10 {
+			asOfDay = asOfDay[:10]
+		}
+		if asOfDay != signalDate {
+			msg := fmt.Sprintf("%s 没有找到 %s 的原始扫描留痕;历史库该日无快照(最近可用为 %s,可能不是交易日),无法重算", strategyName, signalDate, asOfDay)
+			if w := strings.TrimSpace(res.Warning); w != "" {
+				msg += ";扫描器提示:" + w // 别吞底层报错(上次 NULL 扫描错误被这里的文案掩盖,排查绕了弯)
+			}
+			return nil, msg
+		}
+		elapsed := time.Since(start).Seconds()
+		if len(res.Items) == 0 {
+			return nil, fmt.Sprintf("%s 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算(历史快照全字段,耗时%.0fs):该日确实无股票符合(真·当日未符合)", strategyName, signalDate, elapsed)
+		}
+		nowTS := time.Now().Format("2006-01-02 15:04:05")
+		picks := make([]models.StrategyPickSnapshot, 0, len(res.Items))
+		for idx, item := range res.Items {
+			picks = append(picks, models.StrategyPickSnapshot{
+				StrategyID:       strategyID,
+				StrategyName:     strategyName,
+				SignalDate:       signalDate,
+				ScannedAt:        nowTS,
+				Symbol:           item.Symbol,
+				Name:             item.Name,
+				Rank:             idx + 1,
+				Price:            item.Price,
+				ChangePercent:    item.ChangePercent,
+				Score:            item.Score,
+				Industry:         item.Industry,
+				Amount:           item.Amount,
+				TurnoverRate:     item.TurnoverRate,
+				MainNetInflow:    item.MainNetInflow,
+				MainNetInflowPct: item.MainNetInflowRatio,
+				MainFlowSource:   chooseFirstNonEmpty(item.MainFlowSource, "replay"),
+				Triggers:         item.Triggers,
+				Reasons:          item.Reasons,
+				RiskFlags:        item.RiskFlags,
+			})
+		}
+		return picks, fmt.Sprintf("%s 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算命中 %d 只(历史快照含当日真实换手/市值/资金流,耗时%.0fs)", strategyName, signalDate, len(picks), elapsed)
+	}
+}
+
+// replayLimitPullbackOnDate 涨停回调4历史重算:并行扫描系没有历史通道,这里用历史快照行+截断日K
+// 手工镜像其预筛(价/额/ST/主板口径/涨幅(-5,5.5]/换手≤14)并调用同一个 evaluateLimitPullbackRow。
+func (a *App) replayLimitPullbackOnDate(signalDate string, topN int) ([]models.StrategyPickSnapshot, string) {
+	if a == nil || a.historyService == nil {
+		return nil, ""
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+	start := time.Now()
+	rows, asOf, err := a.historyService.LoadScanRowsOnDate(signalDate, false)
+	if err != nil {
+		return nil, "涨停回调低吸 历史重算读取快照失败:" + err.Error()
+	}
+	if asOf != signalDate {
+		return nil, fmt.Sprintf("涨停回调低吸 没有找到 %s 的原始扫描留痕;历史库该日无快照(最近可用为 %s,可能不是交易日),无法重算", signalDate, asOf)
+	}
+	industryMap := buildIndustryMapFromEmbedded()
+	scanned := 0
+	var hits []models.LowBuyScannerItem
+	for _, row := range rows {
+		if row.Price <= 0 || row.Amount <= 0 || row.IsST || isLimitPullbackBlockedBoard(row.Symbol) {
+			continue
+		}
+		if row.ChangePercent > 5.5 || row.ChangePercent < -5.0 {
+			continue
+		}
+		if row.TurnoverRate > 14 { // 历史换手为当日真值;个别日全市场换手缺失时为0,视作放行(与实盘"取不到不卡"一致)
+			continue
+		}
+		daily, derr := a.historyService.LoadKLineDataUntil(row.Symbol, signalDate, 72)
+		if derr != nil || len(daily) < 65 {
+			continue
+		}
+		if last := daily[len(daily)-1].Time; len(last) >= 10 && last[:10] != signalDate {
+			continue // 当日停牌
+		}
+		scanned++
+		if item, ok := evaluateLimitPullbackRow(row, chooseFirstNonEmpty(industryMap[row.Symbol], row.Industry, "未知"), daily, signalDate); ok {
+			hits = append(hits, item)
+		}
+	}
+	if scanned == 0 {
+		return nil, fmt.Sprintf("涨停回调低吸 没有找到 %s 的原始扫描留痕;该日无可评估标的(快照/日K不足),无法重算", signalDate)
+	}
+	sort.Slice(hits, func(i, j int) bool { // 与线上扫描同一排序
+		if hits[i].Score == hits[j].Score {
+			if hits[i].TriggerCount == hits[j].TriggerCount {
+				return hits[i].Amount > hits[j].Amount
+			}
+			return hits[i].TriggerCount > hits[j].TriggerCount
+		}
+		return hits[i].Score > hits[j].Score
+	})
+	if len(hits) > topN {
+		hits = hits[:topN]
+	}
+	elapsed := time.Since(start).Seconds()
+	nowTS := time.Now().Format("2006-01-02 15:04:05")
+	picks := make([]models.StrategyPickSnapshot, 0, len(hits))
+	for idx, item := range hits {
+		picks = append(picks, models.StrategyPickSnapshot{
+			StrategyID:       "limit-pullback-v1",
+			StrategyName:     "涨停回调低吸",
+			SignalDate:       signalDate,
+			ScannedAt:        nowTS,
+			Symbol:           item.Symbol,
+			Name:             item.Name,
+			Rank:             idx + 1,
+			Price:            item.Price,
+			ChangePercent:    item.ChangePercent,
+			Score:            item.Score,
+			Industry:         item.Industry,
+			Amount:           item.Amount,
+			TurnoverRate:     item.TurnoverRate,
+			MainNetInflow:    item.MainNetInflow,
+			MainNetInflowPct: item.MainNetInflowRatio,
+			MainFlowSource:   chooseFirstNonEmpty(item.MainFlowSource, "replay"),
+			Triggers:         item.Triggers,
+			Reasons:          item.Reasons,
+			RiskFlags:        item.RiskFlags,
+		})
+	}
+	if len(picks) == 0 {
+		return nil, fmt.Sprintf("涨停回调低吸 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算(评估%d只,耗时%.0fs):该日确实无股票符合(真·当日未符合)", signalDate, scanned, elapsed)
+	}
+	return picks, fmt.Sprintf("涨停回调低吸 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算命中 %d 只(评估%d只,耗时%.0fs;历史快照含当日真实换手/资金流)", signalDate, len(picks), scanned, elapsed)
+}
+
+// replayTripleVolumeOnDate 三倍量5历史重算:给定过去某交易日,用本地前复权日K跑与线上完全相同的
+// 判定(buildTripleVolumeMetrics/evaluateTripleVolumeRow),重建当日入选名单。供复盘在留痕缺失时调用。
+// 与实盘扫描的已知差异(如实披露,不装同源):历史重算没有当日实时市值/资金流快照——市值加减分按缺省0处理、
+// 资金流仅展示字段缺省;ST 判定用历史库里的最新名称(个股极少改名,近月重算可靠)。核心三条件(未涨停阳线/
+// 3倍量/一阳穿四线)全部来自日K,与实盘逐字同源。
+func (a *App) replayTripleVolumeOnDate(signalDate string, topN int) ([]models.StrategyPickSnapshot, string) {
+	if a == nil || a.historyService == nil {
+		return nil, ""
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+	start := time.Now()
+	codes := a.historyService.AllUniverseCodes()
+	industryMap := buildIndustryMapFromEmbedded()
+	scanned := 0
+	var hits []models.LowBuyScannerItem
+	for _, code := range codes {
+		if isTripleVolumeBlockedBoard(code) {
+			continue
+		}
+		o, h, l, c, v, amt, ds, name := a.historyService.SeriesRecentUntil(code, signalDate, 45)
+		if len(c) < 31 {
+			continue
+		}
+		li := len(c) - 1
+		if ds[li] != signalDate { // 当日停牌/未上市
+			continue
+		}
+		if services.IsSTOrDelistedName(name) {
+			continue
+		}
+		if c[li] <= 0 || amt[li] <= 0 {
+			continue
+		}
+		scanned++
+		klines := make([]models.KLineData, len(c))
+		for i := range c {
+			klines[i] = models.KLineData{Time: ds[i], Open: o[i], High: h[i], Low: l[i], Close: c[i], Volume: int64(v[i]), Amount: amt[i]}
+		}
+		pct := 0.0
+		if prev := c[li-1]; prev > 0 {
+			pct = (c[li]/prev - 1) * 100
+		}
+		row := services.ScanSnapshotRow{Symbol: code, Name: name, Price: c[li], ChangePercent: pct, Amount: amt[li]}
+		if item, ok := evaluateTripleVolumeRow(row, industryMap[code], klines, signalDate); ok {
+			hits = append(hits, item)
+		}
+	}
+	if scanned == 0 {
+		return nil, fmt.Sprintf("三倍量策略 没有找到 %s 的原始扫描留痕;历史库该日无任何日K(可能不是交易日),无法重算", signalDate)
+	}
+	sort.Slice(hits, func(i, j int) bool { // 与线上扫描同一排序
+		if hits[i].Score == hits[j].Score {
+			if hits[i].TriggerCount == hits[j].TriggerCount {
+				return hits[i].Amount > hits[j].Amount
+			}
+			return hits[i].TriggerCount > hits[j].TriggerCount
+		}
+		return hits[i].Score > hits[j].Score
+	})
+	if len(hits) > topN {
+		hits = hits[:topN]
+	}
+	picks := make([]models.StrategyPickSnapshot, 0, len(hits))
+	nowTS := time.Now().Format("2006-01-02 15:04:05")
+	for idx, item := range hits {
+		picks = append(picks, models.StrategyPickSnapshot{
+			StrategyID:     "triple-volume-v5",
+			StrategyName:   "三倍量策略",
+			SignalDate:     signalDate,
+			ScannedAt:      nowTS,
+			Symbol:         item.Symbol,
+			Name:           item.Name,
+			Rank:           idx + 1,
+			Price:          item.Price,
+			ChangePercent:  item.ChangePercent,
+			Score:          item.Score,
+			Industry:       item.Industry,
+			Amount:         item.Amount,
+			TurnoverRate:   item.TurnoverRate,
+			Triggers:       item.Triggers,
+			Reasons:        item.Reasons,
+			RiskFlags:      item.RiskFlags,
+			MainFlowSource: "replay",
+		})
+	}
+	elapsed := time.Since(start).Seconds()
+	if len(picks) == 0 {
+		return nil, fmt.Sprintf("三倍量策略 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算(扫描%d只,耗时%.0fs):该日确实无股票符合(真·当日未符合)", signalDate, scanned, elapsed)
+	}
+	return picks, fmt.Sprintf("三倍量策略 没有找到 %s 的原始扫描留痕;已用本地历史库按线上同口径重算命中 %d 只(扫描%d只,耗时%.0fs;历史重算无当日实时市值/资金流,对应加分项按缺省计)", signalDate, len(picks), scanned, elapsed)
+}
+
 func evaluateTripleVolumeRow(row services.ScanSnapshotRow, industry string, daily []models.KLineData, asOf string) (models.LowBuyScannerItem, bool) {
 	m, ok := buildTripleVolumeMetrics(daily)
 	if !ok {
 		return models.LowBuyScannerItem{}, false
 	}
 
-	triggers := []string{"阳线未涨停", "成交量>=前一日3倍", "一阳穿MA5/10/20/30"}
+	volTag := "成交量≥前一日3倍"
+	if m.VolumeRatio < 3 {
+		volTag = fmt.Sprintf("量比%.2f倍·放宽档(≥2.7)", m.VolumeRatio)
+	}
+	triggers := []string{"阳线未涨停", volTag, "一阳穿MA5/10/20/30"}
 	reasons := []string{
 		fmt.Sprintf("三倍量：今日成交量/昨日=%.2f倍，成交额/昨日=%.2f倍", m.VolumeRatio, m.AmountRatio),
 		fmt.Sprintf("一阳穿线：收盘%.2f 同时上穿 MA5 %.2f / MA10 %.2f / MA20 %.2f / MA30 %.2f", m.Close, m.MA5, m.MA10, m.MA20, m.MA30),
@@ -5679,8 +7541,8 @@ func evaluateTripleVolumeRow(row services.ScanSnapshotRow, industry string, dail
 	risks := make([]string, 0, 4)
 
 	score := 52.0
-	score += 14 // 完整穿越四条均线是该策略的核心结构分。
-	score += clamp(10+(m.VolumeRatio-3)*5, 10, 22)
+	score += 14                                   // 完整穿越四条均线是该策略的核心结构分。
+	score += clamp(10+(m.VolumeRatio-3)*5, 5, 22) // 放宽档(2.7-3.0)自然低于正档,排序如实
 	score += clamp(m.BodyPct*2.2, 0, 9)
 	switch {
 	case m.AvgMADistPct <= 3:
@@ -5720,6 +7582,9 @@ func evaluateTripleVolumeRow(row services.ScanSnapshotRow, industry string, dail
 	if m.VolumeRatio >= 8 {
 		score -= 4
 		risks = append(risks, "量能过度放大，需防次日放量滞涨")
+	}
+	if m.VolumeRatio < 3 {
+		risks = append(risks, fmt.Sprintf("放宽档入选:量比%.2f倍未满3倍,爆量强度打折", m.VolumeRatio))
 	}
 	score = math.Round(clamp(score, 0, 100)*10) / 10
 
@@ -5794,7 +7659,7 @@ func buildTripleVolumeMetrics(daily []models.KLineData) (tripleVolumeMetrics, bo
 
 	positiveCandle := cur.Close > cur.Open && cur.Close < prev.Close*1.095
 	volumeRatio := float64(cur.Volume) / float64(prev.Volume)
-	tripleVolume := volumeRatio >= 3
+	tripleVolume := volumeRatio >= 2.7 // 2026-07-23 用户放宽:2.7-3.0 为放宽档(入选并标记实际倍数);3.0+ 为正档
 	crossAll := cur.Close > ma5 && prev.Close <= prevMA5 &&
 		cur.Close > ma10 && prev.Close <= prevMA10 &&
 		cur.Close > ma20 && prev.Close <= prevMA20 &&
@@ -6051,6 +7916,22 @@ func evaluateHotMoneyV7Row(row services.ScanSnapshotRow, industry string, daily 
 		(lzyUY && cur.Close > cur.Open) ||
 		lzyL8 ||
 		lzy1W
+	// 贴高放宽档(2026-07-24 用户定,艾艾精工实例):原贴高容差0.2%是收盘定型K口径,
+	// 14:50盘中扫描时冲板途中回踩常距日高1-2%,导致启动结构在尾盘最后十分钟才"成立"而漏扫。
+	// 距日高≤2%时按放宽档重验四结构;正档贴高+6分自然不给,标签/风险如实分层。
+	relaxedCH := false
+	if !q3 && cur.High > 0 && (cur.High-cur.Close)/cur.High <= 0.02 {
+		lzy11r := pct1 > 6.5 && pct1 < 11.8 && pct2 < 6.5
+		lzyUYr := lzy11r && volumes[last] < volumes[last-1]
+		lzyL8r := pct1 > 7.5 && pct2 < 9.5 && pct3 > 7.5 && pct4 < 7.5
+		lzy1Wr := pct1 > 7.5 && pct2 < 7.5 && pct3 < 7.5 && pct4 > 7.5 && formulaPctChange(bars, last-4) < 7.5
+		q3r := (lzy11r && cur.Close > cur.Open && okMA && volumes[last] > prevMA5Vol*2) ||
+			(lzyUYr && cur.Close > cur.Open) || lzyL8r || lzy1Wr
+		if q3r {
+			q3, relaxedCH = true, true
+			lzy11, lzyUY, lzyL8, lzy1W = lzy11r, lzyUYr, lzyL8r, lzy1Wr
+		}
+	}
 	sumPrev5 := 0.0
 	for i := last - 5; i < last; i++ {
 		if i >= 0 {
@@ -6090,6 +7971,11 @@ func evaluateHotMoneyV7Row(row services.ScanSnapshotRow, industry string, daily 
 		score += 5
 	}
 	risks := []string{}
+	if relaxedCH {
+		gapPct := (cur.High - cur.Close) / cur.High * 100
+		triggers = append(triggers, fmt.Sprintf("贴高放宽档(距日高%.1f%%≤2%%)", gapPct))
+		risks = append(risks, "现价未贴住日高,冲板未确认,回落风险大;正档要求距日高≤0.2%")
+	}
 	if pct1 > 10.5 {
 		score -= 4
 		risks = append(risks, "涨幅接近涨停，隔日分歧会更大")
@@ -7545,7 +9431,7 @@ func (a *App) AddPaperPosition(symbol, name, source string, costPrice float64, s
 	if a.paperService == nil {
 		return "模拟持仓服务未初始化"
 	}
-	if _, err := a.paperService.Add(symbol, name, source, costPrice, shares); err != nil {
+	if _, err := a.paperService.Add(symbol, name, source, costPrice, shares, "manual"); err != nil {
 		return err.Error()
 	}
 	return "success"
@@ -7697,6 +9583,9 @@ func (a *App) GetPaperRiskSummary() models.PaperRiskSummary {
 
 // riskReasonCN 风控离场原因中文。
 func riskReasonCN(r string) string {
+	if strings.HasPrefix(r, "half_") { // 低吸V1.2:+15%已减半,余仓按此原因离场(两腿加权)
+		return "止盈减半后·" + riskReasonCN(strings.TrimPrefix(r, "half_"))
+	}
 	switch r {
 	case "stop_loss":
 		return "止损"
@@ -7708,8 +9597,75 @@ func riskReasonCN(r string) string {
 		return "止盈封顶"
 	case "time_stop":
 		return "时间止损"
+	case "ma5":
+		return "破5日线"
+	case "ma10":
+		return "破10日线"
+	case "signal_low":
+		return "破信号日低点"
+	case "prev_low":
+		return "破昨日阳线低点"
+	case "ma20":
+		return "破20日线"
+	case "turnover":
+		return "换手过热"
+	case "struct_stop":
+		return "破确认前低"
+	case "window_end":
+		return "到期离场"
 	}
 	return r
+}
+
+// isDipDisciplineSource 低吸家族(执行低吸规则V1.2专属纪律)
+func isDipDisciplineSource(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "lowbuy-v1", "lowbuy", "taillazy-v2", "taillazy", "dip-entry-v8", "dip-entry":
+		return true
+	}
+	return false
+}
+
+// ensureMA10 源日K缺 MA5/MA10 时本地补算(破5日线/破10日线判定依赖)
+func ensureMA10(klines []models.KLineData) {
+	for i := range klines {
+		if klines[i].MA5 <= 0 && i >= 4 {
+			sum := 0.0
+			for j := i - 4; j <= i; j++ {
+				sum += klines[j].Close
+			}
+			klines[i].MA5 = sum / 5
+		}
+		if klines[i].MA10 <= 0 && i >= 9 {
+			sum := 0.0
+			for j := i - 9; j <= i; j++ {
+				sum += klines[j].Close
+			}
+			klines[i].MA10 = sum / 10
+		}
+	}
+}
+
+// inTradingSession A股连续竞价时段(服务器为北京时间):工作日 9:25-15:05,含少量缓冲。
+// 盘中实时止损判定只在此窗口内执行;节假日会拉不到盘中新价(=昨收),即便误入窗口也只会按昨收判硬止损线,风险可控。
+func inTradingSession() bool {
+	now := time.Now()
+	if wd := now.Weekday(); wd == time.Saturday || wd == time.Sunday {
+		return false
+	}
+	hm := now.Hour()*60 + now.Minute()
+	return hm >= 9*60+25 && hm <= 15*60+5
+}
+
+// inTailWindow 尾盘判定窗口(14:45-15:05):收盘口径条款(破5日线/破信号日低点/时间止损等)
+// 用"今日实时虚拟K"提前到尾盘判定,按实时价当天走人,不等次日确认K补记。
+func inTailWindow() bool {
+	now := time.Now()
+	if wd := now.Weekday(); wd == time.Saturday || wd == time.Sunday {
+		return false
+	}
+	hm := now.Hour()*60 + now.Minute()
+	return hm >= 14*60+45 && hm <= 15*60+5
 }
 
 // ApplyPaperExitRules 通用风控引擎：对所有未平仓模拟持仓套统一风控线(短线紧/价值宽，稳健参数)自动平仓+推送预警。
@@ -7722,7 +9678,13 @@ func (a *App) ApplyPaperExitRules() int {
 	if len(opens) == 0 {
 		return 0
 	}
-	today := time.Now().Format("2006-01-02")
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	inSession := inTradingSession()
+	tail := inTailWindow()
+	// 收盘后(≥15:05 工作日)当日K已定型,并入确认K当晚判定;盘中则剔除未定型的今日K
+	wd := now.Weekday()
+	todayFinal := !inSession && wd != time.Saturday && wd != time.Sunday && now.Hour()*60+now.Minute() >= 15*60+5
 	closed := 0
 
 	codes := make([]string, 0, len(opens))
@@ -7731,10 +9693,10 @@ func (a *App) ApplyPaperExitRules() int {
 			codes = append(codes, p.Symbol)
 		}
 	}
-	priceMap := map[string]float64{}
+	rtMap := map[string]models.Stock{}
 	if stocks, err := a.marketService.GetStockRealTimeData(codes...); err == nil {
 		for _, st := range stocks {
-			priceMap[strings.ToLower(strings.TrimSpace(st.Symbol))] = st.Price
+			rtMap[strings.ToLower(strings.TrimSpace(st.Symbol))] = st
 		}
 	}
 
@@ -7757,16 +9719,26 @@ func (a *App) ApplyPaperExitRules() int {
 		if p.CostPrice <= 0 || p.OpenDate == "" {
 			continue
 		}
+		if p.AutoExitOff {
+			continue // 用户撤回过自动平仓=接管:引擎不得再碰,否则同一触发条件下一轮又平,撤回成拉锯
+		}
+		if p.OpenDate == today {
+			// A股 T+1:当日买入当日不可卖。引擎对当日新仓一律不动(止损/止盈/收盘条款都不判),
+			// 次一交易日起才接管——否则 14:50 自动买完,14:55 tick 拿收盘条款把它"卖"了,成 T+0 幻觉(2026-07-21 依依股份实例)。
+			continue
+		}
 		prof := services.RiskProfileForSource(p.Source)
+		dip := isDipDisciplineSource(p.Source)
 		klines, err := a.marketService.GetKLineData(p.Symbol, "1d", 120)
 		if err != nil || len(klines) == 0 {
 			continue
 		}
 		confirmed := klines
-		if last := klines[len(klines)-1]; last.Time >= today {
+		if last := klines[len(klines)-1]; last.Time >= today && !todayFinal {
 			confirmed = klines[:len(klines)-1]
 		}
-		// 入场以来最高价(已确认K)
+		st, hasRT := rtMap[strings.ToLower(strings.TrimSpace(p.Symbol))]
+		// 入场以来最高价(已确认K,盘中并入今日实时最高——移动止损当天冲高也能武装)
 		peak := p.CostPrice
 		started := false
 		for _, k := range confirmed {
@@ -7777,18 +9749,40 @@ func (a *App) ApplyPaperExitRules() int {
 				peak = k.High
 			}
 		}
-		// 1) 实时价跌破当前止损线(硬止损/保本/移动止损)→盘中即走
-		if rt := priceMap[strings.ToLower(strings.TrimSpace(p.Symbol))]; rt > 0 {
+		if inSession && hasRT && st.High > peak {
+			peak = st.High
+		}
+		// 1) 盘中实时判定(仅交易时段,非交易时间"实时价"=昨收会造成没开盘就平仓的假动作):
+		//    止损线(硬止损/保本/移动)触线即走;止盈线触及也实时价即走。
+		//    低吸系止盈是"+15%减半"两腿纪律,由 V1.2 引擎处理,盘中只挂止损线。
+		if inSession && hasRT && st.Price > 0 {
 			line, kind := prof.RiskStopLine(p.CostPrice, peak)
-			if rt <= line {
+			if st.Price <= line {
 				reason := map[string]string{"硬止损": "stop_loss", "保本": "breakeven", "移动止损": "trail"}[kind]
-				doClose(p, rt, today, reason, 0)
+				doClose(p, st.Price, today, reason, 0)
+				continue
+			}
+			if !dip && prof.TPPct > 0 && st.Price >= p.CostPrice*(1+prof.TPPct/100) {
+				doClose(p, st.Price, today, "take_profit", 0)
 				continue
 			}
 		}
-		// 2) 已确认K上判定(止盈/时间止损/收盘破线)
-		if len(confirmed) > 0 {
-			if r := services.EvaluateRiskExit(prof, p.CostPrice, p.OpenDate, confirmed); r.Exited {
+		// 2) 收盘口径条款(破5日线/破信号日低点/破前低/时间止损/低吸V1.2)。
+		//    尾盘窗口(14:45后)追加"今日实时虚拟K"提前判定,当天按实时价走人;
+		//    收盘后今日K定型直接并入;其余时间只判到最近确认K(兜底补漏)。
+		//    低吸家族走 V1.2 专属纪律老引擎,与"规则说明"完全一致;其余策略走各自专属风控线。
+		judged := confirmed
+		if tail && hasRT && st.Price > 0 && st.Open > 0 && (len(confirmed) == 0 || confirmed[len(confirmed)-1].Time < today) {
+			vk := models.KLineData{Time: today, Open: st.Open, High: st.High, Low: st.Low, Close: st.Price}
+			judged = append(append([]models.KLineData{}, confirmed...), vk)
+		}
+		if len(judged) > 0 {
+			ensureMA10(judged)
+			if dip {
+				if r := services.SimulatePaperExit(p.CostPrice, p.OpenDate, judged); r.Exited {
+					doClose(p, r.ExitPrice, r.ExitDate, r.Reason, r.HoldDays)
+				}
+			} else if r := services.EvaluateRiskExit(prof, p.CostPrice, p.OpenDate, judged); r.Exited {
 				doClose(p, r.ExitPrice, r.ExitDate, r.Reason, r.HoldDays)
 			}
 		}
@@ -7819,11 +9813,28 @@ func (a *App) ClosePaperPosition(id int64, closePrice float64) string {
 }
 
 // ReopenPaperPosition 撤回平仓，恢复为未平仓，不再计入已平仓胜率样本。
+// 撤回的是自动平仓时同时「接管」该持仓(auto_exit_off=1),风控引擎此后跳过它——用户成文规则(2026-07-21)。
 func (a *App) ReopenPaperPosition(id int64) string {
 	if a.paperService == nil {
 		return "模拟持仓服务未初始化"
 	}
-	if err := a.paperService.Reopen(id); err != nil {
+	tookOver, err := a.paperService.Reopen(id)
+	if err != nil {
+		return err.Error()
+	}
+	if tookOver {
+		rt.LogInfof("撤回自动平仓并接管: 持仓#%d 自动止盈止损已停用(可在列表点「已接管」恢复)", id)
+		return "taken-over"
+	}
+	return "success"
+}
+
+// SetPaperAutoExit 恢复/停用某持仓的自动风控(off=true 引擎跳过该持仓)。
+func (a *App) SetPaperAutoExit(id int64, off bool) string {
+	if a.paperService == nil {
+		return "模拟持仓服务未初始化"
+	}
+	if err := a.paperService.SetAutoExitOff(id, off); err != nil {
 		return err.Error()
 	}
 	return "success"
@@ -7838,6 +9849,100 @@ func (a *App) DeletePaperPosition(id int64) string {
 		return err.Error()
 	}
 	return "success"
+}
+
+// ClearPaperPositionsByIDs 按 ID 批量清除模拟持仓(供"按来源清空":前端传当前筛选可见的持仓ID)。
+// 删除后,对已没有任何剩余持仓的票,把它从「模拟持仓」自选分组里摘掉。
+func (a *App) ClearPaperPositionsByIDs(ids []int64) string {
+	if a.paperService == nil {
+		return "模拟持仓服务未初始化"
+	}
+	symbols, err := a.paperService.DeleteByIDs(ids)
+	if err != nil {
+		return err.Error()
+	}
+	if a.configService != nil && len(symbols) > 0 {
+		remaining := map[string]bool{}
+		for _, p := range a.paperService.List() {
+			remaining[strings.ToLower(p.Symbol)] = true
+		}
+		groups := a.configService.GetStockGroups()
+		for _, sym := range symbols {
+			lc := strings.ToLower(sym)
+			if remaining[lc] {
+				continue // 该票在别的来源还有持仓,分组保留
+			}
+			cur, ok := groups[lc]
+			if !ok {
+				continue
+			}
+			kept := make([]string, 0, len(cur))
+			hit := false
+			for _, g := range cur {
+				if g == "模拟持仓" {
+					hit = true
+					continue
+				}
+				kept = append(kept, g)
+			}
+			if hit {
+				if err := a.configService.SetStockGroups(lc, kept); err != nil {
+					log.Warn("清模拟持仓分组失败 %s: %v", lc, err)
+				}
+			}
+		}
+	}
+	log.Info("按来源清空模拟持仓: %d 笔", len(ids))
+	return fmt.Sprintf("success:%d", len(ids))
+}
+
+// GetPaperAutoPaused 自动入盘总开关状态(true=已暂停,各策略盘后自动扫描不建仓)。
+func (a *App) GetPaperAutoPaused() bool {
+	return a.paperService != nil && a.paperService.AutoPaused()
+}
+
+// SetPaperAutoPaused 设置自动入盘总开关(文件标志,重启保持;手动添加不受影响)。
+func (a *App) SetPaperAutoPaused(paused bool) string {
+	if a.paperService == nil {
+		return "模拟持仓服务未初始化"
+	}
+	if err := a.paperService.SetAutoPaused(paused); err != nil {
+		return err.Error()
+	}
+	return "success"
+}
+
+// ClearAllPaperPositions 一键清空:全部模拟持仓(含已平仓历史)+权益曲线,并把自选里「模拟持仓」分组成员清空。
+// 策略账户"实盘跟踪"按 paper_positions 的 source 分组盯市,清空后自然归零;"理论回测"为即时计算,不存状态。
+func (a *App) ClearAllPaperPositions() string {
+	if a.paperService == nil {
+		return "模拟持仓服务未初始化"
+	}
+	n, err := a.paperService.ClearAll()
+	if err != nil {
+		return err.Error()
+	}
+	// 清空「模拟持仓」自选分组成员(保留分组本身),避免列表残留没有持仓的票
+	if a.configService != nil {
+		for symbol, groups := range a.configService.GetStockGroups() {
+			kept := make([]string, 0, len(groups))
+			hit := false
+			for _, g := range groups {
+				if g == "模拟持仓" {
+					hit = true
+					continue
+				}
+				kept = append(kept, g)
+			}
+			if hit {
+				if err := a.configService.SetStockGroups(symbol, kept); err != nil {
+					log.Warn("清模拟持仓分组失败 %s: %v", symbol, err)
+				}
+			}
+		}
+	}
+	log.Info("模拟持仓已清空: %d 笔持仓/历史记录", n)
+	return fmt.Sprintf("success:%d", n)
 }
 
 // GetPaperStats 按筛选系统统计胜率
@@ -8409,7 +10514,7 @@ func (a *App) GenerateBoardReport(req GenerateBoardReportRequest) GenerateBoardR
 		Position:     position,
 		AgentTimeout: boardReportGenerateTimeout,
 		// 空回调强制流式：报告输出巨大，非流式会撞 AI 网关约5分钟的响应硬超时(实测每次都在5-6.5分钟被502掐死)
-		Progress:     func(meeting.ProgressEvent) {},
+		Progress: func(meeting.ProgressEvent) {},
 	}
 
 	responses, err := a.meetingService.SendMessage(ctx, aiConfig, chatReq)
@@ -9405,9 +11510,33 @@ func (a *App) WindowMinimize() {
 	rt.WindowMinimise()
 }
 
-// WindowMaximize 最大化/还原窗口
-func (a *App) WindowMaximize() {
+// WindowMaximize 最大化/还原窗口。返回切换后的状态(true=已放大),前端据此换图标,
+// 不再回头查 WindowIsMaximised —— macOS 走全屏时那个查询恒为 false,图标会一直不对。
+//
+// ⚠️平台差异(2026-07-27 用户反馈"点了最大化不是正常软件的效果"):
+//
+//	Windows/Linux 的最大化 = 铺满工作区(任务栏还在),Wails 的 WindowToggleMaximise 正是此意;
+//	macOS 用户心里的"最大化"是绿灯那个**原生全屏**(独立 Space,菜单栏与 Dock 自动隐藏),
+//	而 WindowToggleMaximise 在 mac 上只铺满工作区、菜单栏和 Dock 仍占着,所以看着"不像最大化"。
+//	故按平台分流:darwin 走全屏切换,其余走最大化切换。
+func (a *App) WindowMaximize() bool {
+	// macOS:窗口已改成带 Titled 的透明标题栏(main.go),原生全屏可用 → 走绿灯行为。
+	// 其余平台:Windows/Linux 的"最大化"本就是铺满工作区(任务栏保留),维持 Wails 默认。
+	// ⚠️前提是 main.go 里**不能**设 Frameless:true —— 那会去掉 Titled,让 toggleFullScreen: 静默失效。
+	if stdruntime.GOOS == "darwin" {
+		if rt.WindowIsFullscreen() {
+			rt.WindowUnfullscreen()
+			return false
+		}
+		rt.WindowFullscreen()
+		return true
+	}
 	rt.WindowToggleMaximise()
+	return true
+}
+
+func (a *App) WindowIsFullscreen() bool {
+	return rt.WindowIsFullscreen()
 }
 
 // WindowClose 关闭窗口

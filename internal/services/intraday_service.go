@@ -39,6 +39,35 @@ type IntradayService struct {
 	lastFocus     time.Time
 	finalDone     map[string]bool // trade_date -> 竞价定型已存
 	focusPool     func() []string // 重点池提供者(自选+持仓),由 App 注入
+	rangeMu       sync.Mutex      // 分时覆盖区间缓存(体感练习用,查一次要秒级,10分钟内复用)
+	rangeLo       string
+	rangeHi       string
+	rangeAt       time.Time
+}
+
+// MinuteTickDateRange 自采集分时覆盖的首末交易日。体感练习据此过滤"可练日期"——
+// 次日没有分时磁带的日子摆在下拉里,点进去只会撞一堵墙。
+// ⚠️必须拆成两句单聚合:SQLite 只对**单个** MIN 或 MAX 用索引直取,写成
+// `SELECT MIN(x),MAX(x)` 会退化成扫全表(实测 EXPLAIN 出 SCAN…USING COVERING INDEX,
+// minute_ticks 千万行级冷盘几分钟不回,整个 RPC 就挂死)。拆开后各 0.4~1.4s,再加缓存。
+func (s *IntradayService) MinuteTickDateRange() (string, string) {
+	if s == nil || s.db == nil {
+		return "", ""
+	}
+	s.rangeMu.Lock()
+	defer s.rangeMu.Unlock()
+	if s.rangeLo != "" && time.Since(s.rangeAt) < 10*time.Minute {
+		return s.rangeLo, s.rangeHi
+	}
+	var lo, hi sql.NullString
+	if err := s.db.QueryRow(`SELECT MIN(trade_date) FROM minute_ticks`).Scan(&lo); err != nil || !lo.Valid {
+		return "", ""
+	}
+	if err := s.db.QueryRow(`SELECT MAX(trade_date) FROM minute_ticks`).Scan(&hi); err != nil || !hi.Valid {
+		return "", ""
+	}
+	s.rangeLo, s.rangeHi, s.rangeAt = lo.String, hi.String, time.Now()
+	return s.rangeLo, s.rangeHi
 }
 
 // SetFocusPool 注入重点池代码提供者(3秒线只采这些票)。
@@ -329,10 +358,13 @@ type AuctionFinalRow struct {
 	Name        string  `json:"name"`
 	Price       float64 `json:"price"`
 	Pct         float64 `json:"pct"`
-	Volume      float64 `json:"volume"`
-	Amount      float64 `json:"amount"`
+	Volume      float64 `json:"volume"` // 竞价量(手)
+	Amount      float64 `json:"amount"` // 竞价额(元)
 	VolumeRatio float64 `json:"volumeRatio"`
 	FloatMcap   float64 `json:"floatMcap"`
+	PrevVolume  float64 `json:"prevVolume"` // 昨日成交量(手),App 层从日K补齐
+	MatchG      bool    `json:"matchG"`     // 命中「集合竞价稳健版选股公式 V2.1」(G)
+	MatchC      bool    `json:"matchC"`     // 命中「集合竞价·温和放量高开选股 v2.0」(C)
 }
 
 // AuctionFinal 某日竞价定型全表(按竞价金额降序,limit<=0 取500)。
@@ -369,16 +401,48 @@ type IntradayTick struct {
 
 // StockIntraday 某股某日分时序列(含竞价段)。
 func (s *IntradayService) StockIntraday(code, date string) (auction []IntradayTick, minutes []IntradayTick, err error) {
+	// 竞价主序列走全市场 auction_ticks(全程 9:15-9:25 价+匹配量);
 	q1, err := s.db.Query(`SELECT tick_time,price,pct,volume,amount FROM auction_ticks
 		WHERE trade_date=? AND stock_code=? ORDER BY tick_time`, date, code)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer q1.Close()
 	for q1.Next() {
 		var t IntradayTick
 		if q1.Scan(&t.Time, &t.Price, &t.Pct, &t.Volume, &t.Amount) == nil {
 			auction = append(auction, t)
+		}
+	}
+	q1.Close()
+	// 未匹配量:自选/持仓股的重点池 focus_ticks 采到了竞价盘口 b1/s1(数据源只在临撮合 9:25 前后返回,
+	// 即开盘买卖不平衡)。按 tick_time 就近并入 auction 序列,供前端画"上方未匹配量倒挂柱"。
+	fq, ferr := s.db.Query(`SELECT tick_time,b1,s1 FROM focus_ticks
+		WHERE trade_date=? AND stock_code=? AND tick_time<='09:26:00' AND (b1>0 OR s1>0) ORDER BY tick_time`, date, code)
+	if ferr == nil {
+		type bs struct {
+			t      string
+			b1, s1 float64
+		}
+		var fb []bs
+		for fq.Next() {
+			var x bs
+			if fq.Scan(&x.t, &x.b1, &x.s1) == nil {
+				fb = append(fb, x)
+			}
+		}
+		fq.Close()
+		// 每个 auction 点取时间 ≤ 它的最近一个 focus 盘口(竞价盘口向后填充)
+		for i := range auction {
+			var best *bs
+			for j := range fb {
+				if fb[j].t <= auction[i].Time {
+					best = &fb[j]
+				}
+			}
+			if best != nil {
+				auction[i].B1 = best.b1
+				auction[i].S1 = best.s1
+			}
 		}
 	}
 	q2, err := s.db.Query(`SELECT tick_time,price,pct,cum_volume,cum_amount FROM minute_ticks

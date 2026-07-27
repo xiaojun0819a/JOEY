@@ -350,7 +350,7 @@ export function calculateTradingSignals(data: KLineData[]): TradingSignal[] {
   return signals;
 }
 
-export function calculateIntradayTradingSignals(data: KLineData[], preClose = 0, dayKData: KLineData[] = []): TradingSignal[] {
+export function calculateIntradayTradingSignals(data: KLineData[], preClose = 0, dayKData: KLineData[] = [], includeBingGeT = false): TradingSignal[] {
   if (data.length < 12) return [];
 
   const close = data.map(d => d.close);
@@ -584,7 +584,109 @@ export function calculateIntradayTradingSignals(data: KLineData[], preClose = 0,
     }
   }
 
+  // —— 兵哥分时做T(2026-06-03收费版核心,升级接入)——
+  // 阻力=L1+P1*7/8、支撑=L1+P1*0.5/8,其中 H1=max(昨收,日内高)、L1=min(昨收,日内低)(运行值因果化,不用收盘定格);
+  // T卖:C 在阻力下待≥2根后上穿阻力(冲高触阻力高抛);T买:C 在支撑上待≥2根后跌破支撑(急杀破支撑低吸);
+  // 起涨:C/当日VWAP 比价线 EXPMA30 上穿 EXPMA60;加仓:限制散户线(EXPMA120×中间价轴)在均价线上方且 C 上穿。
+  // 仅"兵哥做T"主图模板选中且单交易日数据(分时1m)启用——默认分时不打,做T是日内行为。
+  const dates = new Set(data.map(d => String(d.time).slice(0, 10)));
+  if (includeBingGeT && dates.size === 1 && data.length >= 30) {
+    const n = data.length;
+    const { support, resistance } = bingGeTLevels(data, preClose);
+    let cumPV = 0;
+    let cumV = 0;
+    const ratio: number[] = new Array(n);
+    let dh = -Infinity;
+    let dl = Infinity;
+    const midAxis: number[] = new Array(n);
+    for (let i = 0; i < n; i++) {
+      cumPV += close[i] * (volume[i] || 0);
+      cumV += volume[i] || 0;
+      const vwap = cumV > 0 ? cumPV / cumV : close[i];
+      // 通达信原式对 VWAP 偏离>5% 回退均线,这里 VWAP 由累计量价直接算,天然在价带内
+      ratio[i] = vwap > 0 ? close[i] / vwap : 1;
+      dh = Math.max(dh, close[i]);
+      dl = Math.min(dl, close[i]);
+      const axisMid = (dh + dl) / 2;
+      midAxis[i] = axisMid - (dh - dl) * 15 / 130; // (50-HL3)*轴差/HL4+中价轴,HL3=65,HL4=130
+    }
+    const emaR30 = ema(ratio, 30);
+    const emaR60 = ema(ratio, 60);
+    const emaR120 = ema(ratio, 120);
+    const mkBase = (i: number) => ({
+      time: parseTime(data[i].time),
+      rawTime: data[i].time,
+      price: close[i],
+      flags: EMPTY_FLAGS,
+    });
+    let lastTBuy = -999;
+    let lastTSell = -999;
+    let lastRise = -999;
+    let lastAdd = -999;
+    for (let i = 3; i < n; i++) {
+      // T卖:前两根都在阻力下方,本根收上阻力
+      if (close[i] > resistance[i] && close[i - 1] <= resistance[i - 1] && close[i - 2] <= resistance[i - 2] && i - lastTSell >= 6) {
+        signals.push({
+          ...mkBase(i), level: 'risk', action: 'reduce', score: 70,
+          title: '兵哥T·卖出', reason: '冲高触及日内阻力位(高低区间7/8),做T高抛',
+        });
+        lastTSell = i;
+      }
+      // T买:前两根都在支撑上方,本根跌破支撑
+      if (close[i] < support[i] && close[i - 1] >= support[i - 1] && close[i - 2] >= support[i - 2] && i - lastTBuy >= 6) {
+        signals.push({
+          ...mkBase(i), level: 'A+', action: 'buy', score: 72,
+          title: '兵哥T·买入', reason: '急杀跌破日内支撑位(高低区间0.5/8),做T低吸',
+        });
+        lastTBuy = i;
+      }
+      // 起涨:VWAP比价 EXPMA30 上穿 EXPMA60
+      if (crossedUp(emaR30, emaR60, i) && i - lastRise >= 30) {
+        signals.push({
+          ...mkBase(i), level: 'A', action: 'buy', score: 58,
+          title: '起涨', reason: 'VWAP比价快线上穿慢线,日内动能转强',
+        });
+        lastRise = i;
+      }
+      // 加仓:限制散户线在均价线上方且价格上穿它
+      const retailLine = emaR120[i] * midAxis[i];
+      const retailLinePrev = emaR120[i - 1] * midAxis[i - 1];
+      const avgV = avgLine[i];
+      if (Number.isFinite(retailLine) && retailLine > avgV
+        && close[i] > retailLine && close[i - 1] <= retailLinePrev && i - lastAdd >= 30) {
+        signals.push({
+          ...mkBase(i), level: 'A+', action: 'buy', score: 62,
+          title: '加仓', reason: '价格上穿散户线且散户线站上均价线,追击确认',
+        });
+        lastAdd = i;
+      }
+    }
+    signals.sort((a, b) => String(a.rawTime).localeCompare(String(b.rawTime)));
+  }
+
   return signals;
+}
+
+// bingGeTLevels 兵哥做T的日内支撑/阻力序列(随行情演进的运行值;跨日自动重置)。
+// 阻力=L1+P1*7/8(绿),支撑=L1+P1*0.5/8(紫),H1/L1 含昨收。
+export function bingGeTLevels(data: KLineData[], preClose = 0): { support: number[]; resistance: number[] } {
+  const support: number[] = [];
+  const resistance: number[] = [];
+  let hi = -Infinity;
+  let lo = Infinity;
+  let day = '';
+  for (const d of data) {
+    const dp = String(d.time).slice(0, 10);
+    if (dp !== day) { day = dp; hi = -Infinity; lo = Infinity; }
+    hi = Math.max(hi, d.high || d.close);
+    lo = Math.min(lo, d.low || d.close);
+    const h1 = preClose > 0 ? Math.max(preClose, hi) : hi;
+    const l1 = preClose > 0 ? Math.min(preClose, lo) : lo;
+    const p1 = h1 - l1;
+    resistance.push(l1 + p1 * 7 / 8);
+    support.push(l1 + p1 * 0.5 / 8);
+  }
+  return { support, resistance };
 }
 
 export function getLatestTradingSignal(signals: TradingSignal[]): TradingSignal | null {

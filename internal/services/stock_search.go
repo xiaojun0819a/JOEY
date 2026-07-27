@@ -192,3 +192,63 @@ func nameInitials(name string) string {
 	initialsCache.Store(name, out)
 	return out
 }
+
+// ===== 全市场 名称→带前缀代码 目录(供情报文本自动关联股票) =====
+
+type StockNameSymbol struct {
+	Name   string
+	Symbol string // 如 sh600519
+}
+
+var (
+	nameCatalogOnce sync.Once
+	nameCatalog     []StockNameSymbol
+)
+
+// AllStockNameSymbols 返回全市场(名称,带前缀代码)目录,首次调用解析嵌入表并缓存。
+func AllStockNameSymbols() []StockNameSymbol {
+	nameCatalogOnce.Do(func() {
+		var basicData stockBasicData
+		if err := json.Unmarshal(embed.StockBasicJSON, &basicData); err != nil {
+			return
+		}
+		symbolIdx, nameIdx, tsCodeIdx := -1, -1, -1
+		for i, f := range basicData.Data.Fields {
+			switch f {
+			case "symbol":
+				symbolIdx = i
+			case "name":
+				nameIdx = i
+			case "ts_code":
+				tsCodeIdx = i
+			}
+		}
+		if symbolIdx < 0 || nameIdx < 0 {
+			return
+		}
+		out := make([]StockNameSymbol, 0, 6000)
+		for _, item := range basicData.Data.Items {
+			symbol, _ := item[symbolIdx].(string)
+			name, _ := item[nameIdx].(string)
+			if symbol == "" || name == "" {
+				continue
+			}
+			full := symbol
+			if tsCodeIdx >= 0 && tsCodeIdx < len(item) {
+				tsCode, _ := item[tsCodeIdx].(string)
+				switch {
+				case strings.HasSuffix(tsCode, ".SH"):
+					full = "sh" + symbol
+				case strings.HasSuffix(tsCode, ".SZ"):
+					full = "sz" + symbol
+				case strings.HasSuffix(tsCode, ".BJ"):
+					full = "bj" + symbol
+				}
+			}
+			// 名称统一去空格(如"万 科A"历史格式),匹配时用 Contains
+			out = append(out, StockNameSymbol{Name: strings.ReplaceAll(name, " ", ""), Symbol: strings.ToLower(full)})
+		}
+		nameCatalog = out
+	})
+	return nameCatalog
+}

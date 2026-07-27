@@ -143,7 +143,7 @@ export const WelcomePage: React.FC<WelcomePageProps> = ({ onAddStock }) => {
         <img src={logo} alt="Logo" className="h-14 w-14 rounded-lg" />
         <div>
           <h1 className={`text-3xl font-bold ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>
-            JOEY <span className="text-accent-2">AI</span>
+            观鲸测浪
           </h1>
           <p className={`text-sm ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>智能股票分析助手</p>
         </div>

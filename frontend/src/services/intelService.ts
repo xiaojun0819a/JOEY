@@ -57,3 +57,23 @@ export const generateIntelDigest = async (positions: any[]): Promise<IntelDigest
     return { success: false, digest: '', noteCount: 0, holdCount: 0, generatedAt: '', error: (e as Error)?.message || '生成失败' };
   }
 };
+
+export interface IntelUploadResult {
+  note: IntelNote;
+  fileName: string;
+  textLen: number;
+  preview: string;
+  warning: string;
+  codeCount: number;
+}
+
+// 文件上传:浏览器读成 base64 交给 Go 解析(docx 是 zip 二进制,Go 用标准库零依赖解)。
+export const addIntelNoteFromFile = async (file: File, codes: string[] = []): Promise<IntelUploadResult | null> => {
+  const dataB64: string = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ''));
+    r.onerror = () => reject(new Error('读取文件失败'));
+    r.readAsDataURL(file);
+  });
+  return await app()?.AddIntelNoteFromUpload(file.name, dataB64, codes ?? []);
+};

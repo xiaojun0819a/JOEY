@@ -340,6 +340,7 @@ func (cs *ConfigService) AddToWatchlist(stock models.Stock) error {
 			return nil
 		}
 	}
+	stock.WatchAddedAt = time.Now().Format("2006-01-02 15:04") // 卡片小字显示加入时刻
 	cs.watchlist = append(cs.watchlist, stock)
 	return cs.saveWatchlistLocked()
 }
@@ -404,6 +405,13 @@ func (cs *ConfigService) SyncStockGroupMembers(groupID, groupName string, member
 			}
 		}
 		if idx < 0 {
+			// ⚠️2026-07-27 修:这条是「分组同步」把股票带进自选的路径(交易台账组/模拟持仓组/波段组等
+			// 都走这里),原来直接 append 不写 WatchAddedAt,导致这样进来的票在卡片上没有"加入 时间"。
+			// 用户实测:今天新加的票也不显示时间——因为它们是被分组同步带进来的,不是手点「+添加」。
+			// 此刻确实是它进入自选的时刻,写上是如实记录,不是编数据。
+			if strings.TrimSpace(stock.WatchAddedAt) == "" {
+				stock.WatchAddedAt = time.Now().Format("2006-01-02 15:04")
+			}
 			cs.watchlist = append(cs.watchlist, stock)
 			watchChanged = true
 		} else {

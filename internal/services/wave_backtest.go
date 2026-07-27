@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/run-bigpig/jcp/internal/embed"
@@ -1659,6 +1662,175 @@ func (s *HistoryService) loadMarketStates(startDate string) map[string]*marketSt
 	return out
 }
 
+// isSTOrDelisted 判定 ST/*ST/退市股(名称含 ST 或"退"),波段选股统一剔除。
+func isSTOrDelisted(name string) bool {
+	up := strings.ToUpper(name)
+	return strings.Contains(up, "ST") || strings.Contains(name, "退")
+}
+
+// strictKeyPatternAtLast 判定"五维全红买(gz) + 均线多头(MA5>MA10>MA20)"在最后一根是否成立。
+// 供「重点布局」三周期(日K/30分/60分)共振复用——同一套判定喂不同周期的K线即可。
+func strictKeyPatternAtLast(ws waveV1Signals, c []float64) bool {
+	n := len(c)
+	if n < 240 {
+		return false
+	}
+	i := n - 1
+	if !ws.gz[i] { // gz = buyState&&trendBull&&energyBull&&midBull&&shortBull(五维擒龙全红买)
+		return false
+	}
+	ma5 := waMA(c, 5)
+	ma10 := waMA(c, 10)
+	ma20 := waMA(c, 20)
+	return ma5[i] > ma10[i] && ma10[i] > ma20[i] // 均线多头排列
+}
+
+// tfKeyStrict 拉某周期(30m/60m)K线,判定该周期是否"五维全红买+多头"。
+// 返回 (ok=形态成立, fetched=取到足够数据)。区分两者才能"只对取数失败重试,不把没形态误判成失败"。
+// asOf 非空时把K线截断到该日(含)收盘,用于历史复盘补算;行情源只带约40个交易日的分钟线,
+// 截断后不足240根(约选股日早于10~20个交易日前)则 fetched=false 诚实降级不硬编。
+func (s *HistoryService) tfKeyStrict(code, period, asOf string) (bool, bool) {
+	if s == nil || s.marketService == nil {
+		return false, false
+	}
+	ks, err := s.marketService.GetKLineData(code, period, 320)
+	if err != nil {
+		return false, false
+	}
+	if asOf != "" {
+		cut := make([]models.KLineData, 0, len(ks))
+		for _, k := range ks {
+			if len(k.Time) >= 10 && k.Time[:10] <= asOf {
+				cut = append(cut, k)
+			}
+		}
+		ks = cut
+	}
+	if len(ks) < 240 {
+		return false, false
+	}
+	n := len(ks)
+	o := make([]float64, n)
+	h := make([]float64, n)
+	l := make([]float64, n)
+	c := make([]float64, n)
+	v := make([]float64, n)
+	amt := make([]float64, n)
+	ds := make([]string, n)
+	for i, k := range ks {
+		o[i], h[i], l[i], c[i] = k.Open, k.High, k.Low, k.Close
+		v[i] = float64(k.Volume)
+		amt[i] = k.Amount
+		ds[i] = k.Time
+	}
+	ws := computeWaveV1Signals(ds, o, h, l, c, v, amt)
+	return strictKeyPatternAtLast(ws, c), true
+}
+
+// tfKeyStrictTimeout 给单次周期确认加硬超时:行情源半死(TDX 断连要等 30s+ 才报错)时,
+// 没有 per-call 上限会把整个扫描拖到分钟级。超时视为取数失败 (false,false)。
+func (s *HistoryService) tfKeyStrictTimeout(code, period, asOf string, budget time.Duration) (bool, bool) {
+	type res struct{ ok, fetched bool }
+	done := make(chan res, 1)
+	go func() {
+		ok, fetched := s.tfKeyStrict(code, period, asOf)
+		done <- res{ok, fetched}
+	}()
+	select {
+	case r := <-done:
+		return r.ok, r.fetched
+	case <-time.After(budget):
+		return false, false
+	}
+}
+
+// tfKeyStrictRetry 只对"取数失败"重试一次(形态不成立不重试),消除行情源瞬时抖动带来的随机漏判。
+func (s *HistoryService) tfKeyStrictRetry(code, period, asOf string, budget time.Duration) bool {
+	ok, fetched := s.tfKeyStrictTimeout(code, period, asOf, budget)
+	if fetched {
+		return ok
+	}
+	time.Sleep(800 * time.Millisecond)
+	ok, _ = s.tfKeyStrictTimeout(code, period, asOf, budget)
+	return ok
+}
+
+// confirmKeyLayout 对日线严格命中者拉 30/60 分确认三周期共振。返回(30与60都过, 已确认周期列表)。
+// 30/60 分并行取且各限 12s;取数失败自动重试一次,行情源慢/断连时单只最多等 ~25s 而不是无限。
+func (s *HistoryService) confirmKeyLayout(code string) (bool, []string) {
+	var ok30, ok60 bool
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); ok30 = s.tfKeyStrictRetry(code, "30m", "", 12*time.Second) }()
+	go func() { defer wg.Done(); ok60 = s.tfKeyStrictRetry(code, "60m", "", 12*time.Second) }()
+	wg.Wait()
+	tfs := []string{"日K"}
+	if ok30 {
+		tfs = append(tfs, "30分")
+	}
+	if ok60 {
+		tfs = append(tfs, "60分")
+	}
+	return ok30 && ok60, tfs
+}
+
+// BackfillKeyLayoutMarks 历史复盘补算「重点布局」:旧留痕没带★标时,用"截至选股日"的数据重判并打标。
+// 日K从本地历史截断;30/60分从行情源取最近320根截到选股日(源约带40个交易日分钟线,更早的补不了,跳过)。
+// 就地修改 picks 的 Triggers。返回补上的数量。
+func (s *HistoryService) BackfillKeyLayoutMarks(signalDate string, picks []models.StrategyPickSnapshot) int {
+	if s == nil || len(picks) == 0 {
+		return 0
+	}
+	for i := range picks { // 已带标(新扫描存的)就不用补
+		for _, t := range picks[i].Triggers {
+			if strings.Contains(t, "重点布局") {
+				return 0
+			}
+		}
+	}
+	added := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	deadline := time.Now().Add(40 * time.Second)
+	for i := range picks {
+		if time.Now().After(deadline) {
+			break
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if time.Now().After(deadline) {
+				return
+			}
+			code := strings.ToLower(strings.TrimSpace(picks[i].Symbol))
+			o, h, l, c, v, amt, ds, _ := s.loadWaveSeriesRecentUntil(code, signalDate, waveScanHistoryBars)
+			n := len(c)
+			if n < 240 || ds[n-1] != signalDate {
+				return
+			}
+			ws := computeWaveV1Signals(ds, o, h, l, c, v, amt)
+			if !strictKeyPatternAtLast(ws, c) {
+				return
+			}
+			if !s.tfKeyStrictRetry(code, "30m", signalDate, 12*time.Second) {
+				return
+			}
+			if !s.tfKeyStrictRetry(code, "60m", signalDate, 12*time.Second) {
+				return
+			}
+			mu.Lock()
+			picks[i].Triggers = append([]string{"★重点布局(补算)"}, picks[i].Triggers...)
+			added++
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	return added
+}
+
 // ScanWaveCandidates 实盘波段策略1.0扫描：三段通达信公式合并，独立于低吸策略。
 func (s *HistoryService) ScanWaveCandidates(topN int, useGate bool) models.WaveScanResult {
 	res := models.WaveScanResult{
@@ -1678,12 +1850,34 @@ func (s *HistoryService) ScanWaveCandidates(topN int, useGate bool) models.WaveS
 	var snapshots []ScanSnapshotRow
 	snapshotMap := map[string]ScanSnapshotRow{}
 	if s.marketService != nil {
-		if rows, err := s.marketService.GetAllAStockSnapshot(false); err == nil && len(rows) > 0 {
-			snapshots = rows
-			snapshotMap = buildWaveSnapshotMap(rows)
-			res.SnapshotAsOf = waveSnapshotAsOf(rows)
-			res.AsOf = res.SnapshotAsOf
-			res.DataSource = "实时全A快照 + 最近日K + 本地历史库"
+		// 取全A快照加 90 秒硬超时:行情源半死时这一步会无限期挂住(东财不通→回退腾讯 87 批),
+		// 而扫描锁一直被持有,前端只看到"扫描中"永不结束、再点又提示"已有一次正在进行"(僵尸锁)。
+		// 超时就降级为纯本地历史库扫描(数据口径会在结果里注明),保证扫描总能返回。
+		tSnap := time.Now()
+		type snapRes struct {
+			rows []ScanSnapshotRow
+			err  error
+		}
+		ch := make(chan snapRes, 1)
+		go func() {
+			rows, err := s.marketService.GetAllAStockSnapshot(false)
+			ch <- snapRes{rows, err}
+		}()
+		select {
+		case r := <-ch:
+			if r.err == nil && len(r.rows) > 0 {
+				snapshots = r.rows
+				snapshotMap = buildWaveSnapshotMap(r.rows)
+				res.SnapshotAsOf = waveSnapshotAsOf(r.rows)
+				res.AsOf = res.SnapshotAsOf
+				res.DataSource = "实时全A快照 + 最近日K + 本地历史库"
+			} else if r.err != nil {
+				historyLog.Warn("波段扫描: 全A快照失败(%.1fs),降级纯本地库: %v", time.Since(tSnap).Seconds(), r.err)
+			}
+			historyLog.Info("波段扫描: 取全A快照 %.1fs (%d只)", time.Since(tSnap).Seconds(), len(snapshots))
+		case <-time.After(90 * time.Second):
+			historyLog.Warn("波段扫描: 全A快照超时90s,降级为纯本地历史库扫描(行情源异常)")
+			res.DataSource = "本地历史库(实时快照超时,降级)"
 		}
 	}
 	if latestErr != nil || latestLocal == "" {
@@ -1722,56 +1916,163 @@ func (s *HistoryService) ScanWaveCandidates(topN int, useGate bool) models.WaveS
 		codes = s.waveUniverseCodes(true)
 	}
 	res.UniverseCount = len(codes)
+	tScan0 := time.Now()
+	historyLog.Info("波段扫描: 全市场 %d 只,开始逐只预热(每只 %d 根)…", len(codes), waveScanHistoryBars)
 
 	type kc struct {
-		c models.WaveCandidate
+		c           models.WaveCandidate
+		dailyStrict bool // 日线已"五维全红买+多头",够格去拉30/60分确认重点布局
 	}
 	var hits []kc
-	for _, code := range codes {
-		o, h, l, c, v, amt, ds, name := s.loadWaveSeriesRecent(code, waveScanHistoryBars)
-		if len(c) == 0 {
-			continue
+	// 全市场逐只预热(每只一次日线库查询 + 240日指标计算)。这里是整个扫描最重的一段:
+	// 5000+ 只串行要跑十几分钟(实测),而后面的复核/重点布局都有并行+预算保护,唯独这里没有。
+	// 改 worker 池并发:SQL 是 IO 等待、指标是纯计算,并发能把两者重叠起来。
+	// 固定 worker 数(而非每只一个 goroutine)是为了压住内存——历史上这个扫描 OOM 过。
+	// 结果顺序不受并发影响:hits 后面按 (分数, 代码) 排序,有确定的 tie-break。
+	{
+		var (
+			mu       sync.Mutex
+			scanned  int64
+			patched  int64
+			codesCh  = make(chan string, len(codes))
+			workerWG sync.WaitGroup
+		)
+		for _, code := range codes {
+			codesCh <- code
 		}
-		if row, ok := snapshotMap[strings.ToLower(code)]; ok {
-			var patched bool
-			o, h, l, c, v, amt, ds, name, patched = mergeWaveSeriesWithSnapshot(o, h, l, c, v, amt, ds, name, row, res.AsOf)
-			if patched {
-				res.PatchedCount++
-			}
+		close(codesCh)
+		workers := runtime.NumCPU()
+		if workers > 6 {
+			workers = 6 // NAS 是低功耗 4 核,再高只会互相抢
 		}
-		if len(c) < waveScanPreheatDays {
-			continue
+		if workers < 2 {
+			workers = 2
 		}
-		li := len(c) - 1
-		if len(snapshotMap) == 0 && ds[li] != latestLocal {
-			continue // 本地模式下仍要求该股最新数据是完整交易日
+		for w := 0; w < workers; w++ {
+			workerWG.Add(1)
+			go func() {
+				defer workerWG.Done()
+				for code := range codesCh {
+					o, h, l, c, v, amt, ds, name := s.loadWaveSeriesRecent(code, waveScanHistoryBars)
+					if len(c) == 0 {
+						continue
+					}
+					if row, ok := snapshotMap[strings.ToLower(code)]; ok {
+						var isPatched bool
+						o, h, l, c, v, amt, ds, name, isPatched = mergeWaveSeriesWithSnapshot(o, h, l, c, v, amt, ds, name, row, res.AsOf)
+						if isPatched {
+							atomic.AddInt64(&patched, 1)
+						}
+					}
+					if isSTOrDelisted(name) {
+						continue // 剔除 ST/*ST/退市:风险票不进波段候选
+					}
+					if len(c) < waveScanPreheatDays {
+						continue
+					}
+					li := len(c) - 1
+					if len(snapshotMap) == 0 && ds[li] != latestLocal {
+						continue // 本地模式下仍要求该股最新数据是完整交易日
+					}
+					if len(snapshotMap) > 0 && res.AsOf != "" && ds[li] < res.AsOf {
+						continue
+					}
+					atomic.AddInt64(&scanned, 1)
+					ws := computeWaveV1Signals(ds, o, h, l, c, v, amt)
+					if ws.entry[li] {
+						cand := kc{c: buildWaveV1Candidate(code, name, c[li], ds[li], ws, li), dailyStrict: strictKeyPatternAtLast(ws, c)}
+						mu.Lock()
+						hits = append(hits, cand)
+						mu.Unlock()
+					}
+				}
+			}()
 		}
-		if len(snapshotMap) > 0 && res.AsOf != "" && ds[li] < res.AsOf {
-			continue
-		}
-		res.ScannedCount++
-		ws := computeWaveV1Signals(ds, o, h, l, c, v, amt)
-		if ws.entry[li] {
-			hits = append(hits, kc{buildWaveV1Candidate(code, name, c[li], ds[li], ws, li)})
-		}
+		workerWG.Wait()
+		res.ScannedCount += int(scanned)
+		res.PatchedCount += int(patched)
+		historyLog.Info("波段扫描: 预热并发 %d 路", workers)
 	}
 
+	historyLog.Info("波段扫描: 预热+选股完成 耗时%.1fs (扫描%d只/命中%d只),进入日K复核…",
+		time.Since(tScan0).Seconds(), res.ScannedCount, len(hits))
+	tRefine0 := time.Now()
+
+	// 最近日K复核:行情源前复权全字段是权威口径(本地 stock_daily 不复权+缺开高低,除权股会失真)。
+	// 取数失败重试2次;仍失败的票【剔除】而非带着可疑的本地口径混进榜——这是"每次扫描结果不一致"的根源:
+	// 源抖动时每次成功复核的票集合不同,榜单在两个口径间随机混合。宁缺毋混,复核通过的集合本身是确定的。
+	uncheckedDropped := 0
+	vetoCount := 0
 	if len(hits) > 0 && s.marketService != nil {
-		refined := hits[:0]
-		for _, hit := range hits {
-			cand, checked, veto := s.refineWaveCandidateWithRecentKLine(hit.c)
-			if checked {
+		type refineOut struct {
+			hit     kc
+			checked bool
+			veto    bool
+		}
+		// 并行(6路)+120秒总预算:行情源半死时串行重试会把整个扫描拖到十几分钟,
+		// 甚至因内存堆积被 OOM。预算耗尽的票按"未复核"处理(剔除,宁缺毋混)。
+		outs := make([]refineOut, len(hits))
+		refineDeadline := time.Now().Add(120 * time.Second)
+		var rwg sync.WaitGroup
+		rsem := make(chan struct{}, 6)
+		for i := range hits {
+			outs[i] = refineOut{hit: hits[i]}
+			rwg.Add(1)
+			go func(i int) {
+				defer rwg.Done()
+				rsem <- struct{}{}
+				defer func() { <-rsem }()
+				if time.Now().After(refineDeadline) {
+					return
+				}
+				var cand models.WaveCandidate
+				var checked, veto bool
+				for attempt := 0; attempt < 3; attempt++ {
+					cand, checked, veto = s.refineWaveCandidateWithRecentKLine(outs[i].hit.c)
+					if checked || time.Now().After(refineDeadline) {
+						break
+					}
+					time.Sleep(time.Duration(attempt+1) * 600 * time.Millisecond)
+				}
+				if checked {
+					outs[i].hit.c = cand
+				}
+				outs[i].checked = checked
+				outs[i].veto = veto
+			}(i)
+		}
+		rwg.Wait()
+		for i := range outs {
+			if outs[i].checked {
 				res.RecentKCount++
 			}
-			if veto {
-				continue
+		}
+		allUnchecked := true
+		for _, o := range outs {
+			if o.checked {
+				allUnchecked = false
+				break
 			}
-			if checked {
-				hit.c = cand
+		}
+		refined := hits[:0]
+		for _, o := range outs {
+			if o.checked && o.veto {
+				vetoCount++
+				continue // 源口径否决(除权失真等),踢出
 			}
-			refined = append(refined, hit)
+			if !o.checked {
+				if !allUnchecked {
+					uncheckedDropped++
+					continue // 个别取数失败:剔除,不拿可疑本地口径混榜
+				}
+				// 行情源整体不可用:全部保留并在消息里明确警示,好过整榜消失
+			}
+			refined = append(refined, o.hit)
 		}
 		hits = refined
+		if allUnchecked && len(hits) > 0 {
+			res.DataSource += "(⚠️行情源整体不可用,本榜未经复核,本地口径除权股可能失真,仅供参考)"
+		}
 	}
 	// 评分优先，其次阶段强弱、控盘度。
 	sort.Slice(hits, func(i, j int) bool {
@@ -1789,11 +2090,69 @@ func (s *HistoryService) ScanWaveCandidates(topN int, useGate bool) models.WaveS
 		}
 		return hits[i].c.Code < hits[j].c.Code
 	})
+
+	historyLog.Info("波段扫描: 日K复核完成 耗时%.1fs (校验%d只/剔除%d只/否决%d只),进入重点布局确认…",
+		time.Since(tRefine0).Seconds(), res.RecentKCount, uncheckedDropped, vetoCount)
+	tKey0 := time.Now()
+
+	// 重点布局:仅对日线严格命中者(五维全红买+多头)拉30/60分确认三周期共振,命中则置顶。
+	// 并行(6路)+45秒总预算:盘中主行情源断连时逐只串行会卡死整个扫描(每只都等TDX失败再走慢新浪),
+	// 预算耗尽就放弃剩余确认(诚实降级:未确认的不打重点布局标),保证扫描总能按时返回。
+	keyCount := 0
+	if s.marketService != nil {
+		const maxKeyProbe = 24
+		deadline := time.Now().Add(45 * time.Second)
+		idxs := make([]int, 0, maxKeyProbe)
+		for i := range hits {
+			if hits[i].dailyStrict && len(idxs) < maxKeyProbe {
+				idxs = append(idxs, i)
+			}
+		}
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 6)
+		for _, i := range idxs {
+			if time.Now().After(deadline) {
+				log.Warn("重点布局确认超预算,放弃剩余候选(行情源慢)")
+				break
+			}
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				if time.Now().After(deadline) {
+					return
+				}
+				if ok, tfs := s.confirmKeyLayout(hits[i].c.Code); ok {
+					mu.Lock()
+					hits[i].c.KeyLayout = true
+					hits[i].c.KeyLayoutTF = tfs
+					hits[i].c.Reasons = append(hits[i].c.Reasons, "日K+30分+60分三周期五维全红买+多头共振")
+					keyCount++
+					mu.Unlock()
+				}
+			}(i)
+		}
+		wg.Wait()
+		if keyCount > 0 {
+			sort.SliceStable(hits, func(i, j int) bool { return hits[i].c.KeyLayout && !hits[j].c.KeyLayout })
+		}
+	}
+
 	for i := 0; i < topN && i < len(hits); i++ {
 		res.Items = append(res.Items, hits[i].c)
 	}
 	res.Count = len(res.Items)
-	res.Message = fmt.Sprintf("波段策略1.0扫描完成，命中 %d 只；数据口：%s，%d日预热，快照补丁%d只，最近日K校验%d只；三维为吃鱼身/异动点火、短线能量、五灯共振", len(hits), res.DataSource, res.PreheatDays, res.PatchedCount, res.RecentKCount)
+	droppedNote := ""
+	if uncheckedDropped > 0 {
+		droppedNote = fmt.Sprintf("，另有%d只因行情源取数失败未复核已剔除(宁缺毋混)", uncheckedDropped)
+	}
+	if vetoCount > 0 {
+		droppedNote += fmt.Sprintf("，复核否决%d只", vetoCount) // 治本(前复权对齐)后应≈0,持续>10说明本地口径又漂了
+	}
+	historyLog.Info("波段扫描: 重点布局确认完成 耗时%.1fs(%d只)。全程总耗时 %.1fs", time.Since(tKey0).Seconds(), keyCount, time.Since(tScan0).Seconds())
+	res.Message = fmt.Sprintf("波段策略1.0扫描完成，命中 %d 只（重点布局%d只）%s；数据口：%s，%d日预热，快照补丁%d只，最近日K校验%d只；三维为吃鱼身/异动点火、短线能量、五灯共振", len(hits), keyCount, droppedNote, res.DataSource, res.PreheatDays, res.PatchedCount, res.RecentKCount)
 	return res
 }
 
@@ -1837,6 +2196,9 @@ func (s *HistoryService) ScanWaveCandidatesOnDate(date string, topN int, useGate
 	var hits []kc
 	for _, code := range codes {
 		o, h, l, c, v, amt, ds, name := s.loadWaveSeriesRecentUntil(code, date, waveScanHistoryBars)
+		if isSTOrDelisted(name) {
+			continue // 剔除 ST/*ST/退市,与实盘扫描口径一致
+		}
 		if len(c) < waveScanPreheatDays {
 			continue
 		}
@@ -2131,6 +2493,60 @@ func (s *HistoryService) loadMarketRet3() map[string]float64 {
 }
 
 // waveUniverseCodes 取吃鱼身池子代码（all=全A，否则 300/301/688/689）。
+// WaveResonance 波段鱼身引擎在"最后一根K"上的共振快照(供其他策略复用同源信号,如超跌起爆11)。
+type WaveResonance struct {
+	EatFish       bool    // 吃鱼身
+	MainOpenFish  bool    // 开仓吃鱼(主图短买)
+	StrictIgnite  bool    // 异动点火·强口径
+	RelaxedIgnite bool    // 异动点火·宽口径
+	MainRise      bool    // 主力拉升(控盘斜率上穿0)
+	StrongCount   int     // 强势次数(1转强/2主升/≥3超强)
+	Lamps         int     // 五灯红数(买/趋势/量能/中期/短期)
+	AllLamps      bool    // 五灯全红
+	Kongpan       float64 // 控盘度
+	Level         string  // 引擎分级文案
+}
+
+// WaveResonanceAtLast 用与波段1.0完全同一套 computeWaveV1Signals 计算序列,取最后一根的共振状态。
+func WaveResonanceAtLast(dates []string, o, h, l, c, v, amount []float64) WaveResonance {
+	ws := computeWaveV1Signals(dates, o, h, l, c, v, amount)
+	li := len(c) - 1
+	res := WaveResonance{}
+	if li < 0 || len(ws.eatFish) <= li {
+		return res
+	}
+	res.EatFish = ws.eatFish[li]
+	res.MainOpenFish = ws.mainOpenFish[li]
+	res.StrictIgnite = ws.strictIgnite[li]
+	res.RelaxedIgnite = ws.relaxedIgnite[li]
+	res.MainRise = ws.mainRise[li]
+	res.StrongCount = ws.strongCount[li]
+	lamps := 0
+	for _, b := range []bool{ws.buyState[li], ws.trendBull[li], ws.energyBull[li], ws.midBull[li], ws.shortBull[li]} {
+		if b {
+			lamps++
+		}
+	}
+	res.Lamps = lamps
+	res.AllLamps = lamps == 5
+	res.Kongpan = ws.kongpanVal[li]
+	if len(ws.level) > li {
+		res.Level = ws.level[li]
+	}
+	return res
+}
+
+// AllUniverseCodes 本地历史库全部股票代码(供策略历史重算遍历,与波段补算同一取数口)。
+func (s *HistoryService) AllUniverseCodes() []string { return s.waveUniverseCodes(true) }
+
+// SeriesRecentUntil 某股截至 endDate 的最近 limit 根日K(升序,前复权口径),返回开高低收/量/额/日期/名称。
+func (s *HistoryService) SeriesRecentUntil(code string, endDate string, limit int) (o, h, l, c, v, amount []float64, dates []string, name string) {
+	return s.loadWaveSeriesRecentUntil(code, endDate, limit)
+}
+
+// IsSTOrDelistedName 名称是否 ST/退市(导出供 app 层重算过滤,与波段口径一致)。
+func IsSTOrDelistedName(name string) bool { return isSTOrDelisted(name) }
+
 func (s *HistoryService) waveUniverseCodes(all bool) []string {
 	q := `SELECT DISTINCT stock_code FROM stock_daily WHERE substr(stock_code,3,3) IN ('300','301','688','689')`
 	if all {
@@ -2279,4 +2695,464 @@ func orVal(v, fallback float64) float64 {
 		return v
 	}
 	return fallback
+}
+
+// ===== 波段执行时点对比回测(2026-07-20 用户要求) =====
+// 对比两种执行方案(信号集合完全相同,只比买卖时点):
+//   A「2:30扫描当天买」: 信号日D 以收盘价买入(近似14:30实价,见诚实声明) → D+1 开盘卖出
+//   B「17:30扫描次日买」: D+1 开盘价买入 → D+2 开盘卖出
+// 口径与 live 波段扫描严格一致:270根窗口逐日重算 computeWaveV1Signals、同评分同排序取每日前N、
+// 大盘闸门(gatePassSmart,不过=当日空仓)、剔ST。扣双边成本(PaperCostRates)。
+// 诚实声明(写进结果):①历史无14:30盘中数据,A的买价用当日收盘近似,且2:30盘中信号与收盘信号
+// 会有出入(尾盘半小时变化),回测统一用收盘信号——对A偏乐观;②涨停可成交过滤:A剔信号日收盘涨停
+// (封死买不进),B剔D+1开盘即涨停(一字买不进);③跌停卖不出未建模。
+
+type WaveTimingTradeStat struct {
+	Trades     int     `json:"trades"`
+	Wins       int     `json:"wins"`
+	WinRate    float64 `json:"winRate"`
+	AvgNet     float64 `json:"avgNet"`   // 单笔净收益均值%
+	SumNet     float64 `json:"sumNet"`   // 逐笔净收益求和%
+	Compound   float64 `json:"compound"` // 每日等权组合复利累计%
+	MaxDD      float64 `json:"maxDd"`    // 组合净值最大回撤%
+	WorstOne   float64 `json:"worstOne"` // 单笔最大亏%
+	BestOne    float64 `json:"bestOne"`
+	Skipped    int     `json:"skipped"`    // 因涨停买不进被剔的笔数
+	AvgHold    float64 `json:"avgHold"`    // 平均持有交易日数
+	Unresolved int     `json:"unresolved"` // 数据末端仍未触发离场的笔数(按最后收盘价截断结算)
+}
+
+type WaveTimingSchemeMonth struct {
+	Month  string  `json:"month"`
+	Trades int     `json:"trades"`
+	Win    float64 `json:"win"`
+	Avg    float64 `json:"avg"`
+}
+
+type WaveTimingScheme struct {
+	Name    string                  `json:"name"`
+	Stat    WaveTimingTradeStat     `json:"stat"`
+	Monthly []WaveTimingSchemeMonth `json:"monthly"`
+}
+
+type WaveTimingBacktestResult struct {
+	StartDate  string             `json:"startDate"`
+	EndDate    string             `json:"endDate"`
+	TopN       int                `json:"topN"`
+	SignalDays int                `json:"signalDays"` // 有信号的交易日数
+	GateDays   int                `json:"gateDays"`   // 闸门通过的交易日数
+	TotalDays  int                `json:"totalDays"`
+	Schemes    []WaveTimingScheme `json:"schemes"`
+	Notes      []string           `json:"notes"`
+	ElapsedSec float64            `json:"elapsedSec"`
+}
+
+func waveTimingLimitRatio(code string) float64 {
+	c := strings.ToLower(code)
+	if strings.HasPrefix(c, "sz300") || strings.HasPrefix(c, "sz301") || strings.HasPrefix(c, "sh688") || strings.HasPrefix(c, "sh689") {
+		return 1.20
+	}
+	if strings.HasPrefix(c, "bj") {
+		return 1.30
+	}
+	return 1.10
+}
+
+// RunWaveTimingBacktest 近 months 个月、每日前 topN 的执行时点对比回测。
+func (s *HistoryService) RunWaveTimingBacktest(months, topN int) WaveTimingBacktestResult {
+	t0 := time.Now()
+	res := WaveTimingBacktestResult{TopN: topN}
+	if s == nil || s.db == nil {
+		res.Notes = append(res.Notes, "history db not ready")
+		return res
+	}
+	if months <= 0 {
+		months = 6
+	}
+	if topN <= 0 {
+		topN = 5
+	}
+
+	// 交易日轴(全市场口径)
+	var allDays []string
+	rows, err := s.db.Query(`SELECT DISTINCT trade_date FROM stock_daily ORDER BY trade_date`)
+	if err != nil {
+		res.Notes = append(res.Notes, "交易日查询失败: "+err.Error())
+		return res
+	}
+	for rows.Next() {
+		var d string
+		if rows.Scan(&d) == nil {
+			allDays = append(allDays, d)
+		}
+	}
+	rows.Close()
+	if len(allDays) < waveScanPreheatDays+10 {
+		res.Notes = append(res.Notes, "本地日线深度不足")
+		return res
+	}
+	endSignalIdx := len(allDays) - 3 // B 需要 D+2,信号日最多到倒数第3个交易日
+	startWant := time.Now().AddDate(0, -months, 0).Format("2006-01-02")
+	startIdx := 0
+	for i, d := range allDays {
+		if d >= startWant {
+			startIdx = i
+			break
+		}
+	}
+	if startIdx > endSignalIdx {
+		startIdx = endSignalIdx
+	}
+	signalDays := allDays[startIdx : endSignalIdx+1]
+	res.StartDate, res.EndDate = signalDays[0], signalDays[len(signalDays)-1]
+	res.TotalDays = len(signalDays)
+
+	// 大盘闸门逐日
+	states := s.loadMarketStates(allDays[maxInt(0, startIdx-2)])
+	gateOK := map[string]bool{}
+	for _, d := range signalDays {
+		if gatePassSmart(states[d]) {
+			gateOK[d] = true
+			res.GateDays++
+		}
+	}
+
+	// 批量加载:预热270根 + 回测期
+	loadStart := allDays[maxInt(0, startIdx-(waveScanHistoryBars+8))]
+	series, idxMap, err := s.LoadAllKLinesAscending(loadStart, allDays[len(allDays)-1])
+	if err != nil {
+		res.Notes = append(res.Notes, "批量加载失败: "+err.Error())
+		return res
+	}
+	// 股票名(剔ST用,取最新名)
+	names := map[string]string{}
+	if nr, err := s.db.Query(`SELECT stock_code, stock_name FROM stock_daily WHERE trade_date=?`, allDays[len(allDays)-1]); err == nil {
+		for nr.Next() {
+			var c, n string
+			if nr.Scan(&c, &n) == nil {
+				names[c] = n
+			}
+		}
+		nr.Close()
+	}
+
+	// 逐股并行:窗口滑动逐信号日算 live 同款信号
+	type hitRec struct {
+		day  string
+		cand models.WaveCandidate
+		idx  int
+		code string
+	}
+	var mu sync.Mutex
+	byDay := map[string][]hitRec{}
+	codes := make([]string, 0, len(series))
+	for c := range series {
+		codes = append(codes, c)
+	}
+	sort.Strings(codes)
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for _, code := range codes {
+		wg.Add(1)
+		go func(code string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			name := names[code]
+			if isSTOrDelisted(name) {
+				return
+			}
+			arr := series[code]
+			pos := idxMap[code]
+			n := len(arr)
+			if n < waveScanPreheatDays {
+				return
+			}
+			// 整段转列一次,窗口用切片(零拷贝),与 live 的270根窗口逐日重算完全同口径
+			o := make([]float64, n)
+			h := make([]float64, n)
+			l := make([]float64, n)
+			c := make([]float64, n)
+			v := make([]float64, n)
+			amt := make([]float64, n)
+			ds := make([]string, n)
+			for i, k := range arr {
+				o[i], h[i], l[i], c[i], v[i], amt[i], ds[i] = k.Open, k.High, k.Low, k.Close, float64(k.Volume), k.Amount, k.Time
+			}
+			for _, day := range signalDays {
+				if !gateOK[day] {
+					continue
+				}
+				li, ok := pos[day]
+				if !ok {
+					continue // 该股当日停牌/无数据
+				}
+				lo := li - waveScanHistoryBars + 1
+				if lo < 0 {
+					lo = 0
+				}
+				if li-lo+1 < waveScanPreheatDays {
+					continue
+				}
+				ws := computeWaveV1Signals(ds[lo:li+1], o[lo:li+1], h[lo:li+1], l[lo:li+1], c[lo:li+1], v[lo:li+1], amt[lo:li+1])
+				wi := li - lo
+				if !ws.entry[wi] {
+					continue
+				}
+				cand := buildWaveV1Candidate(code, name, c[li], day, ws, wi)
+				mu.Lock()
+				byDay[day] = append(byDay[day], hitRec{day: day, cand: cand, idx: li, code: code})
+				mu.Unlock()
+			}
+		}(code)
+	}
+	wg.Wait()
+
+	// 逐日取前N + 多方案结算(信号只算一遍,结算便宜)
+	buyC, sellC := PaperCostRates()
+	netOf := func(buy, sell float64) float64 {
+		outlay := buy * (1 + buyC)
+		return (sell*(1-sellC) - outlay) / outlay * 100
+	}
+	type acc struct {
+		stat   WaveTimingTradeStat
+		daily  map[string][]float64 // 信号日→当日各笔净收益(等权日收益用)
+		months map[string][]float64
+		holds  []int
+	}
+	newAcc := func() *acc { return &acc{daily: map[string][]float64{}, months: map[string][]float64{}} }
+	// 六方案:A/B 各配 开盘卖(原口径) 与 冲高+3%/+5%止盈(未及目标当日收盘了结)
+	schemeNames := []string{
+		"A·2:30买→次日开盘卖",
+		"A·2:30买→次日冲高+3%止盈(否则收盘走)",
+		"A·2:30买→次日冲高+5%止盈(否则收盘走)",
+		"B·次日开盘买→第三日开盘卖",
+		"B·次日开盘买→第三日冲高+3%止盈(否则收盘走)",
+		"B·次日开盘买→第三日冲高+5%止盈(否则收盘走)",
+		"C·次日开盘买→波段纪律持有",
+	}
+	accs := map[string]*acc{}
+	for _, nm := range schemeNames {
+		accs[nm] = newAcc()
+	}
+	recordH := func(a *acc, day string, net float64, hold int) {
+		a.stat.Trades++
+		a.stat.SumNet += net
+		if net > 0 {
+			a.stat.Wins++
+		}
+		if net < a.stat.WorstOne {
+			a.stat.WorstOne = net
+		}
+		if net > a.stat.BestOne {
+			a.stat.BestOne = net
+		}
+		a.months[day[:7]] = append(a.months[day[:7]], net)
+		a.daily[day] = append(a.daily[day], net)
+		a.holds = append(a.holds, hold)
+	}
+	record := func(a *acc, day string, net float64) { recordH(a, day, net, 1) }
+	// tpSell: 持有日bar上的止盈结算——跳空开在目标上按开盘卖(更优),盘中冲到按目标价卖(挂单成交),
+	// 都没有则收盘了结(乏力就走)。日K无法分辨盘中高低先后,但本口径只有止盈单无盘中止损,无歧义。
+	tpSell := func(buy float64, bar models.KLineData, tgtPct float64) float64 {
+		tgt := buy * (1 + tgtPct/100)
+		if bar.Open >= tgt {
+			return bar.Open
+		}
+		if bar.High >= tgt {
+			return tgt
+		}
+		return bar.Close
+	}
+	for _, day := range signalDays {
+		hits := byDay[day]
+		if len(hits) == 0 {
+			continue
+		}
+		res.SignalDays++
+		sort.Slice(hits, func(i, j int) bool {
+			if hits[i].cand.Score != hits[j].cand.Score {
+				return hits[i].cand.Score > hits[j].cand.Score
+			}
+			if hits[i].cand.StrongCount != hits[j].cand.StrongCount {
+				return hits[i].cand.StrongCount > hits[j].cand.StrongCount
+			}
+			if hits[i].cand.GZ != hits[j].cand.GZ {
+				return hits[i].cand.GZ
+			}
+			if hits[i].cand.Kongpan != hits[j].cand.Kongpan {
+				return hits[i].cand.Kongpan > hits[j].cand.Kongpan
+			}
+			return hits[i].cand.Code < hits[j].cand.Code
+		})
+		if len(hits) > topN {
+			hits = hits[:topN]
+		}
+		for _, hrec := range hits {
+			arr := series[hrec.code]
+			li := hrec.idx
+			if li+2 >= len(arr) {
+				continue
+			}
+			d0, d1, d2 := arr[li], arr[li+1], arr[li+2]
+			ratio := waveTimingLimitRatio(hrec.code)
+			prevClose := 0.0
+			if li > 0 {
+				prevClose = arr[li-1].Close
+			}
+			// A 系:信号日收盘买(近似2:30);信号日收盘涨停=封死买不进
+			limit0 := round2(prevClose * ratio)
+			if prevClose > 0 && d0.Close >= limit0-0.001 {
+				for _, nm := range schemeNames[:3] {
+					accs[nm].stat.Skipped++
+				}
+			} else if d0.Close > 0 && d1.Open > 0 {
+				record(accs[schemeNames[0]], day, netOf(d0.Close, d1.Open))
+				record(accs[schemeNames[1]], day, netOf(d0.Close, tpSell(d0.Close, d1, 3)))
+				record(accs[schemeNames[2]], day, netOf(d0.Close, tpSell(d0.Close, d1, 5)))
+			}
+			// B 系:D+1 开盘买;开盘即涨停(一字近似)=买不进;T+1 制度当日不能卖,持有到 D+2
+			limit1 := round2(d0.Close * ratio)
+			if d1.Open >= limit1-0.001 {
+				for _, nm := range schemeNames[3:] {
+					accs[nm].stat.Skipped++
+				}
+			} else if d1.Open > 0 && d2.Open > 0 {
+				record(accs[schemeNames[3]], day, netOf(d1.Open, d2.Open))
+				record(accs[schemeNames[4]], day, netOf(d1.Open, tpSell(d1.Open, d2, 3)))
+				record(accs[schemeNames[5]], day, netOf(d1.Open, tpSell(d1.Open, d2, 5)))
+
+				// C: D+1 开盘买,按波段成文纪律逐日推演离场(riskWave:-8%止损/+8%保本/+12%移动回8%/
+				// +30%封顶/破确认前低(收盘)/10日不涨<3%清)。与 live 引擎同序判定;比引擎更诚实一处:
+				// 跳空穿越止损线按当日开盘价成交(现实滑点),不是理论线价。
+				cost := d1.Open
+				entryIdx := li + 1
+				w0 := entryIdx - 130
+				if w0 < 0 {
+					w0 = 0
+				}
+				pivots := confirmedPivotLows(arr[w0:])
+				prof := riskWave
+				peak := d1.High
+				exited := false
+				for j := entryIdx + 1; j < len(arr); j++ {
+					b := arr[j]
+					hold := j - entryIdx
+					if b.High > peak {
+						peak = b.High
+					}
+					line, _ := prof.RiskStopLine(cost, peak)
+					sellPx, done := 0.0, false
+					switch {
+					case b.Open > 0 && b.Open <= line: // 跳空开在线下:按开盘成交
+						sellPx, done = b.Open, true
+					case b.Low > 0 && b.Low <= line: // 盘中触线:按线价成交
+						sellPx, done = line, true
+					}
+					if !done && prof.StructStop {
+						if pv := pivots[j-w0]; pv > 0 && b.Close < pv {
+							sellPx, done = b.Close, true // 结构止损:收盘口径
+						}
+					}
+					if !done {
+						tp := cost * (1 + prof.TPPct/100)
+						if b.Open >= tp {
+							sellPx, done = b.Open, true // 跳空开在封顶上:按开盘(更优)
+						} else if b.High >= tp {
+							sellPx, done = tp, true
+						}
+					}
+					if !done && prof.TimeStopDays > 0 && hold >= prof.TimeStopDays && (b.Close-cost)/cost*100 < prof.TimeStopGain {
+						sellPx, done = b.Close, true
+					}
+					if done {
+						recordH(accs[schemeNames[6]], day, netOf(cost, sellPx), hold)
+						exited = true
+						break
+					}
+				}
+				if !exited { // 数据末端仍持有:按最后收盘截断结算并计数
+					last := arr[len(arr)-1]
+					recordH(accs[schemeNames[6]], day, netOf(cost, last.Close), len(arr)-1-entryIdx)
+					accs[schemeNames[6]].stat.Unresolved++
+				}
+			}
+		}
+	}
+
+	for _, nm := range schemeNames {
+		a := accs[nm]
+		st := a.stat
+		if st.Trades > 0 {
+			st.WinRate = round2(float64(st.Wins) * 100 / float64(st.Trades))
+			st.AvgNet = round2(st.SumNet / float64(st.Trades))
+			st.SumNet = round2(st.SumNet)
+		}
+		var dayKeys []string
+		for d := range a.daily {
+			dayKeys = append(dayKeys, d)
+		}
+		sort.Strings(dayKeys)
+		nav, peak, maxdd := 1.0, 1.0, 0.0
+		for _, d := range dayKeys {
+			list := a.daily[d]
+			sum := 0.0
+			for _, x := range list {
+				sum += x
+			}
+			nav *= 1 + (sum/float64(len(list)))/100
+			if nav > peak {
+				peak = nav
+			}
+			if dd := (nav/peak - 1) * 100; dd < maxdd {
+				maxdd = dd
+			}
+		}
+		st.Compound = round2((nav - 1) * 100)
+		st.MaxDD = round2(maxdd)
+		st.WorstOne = round2(st.WorstOne)
+		st.BestOne = round2(st.BestOne)
+		if len(a.holds) > 0 {
+			sumH := 0
+			for _, x := range a.holds {
+				sumH += x
+			}
+			st.AvgHold = round2(float64(sumH) / float64(len(a.holds)))
+		}
+		var monthKeys []string
+		for m := range a.months {
+			monthKeys = append(monthKeys, m)
+		}
+		sort.Strings(monthKeys)
+		var monthly []WaveTimingSchemeMonth
+		for _, m := range monthKeys {
+			list := a.months[m]
+			w, sum := 0, 0.0
+			for _, x := range list {
+				sum += x
+				if x > 0 {
+					w++
+				}
+			}
+			monthly = append(monthly, WaveTimingSchemeMonth{Month: m, Trades: len(list),
+				Win: round2(float64(w) * 100 / float64(len(list))), Avg: round2(sum / float64(len(list)))})
+		}
+		res.Schemes = append(res.Schemes, WaveTimingScheme{Name: nm, Stat: st, Monthly: monthly})
+	}
+	res.Notes = append(res.Notes,
+		"A系买价用信号日收盘近似2:30实价;2:30盘中信号与收盘信号有出入,统一用收盘信号——对A系偏乐观",
+		"止盈口径:目标价挂单,跳空开在目标上按开盘卖,盘中冲到按目标价成交,均未及则当日收盘了结(乏力就走);无盘中止损,无高低先后歧义",
+		"可成交过滤:A系剔信号日收盘涨停(封死),B系剔D+1开盘即达涨停(一字近似);跌停卖不出未建模",
+		"信号口径=live波段1.0(270根窗口/240日预热/大盘闸门/剔ST/同评分排序),扣双边成本≈0.35%;B/C系遵守T+1(买入日不卖)",
+		"C口径=波段成文纪律逐日推演(riskWave):跳空穿线按开盘成交(比理论线价诚实);组合日收益按信号日归组,C持有多日会有重叠持仓,复利/回撤为近似口径,单笔均值与胜率不受影响",
+	)
+	res.ElapsedSec = round2(time.Since(t0).Seconds())
+	return res
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

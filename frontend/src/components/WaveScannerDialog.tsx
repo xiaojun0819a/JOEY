@@ -4,7 +4,9 @@ import type { Stock } from '../types';
 import { AddToGroupButton } from './AddToGroupButton';
 import { BatchAddToGroupButton } from './BatchAddToGroupButton';
 import { StrategyReviewDialog } from './StrategyReviewDialog';
-import { runWaveScannerWithGate, type WaveCandidate, type WaveScanResult } from '../services/waveService';
+import { runWaveScannerWithGate, getWaveScanStatus, type WaveCandidate, type WaveScanResult } from '../services/waveService';
+import { watchSharedResult } from '../services/sharedScanService';
+import { listPaperPositions } from '../services/paperService';
 
 interface WaveScannerDialogProps {
   isOpen: boolean;
@@ -62,17 +64,18 @@ const levelClass = (level?: string) => {
 const WaveCandidateRow: React.FC<{
   item: WaveCandidate;
   inWatch: boolean;
+  inPaper: boolean;
   onAddToWatchlist?: (stock: Stock) => Promise<boolean> | void;
   onOpenStock?: (stock: Stock) => void | Promise<void>;
   batchSelectMode?: boolean;
   batchSelected?: boolean;
   onToggleBatch?: () => void;
-}> = ({ item, inWatch, onAddToWatchlist, onOpenStock, batchSelectMode, batchSelected, onToggleBatch }) => {
+}> = ({ item, inWatch, inPaper, onAddToWatchlist, onOpenStock, batchSelectMode, batchSelected, onToggleBatch }) => {
   const stock = emptyStock(item.code, item.name, item.price);
   const reasons = item.reasons ?? [];
   const risks = item.risks ?? [];
   return (
-    <div className="rounded-xl border fin-divider bg-slate-950/20 px-3 py-2.5 hover:bg-white/[0.04]">
+    <div className={`rounded-xl border px-3 py-2.5 hover:bg-white/[0.04] ${item.keyLayout ? 'border-red-500/50 bg-red-500/[0.06] ring-1 ring-red-500/25' : 'fin-divider bg-slate-950/20'}`}>
       <div className={`grid ${batchSelectMode ? 'grid-cols-[112px_1fr_92px_84px_26px]' : 'grid-cols-[112px_1fr_92px_84px]'} gap-3 items-start`}>
         <div className="min-w-0">
           <button
@@ -84,6 +87,14 @@ const WaveCandidateRow: React.FC<{
             {item.name}
           </button>
           <div className="mt-0.5 font-mono text-[11px] text-slate-500">{item.code}</div>
+          {item.keyLayout && (
+            <div
+              className="mt-1 inline-flex items-center gap-1 rounded-md border border-red-500/50 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold text-red-300"
+              title={`日K/30分/60分三周期五维全红买+多头共振（已确认：${(item.keyLayoutTF ?? []).join('/')}）`}
+            >
+              ★ 重点布局
+            </div>
+          )}
         </div>
 
         <div className="min-w-0 space-y-2">
@@ -129,7 +140,7 @@ const WaveCandidateRow: React.FC<{
           </span>
           <span className="text-[15px] font-bold text-amber-200">{Number(item.score || 0).toFixed(1)}</span>
           {onAddToWatchlist && !batchSelectMode && (
-            <AddToGroupButton stock={stock} source="wave-v1" inWatch={inWatch} onAddToWatchlist={onAddToWatchlist} />
+            <AddToGroupButton stock={stock} source="wave-v1" inWatch={inWatch} inPaper={inPaper} onAddToWatchlist={onAddToWatchlist} />
           )}
         </div>
 
@@ -170,6 +181,43 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
   const [batchSelectedCodes, setBatchSelectedCodes] = useState<string[]>([]);
   const scanRequestIdRef = useRef(0);
 
+  // 「在模拟持仓」与「在自选」是两回事:这里单独拉一次未平仓列表,让按钮如实显示"持仓中"
+  const [paperSet, setPaperSet] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!isOpen) return;
+    let alive = true;
+    listPaperPositions()
+      .then(list => {
+        if (!alive) return;
+        setPaperSet(new Set((list || []).filter(p => p.status === 'open').map(p => String(p.symbol || '').toLowerCase())));
+      })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, [isOpen, result]);
+
+  // 断线找回:扫描要跑1-2分钟,公网隧道常把长请求中途掐断(Load failed),但服务端会照常扫完并缓存。
+  // 网络错误后每6秒轮询扫描状态,最多等3分钟,把跑完的结果捞回来,而不是让用户干瞪眼。
+  const recoverScanResult = async (requestId: number): Promise<boolean> => {
+    const deadline = Date.now() + 3 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 6000));
+      if (requestId !== scanRequestIdRef.current) return true; // 用户已重新点了,交给新请求
+      const st = await getWaveScanStatus();
+      if (!st) continue;
+      if (st.running) {
+        setError('连接被中断,但扫描仍在服务器上进行,正在等待结果…');
+        continue;
+      }
+      if (st.result && st.ageSec >= 0 && st.ageSec < 300) {
+        setError(null);
+        setResult({ ...st.result, scannedAt: new Date().toLocaleString('zh-CN', { hour12: false }) });
+        return true;
+      }
+      return false; // 没在跑也没有新结果,放弃找回
+    }
+    return false;
+  };
+
   const handleScan = async (useGate = true) => {
     const requestId = ++scanRequestIdRef.current;
     setLoading(true);
@@ -180,10 +228,24 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
     try {
       const res = await runWaveScannerWithGate(useGate);
       if (requestId !== scanRequestIdRef.current) return;
-      if (res) setResult({ ...res, scannedAt: new Date().toLocaleString('zh-CN', { hour12: false }) });
+      if (res) {
+        setResult({ ...res, scannedAt: new Date().toLocaleString('zh-CN', { hour12: false }) });
+        sharedAtRef.current = new Date().toLocaleString('sv-SE'); // 自己刚扫的,共享轮询不用再回灌
+      }
     } catch (e) {
       if (requestId !== scanRequestIdRef.current) return;
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      // 网络级失败(隧道掐线/超时/部署重启)→ 尝试从服务端缓存找回扫描结果
+      if (/网络错误|Load failed|超时|Failed to fetch|aborted/i.test(msg)) {
+        setError('连接被中断,扫描可能仍在服务器上进行,正在尝试找回结果…');
+        const recovered = await recoverScanResult(requestId);
+        if (requestId === scanRequestIdRef.current) {
+          if (!recovered) setError(msg + '(且未能从服务器找回结果,请稍后重试)');
+          setLoading(false);
+        }
+        return;
+      }
+      setError(msg);
     } finally {
       if (requestId === scanRequestIdRef.current) {
         setLoading(false);
@@ -197,9 +259,27 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
     setBatchSelectedCodes([]);
   }, [isOpen]);
 
+  // 跨账号共享:打开即显示任意账号最新一次扫描(不重扫),期间10秒轮询——谁点了重新扫描,这里自动换新
+  const sharedAtRef = useRef('');
+  useEffect(() => {
+    if (!isOpen || loading) return;
+    const apply = (hit: { at: string; user?: string; result?: WaveScanResult }) => {
+      if (!hit.result) return;
+      sharedAtRef.current = hit.at;
+      setResult({ ...hit.result, scannedAt: `${hit.at}${hit.user ? ` · 来自「${hit.user}」` : ''}` });
+      setError(null);
+    };
+    const stops = ['RunWaveScannerWithGate', 'RunWaveScanner'].map(m =>
+      watchSharedResult<WaveScanResult>(m, apply, () => sharedAtRef.current));
+    return () => stops.forEach(s => s());
+  }, [isOpen, loading]);
+
   if (!isOpen) return null;
 
   const items = result?.items ?? [];
+  // 撞上"已有一次扫描进行中"时,后端返回的是空占位(gatePassed 等字段都是零值),
+  // 直接照渲染会显示成"闸门未过(空仓)·命中0只"——看着像扫完没选出票,其实压根没扫。
+  const isBusyPlaceholder = !!result && !result.universeCount && /正在进行/.test(result.message || '');
   const batchSelectedSet = new Set(batchSelectedCodes);
   const batchStocks = items
     .filter(item => batchSelectedSet.has(item.code))
@@ -219,15 +299,13 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
       <div className="w-[880px] max-w-[94vw] max-h-[84vh] flex flex-col rounded-2xl fin-panel border fin-divider shadow-2xl">
         {/* header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b fin-divider">
-          <div className="flex items-center gap-2">
-            <Activity className="h-5 w-5 text-amber-400" />
-            <div>
-              <div className="text-sm font-semibold text-slate-100">波段策略 1.0</div>
-              <div className="text-[11px] text-slate-400">实时全A快照 + 最近日K + 本地历史库 · 约240日预热 · 不复用低吸规则</div>
-            </div>
+        <div className="flex items-center px-5 py-4 border-b fin-divider">
+          <Activity className="h-5 w-5 text-amber-400 shrink-0" />
+          <div className="flex-1 text-center px-2">
+            <div className="text-sm font-semibold text-slate-100">波段策略 1.0</div>
+            <div className="text-[11px] text-slate-400">实时全A快照 + 最近日K + 本地历史库 · 约240日预热 · 不复用低吸规则 · 剔除ST/退市</div>
           </div>
-          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white">
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-white/10 text-slate-400 hover:text-white shrink-0">
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -241,7 +319,9 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
                 {result.snapshotAsOf ? <> · 快照 <span className="text-slate-200">{result.snapshotAsOf}</span></> : null}
                 {result.scannedAt ? <> · 扫描 <span className="text-slate-200">{result.scannedAt}</span></> : null}
                 {' · '}
-                {result.gateBypassed ? (
+                {isBusyPlaceholder ? (
+                  <span className="text-amber-300">未开始(撞上进行中的扫描)</span>
+                ) : result.gateBypassed ? (
                   <span className="text-amber-300">临时开闸</span>
                 ) : result.gatePassed ? (
                   <span className="text-emerald-400">闸门通过</span>
@@ -254,7 +334,7 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
                 {typeof result.recentKCount === 'number' ? <> · 日K校验 <span className="text-slate-200">{result.recentKCount}</span></> : null}
               </span>
             ) : (
-              <span>数据口：实时全A快照 + 最近日K + 本地历史库；需要约240日数据预热，盘后约17:30可自动推送前5</span>
+              <span>数据口：实时全A快照 + 最近日K + 本地历史库；需要约240日数据预热，手动扫描(自动定时已关)；复盘依赖当天扫过一次</span>
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -304,7 +384,7 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/90 hover:bg-amber-500 text-white text-xs font-medium disabled:opacity-50"
             >
               {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-              <span>{loading ? '扫描中(约30-60秒)' : '重新扫描'}</span>
+              <span>{loading ? '扫描中(全市场5200只,约2-3分钟)' : '重新扫描'}</span>
             </button>
           </div>
         </div>
@@ -371,6 +451,7 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
                   key={it.code}
                   item={it}
                   inWatch={watchSet.has(it.code.toLowerCase())}
+                  inPaper={paperSet.has(it.code.toLowerCase())}
                   onAddToWatchlist={onAddToWatchlist}
                   onOpenStock={onOpenStock}
                   batchSelectMode={batchSelectMode}
@@ -394,6 +475,12 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
       strategyId="wave-v1"
       strategyName="波段策略 1.0"
       signalDate={result?.asOf}
+      onOpenStock={onOpenStock ? (symbol, name, price) => {
+        // 关掉复盘+波段两层弹窗,再开全屏四窗口(鱼身组合),视野干净
+        setShowNextDayReview(false);
+        onClose();
+        void onOpenStock(emptyStock(symbol, name, price));
+      } : undefined}
     />
     </>
   );

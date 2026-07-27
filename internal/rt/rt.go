@@ -9,30 +9,33 @@ import (
 )
 
 type (
-	emitFunc    = func(event string, data ...interface{})
-	onFunc      = func(event string, cb func(...interface{}))
-	logFunc     = func(msg string)
-	logfFunc    = func(format string, args ...interface{})
-	stringFunc  = func(s string)
-	simpleFunc  = func()
+	emitFunc   = func(event string, data ...interface{})
+	onFunc     = func(event string, cb func(...interface{}))
+	logFunc    = func(msg string)
+	logfFunc   = func(format string, args ...interface{})
+	stringFunc = func(s string)
+	simpleFunc = func()
 )
 
 var (
-	emit          emitFunc   = func(string, ...interface{}) {}
-	on            onFunc     = func(string, func(...interface{})) {}
-	off           stringFunc = func(string) {}
-	logInfof      logfFunc   = func(f string, a ...interface{}) { log.Printf("[INFO] "+f, a...) }
-	logInfo       logFunc    = func(m string) { log.Println("[INFO]", m) }
-	logError      logFunc    = func(m string) { log.Println("[ERROR]", m) }
-	logDebug      logFunc    = func(m string) { log.Println("[DEBUG]", m) }
-	logWarning    logFunc    = func(m string) { log.Println("[WARN]", m) }
-	browserOpen   stringFunc = func(string) {}
-	quit          simpleFunc = func() {}
-	windowMin     simpleFunc = func() {}
-	windowMax     simpleFunc = func() {}
-	windowReload  simpleFunc = func() {}
-	windowHide    simpleFunc = func() {}
-	windowShow    simpleFunc = func() {}
+	emit         emitFunc   = func(string, ...interface{}) {}
+	on           onFunc     = func(string, func(...interface{})) {}
+	off          stringFunc = func(string) {}
+	logInfof     logfFunc   = func(f string, a ...interface{}) { log.Printf("[INFO] "+f, a...) }
+	logInfo      logFunc    = func(m string) { log.Println("[INFO]", m) }
+	logError     logFunc    = func(m string) { log.Println("[ERROR]", m) }
+	logDebug     logFunc    = func(m string) { log.Println("[DEBUG]", m) }
+	logWarning   logFunc    = func(m string) { log.Println("[WARN]", m) }
+	browserOpen  stringFunc = func(string) {}
+	quit         simpleFunc = func() {}
+	windowMin    simpleFunc = func() {}
+	windowMax    simpleFunc = func() {}
+	windowFull   simpleFunc = func() {}
+	windowUnfull simpleFunc = func() {}
+	windowIsFull            = func() bool { return false }
+	windowReload simpleFunc = func() {}
+	windowHide   simpleFunc = func() {}
+	windowShow   simpleFunc = func() {}
 )
 
 // Wire 由桌面/headless 入口在启动时注入实现。传 nil 的保持默认。
@@ -49,6 +52,9 @@ type Impl struct {
 	Quit         simpleFunc
 	WindowMin    simpleFunc
 	WindowMax    simpleFunc
+	WindowFull   simpleFunc // 进入原生全屏(macOS 绿灯行为)
+	WindowUnfull simpleFunc // 退出全屏
+	WindowIsFull func() bool
 	WindowReload simpleFunc
 	WindowHide   simpleFunc
 	WindowShow   simpleFunc
@@ -91,6 +97,15 @@ func Wire(i Impl) {
 	if i.WindowMax != nil {
 		windowMax = i.WindowMax
 	}
+	if i.WindowFull != nil {
+		windowFull = i.WindowFull
+	}
+	if i.WindowUnfull != nil {
+		windowUnfull = i.WindowUnfull
+	}
+	if i.WindowIsFull != nil {
+		windowIsFull = i.WindowIsFull
+	}
 	if i.WindowReload != nil {
 		windowReload = i.WindowReload
 	}
@@ -102,9 +117,9 @@ func Wire(i Impl) {
 	}
 }
 
-func Emit(event string, data ...interface{}) { emit(event, data...) }
-func On(event string, cb func(...interface{})) { on(event, cb) }
-func Off(event string)                          { off(event) }
+func Emit(event string, data ...interface{})      { emit(event, data...) }
+func On(event string, cb func(...interface{}))    { on(event, cb) }
+func Off(event string)                            { off(event) }
 func LogInfof(format string, args ...interface{}) { logInfof(format, args...) }
 func LogInfo(msg string)                          { logInfo(msg) }
 func LogError(msg string)                         { logError(msg) }
@@ -114,6 +129,9 @@ func BrowserOpenURL(url string)                   { browserOpen(url) }
 func Quit()                                       { quit() }
 func WindowMinimise()                             { windowMin() }
 func WindowToggleMaximise()                       { windowMax() }
+func WindowFullscreen()                           { windowFull() }
+func WindowUnfullscreen()                         { windowUnfull() }
+func WindowIsFullscreen() bool                    { return windowIsFull() }
 func WindowReload()                               { windowReload() }
 func Hide()                                       { windowHide() }
 func Show()                                       { windowShow() }

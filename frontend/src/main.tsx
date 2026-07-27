@@ -83,6 +83,26 @@ const renderApp = () => {
     }
 }
 
+// 离线自愈:fallback(NAS 配了但启动时没连上)状态下,每 60s 用本地 Go 的 ReprobeBackend 重探 NAS。
+// 一旦 NAS 恢复(返回 remote)→更新横幅提示→短暂延迟后 reload,让 main 以 remote 重新装配远程桥接。
+// 只在 fallback 分支启动;probe 无副作用(NAS 仍挂则保持 fallback,下次再试)。
+function startFallbackSelfHeal() {
+    const timer = setInterval(async () => {
+        const app = (window as any).go?.main?.App
+        if (!app || typeof app.ReprobeBackend !== 'function') return
+        try {
+            const m = await app.ReprobeBackend()
+            if (m && m.mode === 'remote' && m.url) {
+                clearInterval(timer)
+                console.info('[selfheal] NAS 已恢复,重连中 →', m.url)
+                const bar = document.getElementById('jcp-offline-banner')
+                if (bar) bar.innerHTML = '<div style="text-align:center;width:100%;">✅ NAS 已恢复,正在重新连接…</div>'
+                setTimeout(() => window.location.reload(), 800)
+            }
+        } catch { /* 重探失败,下次再试 */ }
+    }, 60_000)
+}
+
 // 启动前先决定后端模式：探到 NAS 可达则装远程桥接(RPC/WS 改道 NAS)，否则用内置绑定。
 // 无论如何都要渲染，探测失败/超时一律回落本地。
 ;(async () => {
@@ -96,6 +116,10 @@ const renderApp = () => {
             // 访客(分发版)不显示技术性提示,避免困扰普通用户
             console.warn('[boot] 后端模式: fallback(NAS 未连接) →', backend.url)
             if (backend.token) showOfflineBanner(backend.url || '')
+            // 自愈:启动时 NAS 没起会一直卡本地旧数据。这里每 60s 悄悄重探一次,
+            // 一旦 NAS 恢复(ReprobeBackend 返回 remote,Go 端已置 remoteMode)→重载页面,
+            // main 会以 remote 干净装配远程桥接,无需手动重启 app。
+            startFallbackSelfHeal()
         } else {
             console.info('[boot] 后端模式: local')
         }

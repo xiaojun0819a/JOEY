@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { X, RefreshCw, Gavel, Plus, Check, ChevronDown, ChevronUp } from 'lucide-react';
-import { GetAuctionFinal, GetStockIntraday, GetStockFocusTicks } from '../../wailsjs/go/main/App';
+import { GetAuctionFinal, GetAuctionPicksG, GetAuctionPicksC, GetStockIntraday, GetStockFocusTicks } from '../../wailsjs/go/main/App';
 import { useTheme } from '../contexts/ThemeContext';
 import { useCandleColor } from '../contexts/CandleColorContext';
 import type { Stock } from '../types';
@@ -15,6 +15,9 @@ interface AuctionRow {
   amount: number;
   volumeRatio: number;
   floatMcap: number;
+  prevVolume?: number; // 昨日成交量(手),后端从日K补齐
+  matchG?: boolean;    // 命中「集合竞价稳健版选股公式 V2.1」(G),后端全市场评估
+  matchC?: boolean;    // 命中「集合竞价·温和放量高开选股 v2.0」(C),后端全市场评估
 }
 
 interface AuctionTick {
@@ -32,9 +35,24 @@ interface AuctionBoardDialogProps {
   onClose: () => void;
   watchlistSymbols: string[];
   onAddToWatchlist: (stock: Stock) => Promise<boolean>;
+  onOpenChart?: (symbol: string, name: string, preClose: number) => void; // 点名字进独立竞价大视图
 }
 
 const fmtYi = (v: number) => (v > 0 ? (v / 1e8).toFixed(2) : '--');
+
+// 好竞价结构判定(据《集合竞价》文档的看涨形态:一字锁死/资金抢筹/诱空洗盘/稳步吸筹)。
+// 注:文档形态靠竞价过程红绿柱演化,榜单只有 9:25 定型值,此处用"翻红+放量"最简代理;
+// 真正的形态识别(9:20后红柱放大/绿柱暴增)在点开的独立竞价视图里做。
+function auctionStructure(r: { pct: number; volumeRatio: number }): { good: boolean; tag: string; strong: boolean } {
+  if (r.pct >= 5 && r.volumeRatio >= 2) return { good: true, tag: '抢筹', strong: true };   // 资金抢筹/强势翻红放量
+  if (r.pct > 0.3 && r.volumeRatio >= 1.5) return { good: true, tag: '吸筹', strong: false }; // 稳步吸筹/温和翻红
+  return { good: false, tag: '', strong: false };
+}
+
+// 优选个股 =「集合竞价稳健版选股公式 V2.1」(G),16 条逐条由后端 GetAuctionPicksG 全市场精确评估
+// (适度高开1~4% + 竞价放量竞昨量比4~15% + 竞价额强 + 趋势向上 + 非高位 + 昨日不过热 + 良好承接 …)。
+// 榜单只有 9:25 定型值,无法在前端算日K技术面,故直接用后端标记的 matchG。
+
 
 const localDateStr = (d: Date) => {
   const p = (n: number) => String(n).padStart(2, '0');
@@ -110,7 +128,7 @@ const AuctionSparkline: React.FC<{ ticks: AuctionTick[]; up: string; down: strin
   );
 };
 
-export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, onClose, watchlistSymbols, onAddToWatchlist }) => {
+export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, onClose, watchlistSymbols, onAddToWatchlist, onOpenChart }) => {
   const { colors } = useTheme();
   const cc = useCandleColor();
   const [date, setDate] = useState<string>(() => localDateStr(new Date()));
@@ -121,6 +139,9 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
   const [ticks, setTicks] = useState<AuctionTick[]>([]);
   const [ticksLoading, setTicksLoading] = useState(false);
   const [added, setAdded] = useState<Record<string, boolean>>({});
+  const [filterMode, setFilterMode] = useState<'all' | 'good' | 'G' | 'C'>('all'); // 全部/好结构/优选G/优选C
+  const [picks, setPicks] = useState<{ G: AuctionRow[] | null; C: AuctionRow[] | null }>({ G: null, C: null }); // 全市场公式命中,懒加载
+  const [picksLoading, setPicksLoading] = useState(false);
 
   const load = useCallback(async (d: string, autoBack: boolean) => {
     if (!isWailsGoReady()) {
@@ -130,6 +151,7 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
     setLoading(true);
     setExpanded('');
     setTip('');
+    setPicks({ G: null, C: null }); // 换日重置公式命中缓存
     try {
       let cur = d;
       for (let back = 0; back <= (autoBack ? 6 : 0); back++) {
@@ -155,6 +177,26 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
     if (isOpen) load(localDateStr(new Date()), true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
+
+  // 切到"优选G/优选C"时按需全市场评估公式(候选常不在竞价额 Top100 内,故走专用全市场接口)
+  useEffect(() => {
+    if ((filterMode !== 'G' && filterMode !== 'C') || picks[filterMode] !== null || !date || !isWailsGoReady()) return;
+    const mode = filterMode;
+    let alive = true;
+    setPicksLoading(true);
+    (async () => {
+      try {
+        const fn = mode === 'G' ? GetAuctionPicksG : GetAuctionPicksC;
+        const list = (await fn(date)) as unknown as AuctionRow[] | null;
+        if (alive) setPicks(p => ({ ...p, [mode]: list || [] }));
+      } catch {
+        if (alive) setPicks(p => ({ ...p, [mode]: [] }));
+      } finally {
+        if (alive) setPicksLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [filterMode, picks, date]);
 
   const toggleExpand = async (code: string) => {
     if (expanded === code) {
@@ -214,6 +256,39 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
             <div className="text-[11px] opacity-60">9:25 撮合结果 · 按竞价金额排序 · 自建采集数据,点行展开竞价过程曲线</div>
           </div>
           <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={() => setFilterMode(m => m === 'good' ? 'all' : 'good')}
+              className={`rounded border px-2.5 py-1 text-xs font-medium transition-colors ${
+                filterMode === 'good'
+                  ? 'border-rose-400/70 text-rose-300 bg-rose-500/15'
+                  : colors.isDark ? 'border-slate-700 text-slate-400 hover:border-rose-400/50 hover:text-rose-300' : 'border-slate-300 text-slate-500 hover:border-rose-400/60'
+              }`}
+              title="好结构:翻红+放量(量比≥1.5)。看涨形态含一字锁死/资金抢筹/诱空洗盘/稳步吸筹;剔除竞价收绿、缩量的弱势票。"
+            >
+              好结构{filterMode === 'good' ? ' ✓' : ''}
+            </button>
+            <button
+              onClick={() => setFilterMode(m => m === 'G' ? 'all' : 'G')}
+              className={`rounded border px-2.5 py-1 text-xs font-medium transition-colors ${
+                filterMode === 'G'
+                  ? 'border-amber-400/70 text-amber-300 bg-amber-500/15'
+                  : colors.isDark ? 'border-slate-700 text-slate-400 hover:border-amber-400/50 hover:text-amber-300' : 'border-slate-300 text-slate-500 hover:border-amber-400/60'
+              }`}
+              title="优选G(集合竞价稳健版 V2.1):适度高开1~4% + 竞价放量(竞昨量比4~15%) + 竞价额强 + 昨额≥2亿 + 趋势向上(站上20线/5≥10/20线上行) + 非高位 + 昨日不过热 + 良好承接。16条全市场精确筛,极严,常空仓。"
+            >
+              优选G{filterMode === 'G' ? ' ✓' : ''}
+            </button>
+            <button
+              onClick={() => setFilterMode(m => m === 'C' ? 'all' : 'C')}
+              className={`rounded border px-2.5 py-1 text-xs font-medium transition-colors ${
+                filterMode === 'C'
+                  ? 'border-sky-400/70 text-sky-300 bg-sky-500/15'
+                  : colors.isDark ? 'border-slate-700 text-slate-400 hover:border-sky-400/50 hover:text-sky-300' : 'border-slate-300 text-slate-500 hover:border-sky-400/60'
+              }`}
+              title="优选C(集合竞价·温和放量高开 v2.0):温和高开0.5~3% + 竞价量≥前5日均量8% + 换手≥0.15% + 竞价额>500万 + 昨日未涨停/跌停 + 10日涨幅<25% + 站上20日线 + 非次新/非ST/非北交。全市场精确筛。"
+            >
+              优选C{filterMode === 'C' ? ' ✓' : ''}
+            </button>
             <input
               type="date"
               value={date}
@@ -233,9 +308,29 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
         {/* 内容 */}
         <div className="flex-1 overflow-y-auto px-3 py-2">
           {tip && <div className="text-xs text-amber-400/90 px-2 py-1.5">{tip}</div>}
-          {loading && rows.length === 0 && <div className="py-16 text-center text-sm opacity-60">加载中...</div>}
-          {!loading && rows.length === 0 && !tip && <div className="py-16 text-center text-sm opacity-60">暂无数据</div>}
-          {rows.length > 0 && (
+          {(filterMode === 'G' || filterMode === 'C') && picksLoading && (
+            <div className="py-16 text-center text-sm opacity-60">
+              全市场评估{filterMode === 'G' ? '「集合竞价稳健版 V2.1」' : '「集合竞价·温和放量高开 v2.0」'}中...
+            </div>
+          )}
+          {(filterMode === 'G' || filterMode === 'C') && !picksLoading && picks[filterMode] !== null && picks[filterMode]!.length === 0 && (
+            <div className="py-16 text-center text-sm opacity-60">
+              当日全市场无个股满足优选{filterMode}全部条件<br />
+              <span className="text-xs opacity-70">
+                {filterMode === 'G'
+                  ? '该公式极严(竞价放量4~15%∩温和高开1~4%∩趋势健康),空仓属正常'
+                  : '该公式要求竞价量≥前5日均量8%且温和高开,空仓属正常'}
+              </span>
+            </div>
+          )}
+          {filterMode !== 'G' && filterMode !== 'C' && loading && rows.length === 0 && <div className="py-16 text-center text-sm opacity-60">加载中...</div>}
+          {filterMode !== 'G' && filterMode !== 'C' && !loading && rows.length === 0 && !tip && <div className="py-16 text-center text-sm opacity-60">暂无数据</div>}
+          {(() => {
+            const displayRows = filterMode === 'good' ? rows.filter(r => auctionStructure(r).good)
+              : filterMode === 'G' ? (picks.G || [])
+              : filterMode === 'C' ? (picks.C || [])
+              : rows;
+            return displayRows.length > 0 && (
             <table className="w-full text-xs">
               <thead>
                 <tr className="opacity-60 text-left">
@@ -251,9 +346,11 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r, i) => {
+                {displayRows.map((r, i) => {
                   const inWatch = added[r.stockCode] || watchlistSymbols.includes(r.stockCode);
                   const isOpenRow = expanded === r.stockCode;
+                  const struct = auctionStructure(r);
+                  const preferred = !!r.matchG || !!r.matchC;
                   return (
                     <React.Fragment key={r.stockCode}>
                       <tr
@@ -262,7 +359,28 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
                       >
                         <td className="px-2 py-1.5 opacity-50">{i + 1}</td>
                         <td className="px-2 py-1.5">
-                          <span className="font-medium">{r.name}</span>
+                          <button
+                            type="button"
+                            className="font-medium hover:underline hover:text-accent-2 text-left"
+                            onClick={e => {
+                              e.stopPropagation();
+                              const pc = Math.abs(100 + r.pct) > 0.001 ? r.price / (1 + r.pct / 100) : 0;
+                              onOpenChart?.(r.stockCode, r.name, pc);
+                            }}
+                            title="打开独立集合竞价大视图"
+                          >
+                            {r.name}
+                          </button>
+                          {struct.good && (
+                            <span className={`ml-1.5 rounded px-1 py-0.5 text-[10px] font-medium ${struct.strong ? 'bg-rose-500/20 text-rose-300' : 'bg-amber-500/20 text-amber-300'}`}>
+                              {struct.tag}
+                            </span>
+                          )}
+                          {preferred && (
+                            <span className={`ml-1 rounded px-1 py-0.5 text-[10px] font-medium ${r.matchG ? 'bg-amber-500/20 text-amber-300' : 'bg-sky-500/20 text-sky-300'}`} title={r.matchG ? '命中集合竞价稳健版 V2.1(G)' : '命中集合竞价·温和放量高开 v2.0(C)'}>
+                              优选{r.matchG ? 'G' : 'C'}
+                            </span>
+                          )}
                           <span className="ml-1.5 opacity-50">{r.stockCode}</span>
                         </td>
                         <td className={`px-2 py-1.5 text-right font-mono ${pctClass(r.pct)}`}>{r.price.toFixed(2)}</td>
@@ -297,7 +415,8 @@ export const AuctionBoardDialog: React.FC<AuctionBoardDialogProps> = ({ isOpen, 
                 })}
               </tbody>
             </table>
-          )}
+            );
+          })()}
         </div>
       </div>
     </div>

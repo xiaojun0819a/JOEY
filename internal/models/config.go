@@ -73,30 +73,30 @@ type MCPServerConfig struct {
 
 // AppConfig 应用配置
 type AppConfig struct {
-	Theme               string              `json:"theme"`           // 主题色: military, ocean, purple, orange, dark
-	CandleColorMode     string              `json:"candleColorMode"` // 涨跌颜色模式: red-up(红涨绿跌) / green-up(绿涨红跌)
-	AIConfigs           []AIConfig          `json:"aiConfigs"`
-	DefaultAIID         string              `json:"defaultAiId"`
-	StrategyAIID        string              `json:"strategyAiId"`  // 策略生成用AI
-	ModeratorAIID       string              `json:"moderatorAiId"` // 意图分析(小韭菜)用AI
-	AIRetryCount        int                 `json:"aiRetryCount"`
-	VerboseAgentIO      bool                `json:"verboseAgentIO"`
-	AgentSelectionStyle AgentSelectionStyle `json:"agentSelectionStyle"`
-	EnableSecondReview  bool                `json:"enableSecondReview"`
-	MCPServers          []MCPServerConfig   `json:"mcpServers"` // MCP服务器配置列表
-	Memory              MemoryConfig        `json:"memory"`     // 记忆管理配置
-	Proxy               ProxyConfig         `json:"proxy"`      // 代理配置
-	Layout              LayoutConfig        `json:"layout"`     // 界面布局配置
-	OpenClaw            OpenClawConfig      `json:"openClaw"`   // OpenClaw 服务配置
-	Indicators          IndicatorConfig     `json:"indicators"` // 技术指标配置
-	History             HistoryConfig       `json:"history"`     // 历史数据采集配置
-	Push                PushConfig          `json:"push"`        // 信号推送配置
-	TailForward         TailForwardConfig   `json:"tailForward"`      // 2:30 实盘向前验证配置
-	RemoteBackendURL       string           `json:"remoteBackendUrl"`       // 远程后端(NAS)内网地址,如 http://192.168.1.4:8810。非空且可达则桌面进"瘦身模式",前端路由到 NAS;空=本地全量
-	RemoteBackendPublicURL string           `json:"remoteBackendPublicUrl"` // 公网地址(Cloudflare 隧道,如 https://jcp.junai.uk)。内网探测失败时尝试,在外也能连 NAS
-	RemoteBackendToken     string           `json:"remoteBackendToken"`     // 访问令牌,与 NAS 的 JCP_TOKEN 一致;公网暴露必须设置
-	RemoteUsers            []RemoteUser     `json:"remoteUsers"`            // 访客账号(分发给他人的 app 用账号密码登录,权限受限)
-	RegisterInviteCode     string           `json:"registerInviteCode"`     // 自助注册邀请码;空=开放注册,非空则 Register 必须携带一致的邀请码
+	Theme                  string              `json:"theme"`           // 主题色: military, ocean, purple, orange, dark
+	CandleColorMode        string              `json:"candleColorMode"` // 涨跌颜色模式: red-up(红涨绿跌) / green-up(绿涨红跌)
+	AIConfigs              []AIConfig          `json:"aiConfigs"`
+	DefaultAIID            string              `json:"defaultAiId"`
+	StrategyAIID           string              `json:"strategyAiId"`  // 策略生成用AI
+	ModeratorAIID          string              `json:"moderatorAiId"` // 意图分析(小韭菜)用AI
+	AIRetryCount           int                 `json:"aiRetryCount"`
+	VerboseAgentIO         bool                `json:"verboseAgentIO"`
+	AgentSelectionStyle    AgentSelectionStyle `json:"agentSelectionStyle"`
+	EnableSecondReview     bool                `json:"enableSecondReview"`
+	MCPServers             []MCPServerConfig   `json:"mcpServers"`             // MCP服务器配置列表
+	Memory                 MemoryConfig        `json:"memory"`                 // 记忆管理配置
+	Proxy                  ProxyConfig         `json:"proxy"`                  // 代理配置
+	Layout                 LayoutConfig        `json:"layout"`                 // 界面布局配置
+	OpenClaw               OpenClawConfig      `json:"openClaw"`               // OpenClaw 服务配置
+	Indicators             IndicatorConfig     `json:"indicators"`             // 技术指标配置
+	History                HistoryConfig       `json:"history"`                // 历史数据采集配置
+	Push                   PushConfig          `json:"push"`                   // 信号推送配置
+	TailForward            TailForwardConfig   `json:"tailForward"`            // 2:30 实盘向前验证配置
+	RemoteBackendURL       string              `json:"remoteBackendUrl"`       // 远程后端(NAS)内网地址,如 http://192.168.1.4:8810。非空且可达则桌面进"瘦身模式",前端路由到 NAS;空=本地全量
+	RemoteBackendPublicURL string              `json:"remoteBackendPublicUrl"` // 公网地址(Cloudflare 隧道,如 https://jcp.junai.uk)。内网探测失败时尝试,在外也能连 NAS
+	RemoteBackendToken     string              `json:"remoteBackendToken"`     // 访问令牌,与 NAS 的 JCP_TOKEN 一致;公网暴露必须设置
+	RemoteUsers            []RemoteUser        `json:"remoteUsers"`            // 访客账号(分发给他人的 app 用账号密码登录,权限受限)
+	RegisterInviteCode     string              `json:"registerInviteCode"`     // 自助注册邀请码;空=开放注册,非空则 Register 必须携带一致的邀请码
 }
 
 // RemoteUser 远程访客账号(密码存 SHA256 十六进制)
@@ -108,8 +108,10 @@ type RemoteUser struct {
 
 // TailForwardConfig 2:30 实盘向前验证（尾盘买点闭环）配置
 type TailForwardConfig struct {
-	Enabled bool `json:"enabled"` // 2:30 定时扫描总开关
+	Enabled bool `json:"enabled"` // 2:50 定时扫描总开关
 	Auto    bool `json:"auto"`    // true=自动记入模拟持仓；false=仅出候选清单待确认
+	// LastFiredDate 当天已触发标记(持久化):防止重启后的"当天补跑"重扫一遍、二次写留痕污染复盘(2026-07-21)。
+	LastFiredDate string `json:"lastFiredDate,omitempty"`
 }
 
 // PushConfig 信号推送配置（支持 Bark / Telegram / 飞书 / 企业微信）

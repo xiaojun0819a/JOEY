@@ -103,11 +103,12 @@ export const themes: Record<ThemeType, ThemeColors> = {
   dark: {
     name: '暗夜黑',
     isDark: true,
-    bg0: '#09090b',
-    bg1: '#18181b',
-    panel: 'rgba(24, 24, 27, 0.72)',
-    panelStrong: 'rgba(24, 24, 27, 0.92)',
-    panelSoft: 'rgba(24, 24, 27, 0.56)',
+    // 纯黑基调,与K线/分时图表底色(#000000)完全一致;面板留极轻灰阶保住卡片层次
+    bg0: '#000000',
+    bg1: '#0a0a0c',
+    panel: 'rgba(10, 10, 12, 0.72)',
+    panelStrong: 'rgba(10, 10, 12, 0.92)',
+    panelSoft: 'rgba(10, 10, 12, 0.56)',
     stroke: 'rgba(161, 161, 170, 0.18)',
     strokeStrong: 'rgba(161, 161, 170, 0.28)',
     text0: '#fafafa',

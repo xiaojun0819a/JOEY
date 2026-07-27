@@ -67,6 +67,8 @@ type MarketDataPusher struct {
 	klineSub      KLineSubscription
 	klineSubMu    sync.RWMutex
 	lastKLineTime int64 // 最后一根K线的时间戳，用于增量推送
+	// K线加工钩子(App 注入):补换手率等,保证推送与 App.GetKLineData 同口径
+	klineEnrich func(code, period string, data []models.KLineData) []models.KLineData
 
 	// 快讯缓存（用于检测新快讯）
 	lastTelegraphContent string
@@ -95,6 +97,23 @@ func NewMarketDataPusher(marketService *MarketService, configService *ConfigServ
 		stopChan:        make(chan struct{}),
 		readyChan:       make(chan struct{}),
 	}
+}
+
+// SetKLineEnricher 注入K线加工(换手率补齐等)。推送与 App.GetKLineData 必须同一口径——
+// 否则推送来的数组会把前端已补好的换手率整体覆盖掉,表现为 tooltip 换手周期性变 --。
+func (p *MarketDataPusher) SetKLineEnricher(fn func(code, period string, data []models.KLineData) []models.KLineData) {
+	if p == nil {
+		return
+	}
+	p.klineEnrich = fn
+}
+
+// enrichKLine 应用注入的加工(未注入时原样返回)。
+func (p *MarketDataPusher) enrichKLine(code, period string, data []models.KLineData) []models.KLineData {
+	if p == nil || p.klineEnrich == nil {
+		return data
+	}
+	return p.klineEnrich(code, period, data)
 }
 
 // Start 启动推送服务
@@ -424,6 +443,7 @@ func (p *MarketDataPusher) pushKLineData() {
 	if err != nil {
 		return
 	}
+	klines = p.enrichKLine(sub.Code, sub.Period, klines)
 
 	rt.Emit(EventKLineUpdate, map[string]any{
 		"code":   sub.Code,
@@ -516,6 +536,7 @@ func (p *MarketDataPusher) pushKLineDay() {
 	if err != nil {
 		return
 	}
+	klines = p.enrichKLine(sub.Code, sub.Period, klines)
 
 	rt.Emit(EventKLineUpdate, map[string]any{
 		"code":   sub.Code,

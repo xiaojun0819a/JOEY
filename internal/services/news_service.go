@@ -128,13 +128,13 @@ func (s *NewsService) GetTelegraphList() ([]Telegraph, error) {
 
 // cardMapSignal 对应 aicardmap /api/jcp-signals 返回的单条信号。
 type cardMapSignal struct {
-	NodeName string `json:"nodeName"`
-	Category string `json:"category"`
+	NodeName  string `json:"nodeName"`
+	Category  string `json:"category"`
 	Direction string `json:"direction"`
-	Tighten  int    `json:"tighten"`
-	Loosen   int    `json:"loosen"`
-	Count    int    `json:"count"`
-	Stocks   []struct {
+	Tighten   int    `json:"tighten"`
+	Loosen    int    `json:"loosen"`
+	Count     int    `json:"count"`
+	Stocks    []struct {
 		Name   string `json:"name"`
 		Ticker string `json:"ticker"`
 		Role   string `json:"role"`

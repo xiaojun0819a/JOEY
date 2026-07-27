@@ -31,16 +31,16 @@ type SectorMove struct {
 
 // MarketMood 市场情绪面快照
 type MarketMood struct {
-	Date         string       `json:"date"`         // 涨跌分布对应日期
-	UpCount      int          `json:"upCount"`      // 上涨家数
-	DownCount    int          `json:"downCount"`    // 下跌家数
-	FlatCount    int          `json:"flatCount"`    // 平盘家数
-	StrongCount  int          `json:"strongCount"`  // 涨幅≥7%家数(近涨停梯队)
-	WeakCount    int          `json:"weakCount"`    // 跌幅≤-7%家数
-	MarginTrend  []MarginDay  `json:"marginTrend"`  // 近5个交易日两融余额(旧→新)
-	TopSectors   []SectorMove `json:"topSectors"`   // 行业板块涨幅前5
+	Date          string       `json:"date"`          // 涨跌分布对应日期
+	UpCount       int          `json:"upCount"`       // 上涨家数
+	DownCount     int          `json:"downCount"`     // 下跌家数
+	FlatCount     int          `json:"flatCount"`     // 平盘家数
+	StrongCount   int          `json:"strongCount"`   // 涨幅≥7%家数(近涨停梯队)
+	WeakCount     int          `json:"weakCount"`     // 跌幅≤-7%家数
+	MarginTrend   []MarginDay  `json:"marginTrend"`   // 近5个交易日两融余额(旧→新)
+	TopSectors    []SectorMove `json:"topSectors"`    // 行业板块涨幅前5
 	BottomSectors []SectorMove `json:"bottomSectors"` // 行业板块跌幅前5
-	FetchedAt    string       `json:"fetchedAt"`
+	FetchedAt     string       `json:"fetchedAt"`
 }
 
 // MarketMoodService 市场情绪面(东财开放接口:涨跌分布/两融/行业板块)

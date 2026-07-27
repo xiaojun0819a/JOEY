@@ -206,8 +206,11 @@ func (ms *MarketService) GetStockDataWithOrderBook(codes ...string) ([]StockWith
 		return nil, err
 	}
 
-	// 更新缓存
+	// 更新缓存(限容防涨,理由同 klineCache)
 	ms.cacheMu.Lock()
+	if len(ms.cache) > 800 {
+		ms.cache = make(map[string]*stockCache, 64)
+	}
 	ms.cache[cacheKey] = &stockCache{
 		data:      data,
 		timestamp: time.Now(),
@@ -303,7 +306,10 @@ func (ms *MarketService) parseStockFields(code string, parts []string) models.St
 	high, _ := strconv.ParseFloat(parts[4], 64)
 	low, _ := strconv.ParseFloat(parts[5], 64)
 	preClose, _ := strconv.ParseFloat(parts[2], 64)
-	volume, _ := strconv.ParseInt(parts[8], 10, 64)
+	// 新浪成交量单位是"股",统一成"手"(与 TDX 主源的 TotalHand、以及本函数下方盘口 /100 口径一致),
+	// 避免 TDX 存活时显示手、回退新浪时显示股导致同一字段相差 100 倍。
+	volumeShares, _ := strconv.ParseInt(parts[8], 10, 64)
+	volume := volumeShares / 100
 	amount, _ := strconv.ParseFloat(parts[9], 64)
 
 	change := price - preClose
@@ -431,8 +437,12 @@ func (ms *MarketService) GetKLineData(code string, period string, days int) ([]m
 		return nil, err
 	}
 
-	// 更新缓存
+	// 更新缓存。⚠️必须限容:TTL 只在读取时判断、从不驱逐,全市场重建/扫描会灌入几千只K线,
+	// 曾把进程吃到 2GB 被内核 OOM 杀掉(NAS 仅 3.7GB 内存)。超限直接全清,TTL 本来只有 30s,清了无伤。
 	ms.klineCacheMu.Lock()
+	if len(ms.klineCache) > 2000 {
+		ms.klineCache = make(map[string]*klineCache, 256)
+	}
 	ms.klineCache[cacheKey] = &klineCache{
 		data:      klines,
 		timestamp: time.Now(),
@@ -514,7 +524,7 @@ func (ms *MarketService) fetchTimeShareFromTencent(code string) ([]models.KLineD
 	}
 	// 先解析成 (HH:MM, 价, 累计量, 累计额)
 	type mp struct {
-		hhmm             string
+		hhmm              string
 		price, cVol, cAmt float64
 	}
 	pts := make([]mp, 0, len(node.Data.Data))
@@ -559,8 +569,8 @@ func (ms *MarketService) fetchTimeShareFromTencent(code string) ([]models.KLineD
 		}
 		prevVol, prevAmt = p.cVol, p.cAmt
 		klines = append(klines, models.KLineData{
-			Time:   date + " " + p.hhmm[:2] + ":" + p.hhmm[2:] + ":00",
-			Open:   p.price, High: p.price, Low: p.price, Close: p.price,
+			Time: date + " " + p.hhmm[:2] + ":" + p.hhmm[2:] + ":00",
+			Open: p.price, High: p.price, Low: p.price, Close: p.price,
 			Volume: int64(incVol), Amount: incAmt,
 		})
 	}
@@ -1263,6 +1273,9 @@ type ScanSnapshotRow struct {
 	Name               string
 	Price              float64
 	ChangePercent      float64
+	Open               float64 // 今开(东财f17/腾讯[5]);竞价时段或停牌为0
+	High               float64 // 最高(东财f15/腾讯[33]);同上
+	Low                float64 // 最低(东财f16/腾讯[34]);同上
 	Volume             float64 // 成交量(手);竞价时段=匹配量
 	Amount             float64
 	TurnoverRate       float64
@@ -1331,7 +1344,7 @@ func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) 
 		params.Set("pn", strconv.Itoa(page))
 		params.Set("pz", strconv.Itoa(pageSize))
 		params.Set("fs", fs)
-		params.Set("fields", "f12,f14,f2,f3,f5,f6,f8,f10,f20,f21,f62,f184,f124,f13")
+		params.Set("fields", "f12,f14,f2,f3,f5,f6,f8,f10,f15,f16,f17,f20,f21,f62,f184,f124,f13")
 		params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
 
 		raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
@@ -1372,6 +1385,9 @@ func (ms *MarketService) getAllAStockSnapshotFromEastmoney(includeBeijing bool) 
 				Name:               name,
 				Price:              toFloat64Any(row["f2"]),
 				ChangePercent:      toFloat64Any(row["f3"]),
+				Open:               toFloat64Any(row["f17"]),
+				High:               toFloat64Any(row["f15"]),
+				Low:                toFloat64Any(row["f16"]),
 				Volume:             toFloat64Any(row["f5"]),
 				Amount:             toFloat64Any(row["f6"]),
 				TurnoverRate:       toFloat64Any(row["f8"]),
@@ -1404,136 +1420,182 @@ func (ms *MarketService) getAllAStockSnapshotFromTencent(includeBeijing bool) ([
 
 	// 腾讯接口单次 URL 过长会失败，这里做小批量。
 	const batchSize = 60
-	items := make([]ScanSnapshotRow, 0, len(catalog))
 	nowText := time.Now().Format("2006-01-02 15:04:05")
 
-	for i := 0; i < len(catalog); i += batchSize {
-		end := i + batchSize
-		if end > len(catalog) {
-			end = len(catalog)
-		}
-		chunk := catalog[i:end]
-		symbols := make([]string, 0, len(chunk))
-		meta := make(map[string]embeddedStockMeta, len(chunk))
-		for _, item := range chunk {
-			symbols = append(symbols, item.Symbol)
-			meta[item.Symbol] = item
-		}
-
-		qURL := "https://qt.gtimg.cn/q=" + strings.Join(symbols, ",")
-		req, reqErr := http.NewRequest("GET", qURL, nil)
-		if reqErr != nil {
-			return nil, reqErr
-		}
-		req.Header.Set("Referer", "https://gu.qq.com/")
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-		resp, doErr := ms.client.Do(req)
-		if doErr != nil {
-			return nil, doErr
-		}
-		reader := transform.NewReader(resp.Body, simplifiedchinese.GBK.NewDecoder())
-		body, readErr := io.ReadAll(reader)
-		resp.Body.Close()
-		if readErr != nil {
-			return nil, readErr
-		}
-
-		// 同批次追加腾讯盘口买卖比数据（作为主力代理分数）
-		pkURL := "https://qt.gtimg.cn/q=" + buildTencentPKSymbols(symbols)
-		pkReq, pkReqErr := http.NewRequest("GET", pkURL, nil)
-		if pkReqErr != nil {
-			return nil, pkReqErr
-		}
-		pkReq.Header.Set("Referer", "https://gu.qq.com/")
-		pkReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-		pkResp, pkDoErr := ms.client.Do(pkReq)
-		if pkDoErr != nil {
-			return nil, pkDoErr
-		}
-		pkReader := transform.NewReader(pkResp.Body, simplifiedchinese.GBK.NewDecoder())
-		pkBody, pkReadErr := io.ReadAll(pkReader)
-		pkResp.Body.Close()
-		if pkReadErr != nil {
-			return nil, pkReadErr
-		}
-		pkScore := parseTencentPKScoreMap(string(pkBody))
-
-		lines := strings.Split(string(body), ";")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "v_") || !strings.Contains(line, "=\"") {
-				continue
+	// 全A 5000+ 只 → 87 批,每批 2 次 HTTP(行情+盘口) = 174 次请求。串行发要 5-15 分钟,
+	// 会把整个波段扫描堵在"取快照"这一步(日志连预热都打不出来,前端只看到永远转圈)。
+	// 并发 8 路发批次:纯网络等待,与限流无关的耗时能重叠掉。
+	// 结果按批次下标写回,保证顺序与串行版完全一致(扫描结果不能随并发抖动)。
+	batchCount := (len(catalog) + batchSize - 1) / batchSize
+	batchItems := make([][]ScanSnapshotRow, batchCount)
+	batchErrs := make([]error, batchCount)
+	var snapWG sync.WaitGroup
+	snapSem := make(chan struct{}, 8)
+	for bi := 0; bi < batchCount; bi++ {
+		snapWG.Add(1)
+		go func(bi int) {
+			defer snapWG.Done()
+			snapSem <- struct{}{}
+			defer func() { <-snapSem }()
+			i := bi * batchSize
+			end := i + batchSize
+			if end > len(catalog) {
+				end = len(catalog)
 			}
-			lhsRhs := strings.SplitN(line, "=\"", 2)
-			if len(lhsRhs) != 2 {
-				continue
-			}
-			symbol := strings.TrimPrefix(lhsRhs[0], "v_")
-			payload := strings.TrimSuffix(lhsRhs[1], "\"")
-			if payload == "" {
-				continue
-			}
-			fields := strings.Split(payload, "~")
-			// 关键字段按公开索引：3现价, 32涨跌幅, 37成交额(万), 38换手率, 44/45市值, 49量比
-			if len(fields) < 50 {
-				continue
+			items := make([]ScanSnapshotRow, 0, batchSize)
+			setErr := func(err error) { batchErrs[bi] = err }
+			defer func() { batchItems[bi] = items }()
+			chunk := catalog[i:end]
+			symbols := make([]string, 0, len(chunk))
+			meta := make(map[string]embeddedStockMeta, len(chunk))
+			for _, item := range chunk {
+				symbols = append(symbols, item.Symbol)
+				meta[item.Symbol] = item
 			}
 
-			price := parseFloat64Safe(fields[3])
-			changePct := parseFloat64Safe(fields[32])
-			amountWan := parseFloat64Safe(fields[37])
-			turnover := parseFloat64Safe(fields[38])
-			mcap44 := parseFloat64Safe(fields[44])
-			mcap45 := parseFloat64Safe(fields[45])
-			volumeRatio := parseFloat64Safe(fields[49])
+			qURL := "https://qt.gtimg.cn/q=" + strings.Join(symbols, ",")
+			req, reqErr := http.NewRequest("GET", qURL, nil)
+			if reqErr != nil {
+				setErr(reqErr)
+				return
+			}
+			req.Header.Set("Referer", "https://gu.qq.com/")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-			// 兼容索引口径差异：总市值一般 >= 流通市值
-			totalCapYi := math.Max(mcap44, mcap45)
-			floatCapYi := math.Min(mcap44, mcap45)
-			if totalCapYi <= 0 {
-				continue
+			resp, doErr := ms.client.Do(req)
+			if doErr != nil {
+				setErr(doErr)
+				return
 			}
-			if floatCapYi <= 0 {
-				floatCapYi = totalCapYi
-			}
-
-			m := meta[symbol]
-			name := fields[1]
-			if strings.TrimSpace(name) == "" {
-				name = m.Name
-			}
-			mainNetProxy := math.NaN()
-			mainRatioProxy := math.NaN()
-			mainFlowSource := ""
-			if score, ok := pkScore[symbol]; ok {
-				mainRatioProxy = score
-				// 映射到近似“主力净流入额”代理量，便于前端展示非空
-				mainNetProxy = (score / 100.0) * amountWan * 10000
-				mainFlowSource = "tencent-pk-proxy"
+			reader := transform.NewReader(resp.Body, simplifiedchinese.GBK.NewDecoder())
+			body, readErr := io.ReadAll(reader)
+			resp.Body.Close()
+			if readErr != nil {
+				setErr(readErr)
+				return
 			}
 
-			items = append(items, ScanSnapshotRow{
-				Symbol:             symbol,
-				Name:               name,
-				Price:              price,
-				ChangePercent:      changePct,
-				Amount:             amountWan * 10000, // 万元 -> 元
-				TurnoverRate:       turnover,
-				VolumeRatio:        volumeRatio,
-				TotalMarketCap:     totalCapYi * 1e8, // 亿 -> 元
-				FloatMarketCap:     floatCapYi * 1e8, // 亿 -> 元
-				Industry:           m.Industry,
-				IsST:               isSTName(name),
-				MainNetInflow:      mainNetProxy,
-				MainNetInflowRatio: mainRatioProxy,
-				MainFlowSource:     mainFlowSource,
-				UpdateTime:         nowText,
-			})
+			// 同批次追加腾讯盘口买卖比数据（作为主力代理分数）
+			pkURL := "https://qt.gtimg.cn/q=" + buildTencentPKSymbols(symbols)
+			pkReq, pkReqErr := http.NewRequest("GET", pkURL, nil)
+			if pkReqErr != nil {
+				setErr(pkReqErr)
+				return
+			}
+			pkReq.Header.Set("Referer", "https://gu.qq.com/")
+			pkReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+			pkResp, pkDoErr := ms.client.Do(pkReq)
+			if pkDoErr != nil {
+				setErr(pkDoErr)
+				return
+			}
+			pkReader := transform.NewReader(pkResp.Body, simplifiedchinese.GBK.NewDecoder())
+			pkBody, pkReadErr := io.ReadAll(pkReader)
+			pkResp.Body.Close()
+			if pkReadErr != nil {
+				setErr(pkReadErr)
+				return
+			}
+			pkScore := parseTencentPKScoreMap(string(pkBody))
+
+			lines := strings.Split(string(body), ";")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if !strings.HasPrefix(line, "v_") || !strings.Contains(line, "=\"") {
+					continue
+				}
+				lhsRhs := strings.SplitN(line, "=\"", 2)
+				if len(lhsRhs) != 2 {
+					continue
+				}
+				symbol := strings.TrimPrefix(lhsRhs[0], "v_")
+				payload := strings.TrimSuffix(lhsRhs[1], "\"")
+				if payload == "" {
+					continue
+				}
+				fields := strings.Split(payload, "~")
+				// 关键字段按公开索引：3现价, 32涨跌幅, 37成交额(万), 38换手率, 44/45市值, 49量比
+				if len(fields) < 50 {
+					continue
+				}
+
+				price := parseFloat64Safe(fields[3])
+				openPx := parseFloat64Safe(fields[5])   // 今开
+				highPx := parseFloat64Safe(fields[33])  // 最高
+				lowPx := parseFloat64Safe(fields[34])   // 最低
+				changePct := parseFloat64Safe(fields[32])
+				amountWan := parseFloat64Safe(fields[37])
+				turnover := parseFloat64Safe(fields[38])
+				mcap44 := parseFloat64Safe(fields[44])
+				mcap45 := parseFloat64Safe(fields[45])
+				volumeRatio := parseFloat64Safe(fields[49])
+
+				// 兼容索引口径差异：总市值一般 >= 流通市值
+				totalCapYi := math.Max(mcap44, mcap45)
+				floatCapYi := math.Min(mcap44, mcap45)
+				if totalCapYi <= 0 {
+					continue
+				}
+				if floatCapYi <= 0 {
+					floatCapYi = totalCapYi
+				}
+
+				m := meta[symbol]
+				name := fields[1]
+				if strings.TrimSpace(name) == "" {
+					name = m.Name
+				}
+				mainNetProxy := math.NaN()
+				mainRatioProxy := math.NaN()
+				mainFlowSource := ""
+				if score, ok := pkScore[symbol]; ok {
+					mainRatioProxy = score
+					// 映射到近似“主力净流入额”代理量，便于前端展示非空
+					mainNetProxy = (score / 100.0) * amountWan * 10000
+					mainFlowSource = "tencent-pk-proxy"
+				}
+
+				items = append(items, ScanSnapshotRow{
+					Symbol:             symbol,
+					Name:               name,
+					Price:              price,
+					ChangePercent:      changePct,
+					Open:               openPx,
+					High:               highPx,
+					Low:                lowPx,
+					Amount:             amountWan * 10000, // 万元 -> 元
+					TurnoverRate:       turnover,
+					VolumeRatio:        volumeRatio,
+					TotalMarketCap:     totalCapYi * 1e8, // 亿 -> 元
+					FloatMarketCap:     floatCapYi * 1e8, // 亿 -> 元
+					Industry:           m.Industry,
+					IsST:               isSTName(name),
+					MainNetInflow:      mainNetProxy,
+					MainNetInflowRatio: mainRatioProxy,
+					MainFlowSource:     mainFlowSource,
+					UpdateTime:         nowText,
+				})
+			}
+		}(bi)
+	}
+	snapWG.Wait()
+
+	items := make([]ScanSnapshotRow, 0, len(catalog))
+	var firstErr error
+	for bi := range batchItems {
+		items = append(items, batchItems[bi]...)
+		if firstErr == nil && batchErrs[bi] != nil {
+			firstErr = batchErrs[bi]
 		}
 	}
 	if len(items) == 0 {
+		if firstErr != nil {
+			return nil, fmt.Errorf("腾讯快照回退失败：%v", firstErr)
+		}
 		return nil, fmt.Errorf("腾讯快照回退失败：返回为空")
+	}
+	if firstErr != nil {
+		log.Warn("腾讯全A快照部分批次失败(已用成功部分 %d 只): %v", len(items), firstErr)
 	}
 	return items, nil
 }

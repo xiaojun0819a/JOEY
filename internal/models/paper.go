@@ -2,22 +2,26 @@ package models
 
 // PaperPosition 模拟持仓（纸上交易，用于验证各筛选系统胜率）
 type PaperPosition struct {
-	ID         int64   `json:"id"`
-	Symbol     string  `json:"symbol"`
-	Name       string  `json:"name"`
-	Source     string  `json:"source"` // lowbuy/wave/latechase/manual
-	CostPrice  float64 `json:"costPrice"`
-	Shares     int64   `json:"shares"`
-	OpenDate   string  `json:"openDate"`
-	OpenPrice  float64 `json:"openPrice"`  // 加入时现价（基准参考）
-	Status     string  `json:"status"`     // open/closed
-	ClosePrice float64 `json:"closePrice"` // 平仓价
-	CloseDate  string  `json:"closeDate"`
-	ExitReason string  `json:"exitReason"` // 自动平仓原因(stop_loss/ma10/time_stop/half_*等)，手动平仓为空
+	ID          int64   `json:"id"`
+	Symbol      string  `json:"symbol"`
+	Name        string  `json:"name"`
+	Source      string  `json:"source"` // lowbuy/wave/latechase/manual
+	CostPrice   float64 `json:"costPrice"`
+	Shares      int64   `json:"shares"`
+	OpenDate    string  `json:"openDate"`
+	OpenPrice   float64 `json:"openPrice"`  // 加入时现价（基准参考）
+	Status      string  `json:"status"`     // open/closed
+	ClosePrice  float64 `json:"closePrice"` // 平仓价
+	CloseDate   string  `json:"closeDate"`
+	ExitReason  string  `json:"exitReason"`            // 自动平仓原因(stop_loss/ma10/time_stop/half_*等)，手动平仓为空
+	OpenedAt    string  `json:"openedAt,omitempty"`    // 建仓精确时刻 "2006-01-02 15:04:05"(图表分时打点用;旧数据为空)
+	ClosedAt    string  `json:"closedAt,omitempty"`    // 平仓精确时刻(仅盘中实时平仓有;补判历史K为空)
+	AddedBy     string  `json:"addedBy,omitempty"`     // auto=策略自动入盘 / manual=手动(含从策略列表点加);旧数据为空
+	AutoExitOff bool    `json:"autoExitOff,omitempty"` // true=用户撤回过自动平仓(接管):风控引擎不再自动止盈止损
 	// 实时字段（由前端按现价填充，不入库）
-	CurrentPrice  float64 `json:"currentPrice,omitempty"`
-	ProfitPct     float64 `json:"profitPct,omitempty"`
-	ProfitAmount  float64 `json:"profitAmount,omitempty"`
+	CurrentPrice float64 `json:"currentPrice,omitempty"`
+	ProfitPct    float64 `json:"profitPct,omitempty"`
+	ProfitAmount float64 `json:"profitAmount,omitempty"`
 	// 风控线（运行时计算，不入库）
 	RiskKind  string  `json:"riskKind,omitempty"`  // 风控口径：短线/价值
 	StopPrice float64 `json:"stopPrice,omitempty"` // 止损价(成本硬止损)
@@ -51,18 +55,18 @@ type PaperRiskSummary struct {
 
 // PaperSourceStat 按筛选系统分组的胜率统计（扣成本净收益口径，与回测一致）
 type PaperSourceStat struct {
-	Source      string  `json:"source"`
-	Total       int     `json:"total"`       // 该来源总笔数
-	Closed      int     `json:"closed"`      // 已平仓笔数
-	Win         int     `json:"win"`         // 盈利笔数（已平仓，净收益>0）
-	WinRate     float64 `json:"winRate"`     // 胜率 %（已平仓口径）
-	AvgReturn   float64 `json:"avgReturn"`   // 期望值/笔 %（已平仓净收益均值）
-	TotalReturn float64 `json:"totalReturn"` // 累计收益 %（已平仓逐笔相加）
-	AvgWin      float64 `json:"avgWin"`      // 盈利单均值 %
-	AvgLoss     float64 `json:"avgLoss"`     // 亏损单均值 %
-	PayoffRatio float64 `json:"payoffRatio"` // 赔率 = AvgWin/|AvgLoss|
+	Source       string  `json:"source"`
+	Total        int     `json:"total"`        // 该来源总笔数
+	Closed       int     `json:"closed"`       // 已平仓笔数
+	Win          int     `json:"win"`          // 盈利笔数（已平仓，净收益>0）
+	WinRate      float64 `json:"winRate"`      // 胜率 %（已平仓口径）
+	AvgReturn    float64 `json:"avgReturn"`    // 期望值/笔 %（已平仓净收益均值）
+	TotalReturn  float64 `json:"totalReturn"`  // 累计收益 %（已平仓逐笔相加）
+	AvgWin       float64 `json:"avgWin"`       // 盈利单均值 %
+	AvgLoss      float64 `json:"avgLoss"`      // 亏损单均值 %
+	PayoffRatio  float64 `json:"payoffRatio"`  // 赔率 = AvgWin/|AvgLoss|
 	ProfitFactor float64 `json:"profitFactor"` // 总盈利/总亏损
-	MaxLoss     float64 `json:"maxLoss"`     // 单笔最大亏损 %
+	MaxLoss      float64 `json:"maxLoss"`      // 单笔最大亏损 %
 }
 
 // PaperStats 模拟持仓总览（计分卡口径）

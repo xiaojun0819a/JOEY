@@ -28,8 +28,8 @@ const defaultUpdateBase = "https://joey-app.junai.uk"
 // 从自建 NAS(joey-app.junai.uk)拉版本清单和安装包,不走 GitHub(国内常连不上导致卡死)。
 type UpdateService struct {
 	ctx            context.Context
-	currentVersion string           // 当前版本号
-	baseURLFn      func() string     // 返回更新源基址(默认公网隧道,可被 config 覆盖)
+	currentVersion string        // 当前版本号
+	baseURLFn      func() string // 返回更新源基址(默认公网隧道,可被 config 覆盖)
 }
 
 // updateManifest NAS 上的版本清单(/update/manifest.json)。

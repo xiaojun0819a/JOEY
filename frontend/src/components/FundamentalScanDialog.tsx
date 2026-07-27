@@ -4,14 +4,19 @@ import { useTheme } from '../contexts/ThemeContext';
 import { runFundamentalScan, refreshFundamentals, type FundamentalScanResult } from '../services/fundamentalService';
 import { addPaperPosition } from '../services/paperService';
 
-interface Props { isOpen: boolean; onClose: () => void; }
+interface Props {
+  isOpen: boolean;
+  onClose: () => void;
+  /** 点股票名打开个股全屏图(由 App 注入,与波段/综合评分同款) */
+  onOpenStock?: (symbol: string, name: string, price: number) => void;
+}
 
 const PRESETS = [
   { key: 'value', label: '长线价值 A' },
   { key: 'boom', label: '中线景气 B' },
 ];
 
-export const FundamentalScanDialog: React.FC<Props> = ({ isOpen, onClose }) => {
+export const FundamentalScanDialog: React.FC<Props> = ({ isOpen, onClose, onOpenStock }) => {
   const { colors } = useTheme();
   const dark = colors.isDark;
   const [preset, setPreset] = useState('value');
@@ -104,7 +109,14 @@ export const FundamentalScanDialog: React.FC<Props> = ({ isOpen, onClose }) => {
                 {(res?.candidates || []).map((c, i) => (
                   <tr key={c.symbol} className="border-b fin-divider-soft hover:bg-white/5">
                     <td className={`${td} text-left fin-text-tertiary`}>{i + 1}</td>
-                    <td className="px-2 py-1.5 text-left text-xs"><div className="fin-text-primary">{c.name}</div><div className="text-[10px] font-mono fin-text-tertiary">{c.symbol}</div></td>
+                    <td
+                      className={`px-2 py-1.5 text-left text-xs ${onOpenStock ? 'cursor-pointer group' : ''}`}
+                      title={onOpenStock ? '点击打开个股全屏图' : undefined}
+                      onClick={() => onOpenStock?.(c.symbol, c.name, c.price)}
+                    >
+                      <div className={`fin-text-primary ${onOpenStock ? 'group-hover:text-indigo-300 group-hover:underline underline-offset-2' : ''}`}>{c.name}</div>
+                      <div className="text-[10px] font-mono fin-text-tertiary">{c.symbol}</div>
+                    </td>
                     <td className={`${td} fin-text-secondary`}>{c.marketCapYi}</td>
                     <td className={`${td} text-rose-300`}>{c.annRoe}%</td>
                     <td className={`${td} ${pos(c.profitYoY)}`}>{c.profitYoY >= 0 ? '+' : ''}{c.profitYoY}%</td>

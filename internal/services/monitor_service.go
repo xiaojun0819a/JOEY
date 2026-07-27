@@ -34,16 +34,19 @@ type MonitorService struct {
 	pushService    *PushService
 	configService  *ConfigService
 
-	buyScan  func() // 尾盘买点扫描回调（由 App 注入，低吸，14:00）
-	waveScan func() // 盘后波段扫描回调（由 App 注入，全A锯齿，17:30）
+	buyScan     func() // 尾盘买点扫描回调（由 App 注入，低吸，14:00）
+	waveScan    func() // 盘后波段扫描回调（由 App 注入，全A锯齿，17:30）
+	paperExit   func() // 模拟持仓风控巡检（由 App 注入，盘中每5分钟+尾盘窗口）
+	boardReseal func() // 游资炸板回封状态机（由 App 注入，盘中每分钟,名单空时是空转)
 
-	mu           sync.Mutex
-	cancel       context.CancelFunc
-	lastHardStop time.Time         // 上次 -5% 硬止损快循环时间
-	lastEnvCheck time.Time         // 上次大盘环境检查时间
-	lastGate     *bool             // 上次大盘闸门状态(nil=未建立基线)
-	dailyDone    map[string]string // 固定时点任务 taskKey -> 已执行日期
-	running      bool
+	mu            sync.Mutex
+	cancel        context.CancelFunc
+	lastHardStop  time.Time         // 上次 -5% 硬止损快循环时间
+	lastEnvCheck  time.Time         // 上次大盘环境检查时间
+	lastPaperExit time.Time         // 上次模拟持仓风控巡检时间
+	lastGate      *bool             // 上次大盘闸门状态(nil=未建立基线)
+	dailyDone     map[string]string // 固定时点任务 taskKey -> 已执行日期
+	running       bool
 }
 
 func NewMonitorService(sessionService *SessionService, marketService *MarketService, historyService *HistoryService, pushService *PushService, configService *ConfigService) *MonitorService {
@@ -71,6 +74,22 @@ func (m *MonitorService) SetWaveScanFunc(fn func()) {
 		return
 	}
 	m.waveScan = fn
+}
+
+// SetPaperExitFunc 注入模拟持仓风控巡检(盘中止损/止盈实时触线+尾盘收盘口径判定)。
+func (m *MonitorService) SetPaperExitFunc(fn func()) {
+	if m == nil {
+		return
+	}
+	m.paperExit = fn
+}
+
+// SetBoardResealFunc 注入游资炸板回封状态机(封死→炸板→回封买入,成文规则v1)。
+func (m *MonitorService) SetBoardResealFunc(fn func()) {
+	if m == nil {
+		return
+	}
+	m.boardReseal = fn
 }
 
 func (m *MonitorService) cstNow() time.Time {
@@ -142,7 +161,7 @@ func (m *MonitorService) Stop() {
 //   - 17:00：盘后时间止损
 func (m *MonitorService) tick() {
 	cfg := m.getConfig()
-	if !cfg.Enabled || m.marketService == nil {
+	if m.marketService == nil {
 		return
 	}
 	status := m.marketService.GetMarketStatus()
@@ -152,6 +171,27 @@ func (m *MonitorService) tick() {
 	now := m.cstNow()
 	today := now.Format("2006-01-02")
 	nowMin := now.Hour()*60 + now.Minute()
+
+	// 模拟持仓风控巡检：独立于推送监控开关(纪律执行是核心功能,不是可选推送)。
+	// 盘中每5分钟触线判定;尾盘窗口(14:45-15:00)自然覆盖收盘口径条款的当天执行。
+	// 炸板回封状态机:每分钟必须看一眼(名单为空时开销≈0);独立于推送开关,与风控巡检同理
+	if status.Status == "trading" && m.boardReseal != nil {
+		m.runGuarded(m.boardReseal)
+	}
+	if status.Status == "trading" && m.paperExit != nil {
+		m.mu.Lock()
+		pdue := m.lastPaperExit.IsZero() || now.Sub(m.lastPaperExit) >= 5*time.Minute
+		if pdue {
+			m.lastPaperExit = now
+		}
+		m.mu.Unlock()
+		if pdue {
+			m.runGuarded(m.paperExit)
+		}
+	}
+	if !cfg.Enabled {
+		return
+	}
 
 	// 盘中 -5% 硬止损快循环（灾难线，唯一值得盘中紧盯）
 	if status.Status == "trading" {

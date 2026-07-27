@@ -12,6 +12,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/mac"
 )
 
 //go:embed all:frontend/dist
@@ -30,12 +31,19 @@ func main() {
 
 	// Create application with options
 	err := wails.Run(&options.App{
-		Title:           "JOEY",
-		Width:           1920,
-		Height:          1080,
-		MinWidth:        1366,
-		MinHeight:       768,
-		Frameless:       true,
+		Title:     "观鲸测浪",
+		Width:     1920,
+		Height:    1080,
+		MinWidth:  1366,
+		MinHeight: 768,
+		// macOS 原生全屏(绿灯行为)要求窗口带 NSWindowStyleMaskTitled,而 Frameless 会把它去掉,
+		// 导致 toggleFullScreen: 静默失效(2026-07-27 实测点了没反应,已在 Wails v2.11 源码坐实)。
+		// 改用 TitleBarHidden:标题栏透明、标题隐藏、内容铺满,但**保留 Titled**,所以全屏可用。
+		// 代价=左上角出现系统红黄绿三个灯,故前端在 macOS 上隐藏自绘的那三个按钮并给顶栏留左侧空位。
+		// 回退方式:把下面 Mac 那段删掉,改回 Frameless: true,并把 App.tsx 里 IS_MAC 相关的三处还原。
+		Mac: &mac.Options{
+			TitleBar: mac.TitleBarHidden(),
+		},
 		CSSDragProperty: "--wails-draggable",
 		CSSDragValue:    "drag",
 		AssetServer: &assetserver.Options{

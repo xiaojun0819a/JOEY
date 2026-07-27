@@ -18,16 +18,16 @@ import (
 const emPerfReportName = "RPT_LICO_FN_CPD"
 
 type emPerfRow struct {
-	SecurityCode  string   `json:"SECURITY_CODE"`
-	Name          string   `json:"SECURITY_NAME_ABBR"`
-	ROE           *float64 `json:"WEIGHTAVG_ROE"`
-	RevYoY        *float64 `json:"YSTZ"`
-	ProfitYoY     *float64 `json:"SJLTZ"`
-	GrossMargin   *float64 `json:"XSMLL"`
-	CFPS          *float64 `json:"MGJYXJJE"`
-	EPS           *float64 `json:"BASIC_EPS"`
-	ReportDate    string   `json:"REPORTDATE"`
-	NoticeDate    string   `json:"NOTICE_DATE"`
+	SecurityCode string   `json:"SECURITY_CODE"`
+	Name         string   `json:"SECURITY_NAME_ABBR"`
+	ROE          *float64 `json:"WEIGHTAVG_ROE"`
+	RevYoY       *float64 `json:"YSTZ"`
+	ProfitYoY    *float64 `json:"SJLTZ"`
+	GrossMargin  *float64 `json:"XSMLL"`
+	CFPS         *float64 `json:"MGJYXJJE"`
+	EPS          *float64 `json:"BASIC_EPS"`
+	ReportDate   string   `json:"REPORTDATE"`
+	NoticeDate   string   `json:"NOTICE_DATE"`
 }
 
 type emPerfResp struct {
@@ -115,18 +115,18 @@ func (s *HistoryService) FetchAndStoreFundamentals(reportDate string) (int, stri
 
 // fundamentalRuleSet 基本面硬规则（仅含可批量取得的量化指标；市占率/壁垒/政策等定性留给步骤③人工）。
 type fundamentalRuleSet struct {
-	preset, label, rulesText            string
-	excludeST                           bool
-	minAnnROE                           float64 // 年化ROE下限(0=不限)
-	profitYoYMin, profitYoYMax          float64 // 净利同比区间(Max=0 不设上限)
-	revYoYMin                           float64 // 营收同比下限
-	minGrossMargin                      float64 // 毛利率下限
-	requirePositiveCFPS                 bool    // 每股经营现金流>0
-	requirePositiveEPS                  bool    // 不亏损
-	minAmountYuan                       float64 // 当日成交额下限(元)
-	maxDebtRatio                        float64 // 资产负债率上限(%, 0=不限)
-	maxValuationPctile                  float64 // 估值历史分位上限(%, 0=不限)
-	maxGoodwillRatio                    float64 // 商誉占净资产上限(%, 0=不限)
+	preset, label, rulesText   string
+	excludeST                  bool
+	minAnnROE                  float64 // 年化ROE下限(0=不限)
+	profitYoYMin, profitYoYMax float64 // 净利同比区间(Max=0 不设上限)
+	revYoYMin                  float64 // 营收同比下限
+	minGrossMargin             float64 // 毛利率下限
+	requirePositiveCFPS        bool    // 每股经营现金流>0
+	requirePositiveEPS         bool    // 不亏损
+	minAmountYuan              float64 // 当日成交额下限(元)
+	maxDebtRatio               float64 // 资产负债率上限(%, 0=不限)
+	maxValuationPctile         float64 // 估值历史分位上限(%, 0=不限)
+	maxGoodwillRatio           float64 // 商誉占净资产上限(%, 0=不限)
 }
 
 func fundamentalPreset(preset string) fundamentalRuleSet {
@@ -314,9 +314,9 @@ func (s *HistoryService) RunFundamentalScan(preset string) models.FundamentalSca
 }
 
 type emBalanceRow struct {
-	SecurityCode  string   `json:"SECURITY_CODE"`
-	DebtRatio     *float64 `json:"DEBT_ASSET_RATIO"`
-	Equity        *float64 `json:"TOTAL_EQUITY"`
+	SecurityCode string   `json:"SECURITY_CODE"`
+	DebtRatio    *float64 `json:"DEBT_ASSET_RATIO"`
+	Equity       *float64 `json:"TOTAL_EQUITY"`
 }
 type emBalanceResp struct {
 	Success bool `json:"success"`

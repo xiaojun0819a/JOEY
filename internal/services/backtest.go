@@ -312,7 +312,7 @@ func exitCfgFrom(req models.BacktestRequest) exitCfg {
 	// 低吸纪律：+15% 止盈减半（余仓续跑），耐心模式不减半
 	c.halfTP = c.rule != "patient"
 	// 交易成本：默认真实散户口径；若请求显式给了往返成本，则全部记到卖出端（买入端置0，避免重复）
-	c.buyCostRate = btCommissionRate + btSlippageRate               // 买入：佣金+滑点
+	c.buyCostRate = btCommissionRate + btSlippageRate                // 买入：佣金+滑点
 	c.sellCostRate = btCommissionRate + btStampRate + btSlippageRate // 卖出：佣金+印花税+滑点
 	if req.CostPct > 0 {
 		c.buyCostRate = 0
@@ -384,13 +384,13 @@ type openPos struct {
 	halfTaken    bool    // 是否已在 +15% 减半
 	tpExitPrice  float64 // 减半成交价（用于最终 blended 收益记录）
 	// 策略型 profile 状态（仅 profile 驱动的策略账户用）
-	signalHigh   float64 // 启动信号日最高（半分位止损）
-	signalLow    float64 // 启动信号日最低
-	maxClose     float64 // 入场后最高收盘（新高加仓判定）
-	addsDone     int     // 已加仓次数
-	beArmed      bool    // 保本止损是否已上移
-	baseInvest   float64 // 初始投入（加仓基数）
-	peakHigh     float64 // 入场后最高价（通用风控移动止损用）
+	signalHigh float64 // 启动信号日最高（半分位止损）
+	signalLow  float64 // 启动信号日最低
+	maxClose   float64 // 入场后最高收盘（新高加仓判定）
+	addsDone   int     // 已加仓次数
+	beArmed    bool    // 保本止损是否已上移
+	baseInvest float64 // 初始投入（加仓基数）
+	peakHigh   float64 // 入场后最高价（通用风控移动止损用）
 }
 
 // RunPortfolioBacktest 真实组合模拟：固定资金、最多同时持 MaxPositions 只、等权，

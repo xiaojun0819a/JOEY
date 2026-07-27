@@ -11,6 +11,7 @@ import { TradeJournalDialog } from './components/TradeJournalDialog';
 import { HotTrendDialog } from './components/HotTrendDialog';
 import { LongHuBangDialog } from './components/LongHuBangDialog';
 import { AuctionBoardDialog } from './components/AuctionBoardDialog';
+import { AuctionChartDialog } from './components/AuctionChartDialog';
 import { MarketMovesDialog } from './components/MarketMovesDialog';
 import LowBuyScannerDialog, {
   type HistoryAutoCollectRequest,
@@ -55,6 +56,8 @@ import {
   runTailLazyScannerV2,
   runTailBuyScannerV6,
   runTripleVolumeScannerV5,
+  runOversoldIgniteScanner,
+  runLimitupRetraceScanner,
   runTailLazyReplayOnDate,
   runLowBuyReplayOnDate,
   updateHistoryAutoCollect,
@@ -63,6 +66,7 @@ import { getOrCreateSession, StockSession, updateStockPosition } from './service
 import { sellStockPosition } from './services/journalService';
 import { getConfig, updateConfig } from './services/configService';
 import { checkForUpdate } from './services/updateService';
+import { watchSharedResult } from './services/sharedScanService';
 import { useMarketEvents } from './hooks/useMarketEvents';
 import { useMarketStatus } from './hooks/useMarketStatus';
 import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex, F10Overview, StockValuation } from './types';
@@ -78,7 +82,24 @@ const LAYOUT_DEFAULTS = {
   bottomPanelHeight: 132,
 };
 
-type LowBuyStrategyMode = 'lowbuy' | 'limit-pullback' | 'triple-volume' | 'tail-buy' | 'hot-money' | 'dip-entry' | 'monster' | 'monster-v10' | 'taillazy' | 'caoyuan-standard4a' | 'caoyuan-zhuang4b';
+type LowBuyStrategyMode = 'lowbuy' | 'limit-pullback' | 'triple-volume' | 'tail-buy' | 'hot-money' | 'dip-entry' | 'monster' | 'monster-v10' | 'taillazy' | 'oversold-ignite' | 'limitup-retrace' | 'caoyuan-standard4a' | 'caoyuan-zhuang4b';
+
+// 策略模式 → 后端扫描 RPC 方法名(共享扫描按方法名取最新,见 sharedScanService)
+const LOWBUY_SHARED_METHOD: Partial<Record<LowBuyStrategyMode, string>> = {
+  lowbuy: 'RunLowBuyScannerV1',
+  taillazy: 'RunTailLazyScannerV2',
+  'limit-pullback': 'RunLimitPullbackScanner',
+  'triple-volume': 'RunTripleVolumeScannerV5',
+  'tail-buy': 'RunTailBuyScannerV6',
+  'hot-money': 'RunHotMoneyBreakoutScannerV7',
+  'dip-entry': 'RunDipEntryScannerV8',
+  monster: 'RunMonsterScannerV9',
+  'monster-v10': 'RunMonsterScannerV10',
+  'oversold-ignite': 'RunOversoldIgniteScanner',
+  'limitup-retrace': 'RunLimitupRetraceScanner',
+  'caoyuan-standard4a': 'RunCaoYuanStandardScanner4A',
+  'caoyuan-zhuang4b': 'RunCaoYuanZhuangScanner4B',
+};
 type ChartFullscreenMode = 'normal' | 'strategy';
 const LAYOUT_MIN = {
   leftPanelWidth: 180,
@@ -198,6 +219,11 @@ const DEFAULT_STOCK: Stock = {
   volume: 0, amount: 0, marketCap: '', sector: '', open: 0, high: 0, low: 0, preClose: 0,
 };
 
+// macOS 改用带原生标题栏的窗口后(为了拿到真全屏),系统会在左上角画红黄绿三个灯:
+// ① 自绘的最小化/最大化/关闭三个按钮要隐藏,否则一个窗口两套控件;
+// ② 顶栏左侧要留出约 78px,不然 logo 会被三个灯压住。
+const IS_MAC = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent);
+
 const App: React.FC = () => {
   const { colors } = useTheme();
   const cc = useCandleColor();
@@ -229,8 +255,9 @@ const App: React.FC = () => {
   const [showHotTrend, setShowHotTrend] = useState(false);
   const [showLongHuBang, setShowLongHuBang] = useState(false);
   const [showAuctionBoard, setShowAuctionBoard] = useState(false);
-  // 分时图叠加集合竞价段的开关(本机偏好,默认关)
-  const [showAuctionOverlay, setShowAuctionOverlay] = useState(() => localStorage.getItem('jcp_show_auction') === '1');
+  const [auctionChartTarget, setAuctionChartTarget] = useState<{ symbol: string; name: string; preClose: number } | null>(null); // 独立集合竞价视图目标股票
+  // 分时图叠加集合竞价段的开关(本机偏好,默认开;A股分时含 9:15-9:25 竞价段,显式关掉才不显示)
+  const [showAuctionOverlay, setShowAuctionOverlay] = useState(() => localStorage.getItem('jcp_show_auction') !== '0');
   const toggleAuctionOverlay = useCallback(() => {
     setShowAuctionOverlay(v => {
       localStorage.setItem('jcp_show_auction', v ? '0' : '1');
@@ -319,9 +346,17 @@ const App: React.FC = () => {
     if (previewStock && previewStock.symbol.toLowerCase() === normalizedSelected) return previewStock;
     return watchlist[0] || previewStock || DEFAULT_STOCK;
   }, [selectedSymbol, watchlist, previewStock]);
-  const watchlistSubscriptionKey = useMemo(() => (
-    Array.from(new Set(watchlist.map(stock => String(stock.symbol || '').trim()).filter(Boolean))).join(',')
-  ), [watchlist]);
+  // 订阅名单 = 自选 + 当前预览股(搜索进来只看不加自选的那只,否则它没有实时行情)
+  const watchlistSubscriptionKey = useMemo(() => {
+    const codes = watchlist.map(stock => String(stock.symbol || '').trim()).filter(Boolean);
+    const preview = String(previewStock?.symbol || '').trim();
+    if (preview) codes.push(preview);
+    return Array.from(new Set(codes)).join(',');
+  }, [watchlist, previewStock]);
+
+  // 体感练习「看图但不许看未来」:非空时全屏图只画到这一天为止。
+  // 练习是盲选,右侧四图要是把信号日之后的走势也画出来,题就废了。
+  const [drillAsOf, setDrillAsOf] = useState('');
 
   const safeKLineData = useMemo(() => (
     (kLineData || []).filter((item): item is KLineData => (
@@ -334,6 +369,16 @@ const App: React.FC = () => {
       && Number.isFinite(item.volume)
     ))
   ), [kLineData]);
+
+  // 练习模式截断:K线数据有 8 条写入路径(首屏/切周期/轮询/事件推送…),挨个改容易漏,
+  // 所以只在"交给图表组件"这一处夹断——任何路径进来的数据都逃不掉。
+  // time 格式:日K "2026-04-22"、分时 "2026-07-24 09:30:00",取前10位比较通吃两者
+  // (分时天然全部晚于信号日 → 被整段滤掉,练习模式看不到分时,正是想要的)。
+  const clampByDrill = useCallback((rows: KLineData[]) => (
+    drillAsOf ? (rows || []).filter(r => String(r?.time || '').slice(0, 10) <= drillAsOf) : (rows || [])
+  ), [drillAsOf]);
+  const drillKLineData = useMemo(() => clampByDrill(safeKLineData), [clampByDrill, safeKLineData]);
+  const drillDayKData = useMemo(() => clampByDrill(multiCycleKLines.daily), [clampByDrill, multiCycleKLines.daily]);
 
   const pricePanelState = useMemo(
     () => selectedStock ? getPricePanelState(selectedStock) : { trendLabel: '平盘', zoneLabel: '区间中性', zoneTone: 'mid' as const },
@@ -397,9 +442,10 @@ const App: React.FC = () => {
     return () => window.clearInterval(timer);
   }, []);
 
-  // 启动后静默检查更新(CheckForUpdate 在 remoteBridge 白名单里,始终走本地绑定查 GitHub Release);
-  // dev 本地构建时后端会带 error(版本号不可解析),不弹提醒
+  // 启动后静默检查更新。个人版(__ADMIN_BUILD__)永不在 app 内更新——它走 build-me.sh 升级,
+  // 且 app 内更新会下载分发版覆盖、丢掉账号管理(manifest 一旦放了 darwin 包就会误触发)。
   useEffect(() => {
+    if (__ADMIN_BUILD__) return;
     const timer = window.setTimeout(async () => {
       try {
         const info = await checkForUpdate();
@@ -425,6 +471,13 @@ const App: React.FC = () => {
         const updated = stocks.find(s => String(s.symbol || '').trim().toLowerCase() === symbol);
         return updated || stock;
       });
+    });
+    // 预览股(搜索进来只看、没加自选)不在 watchlist 里,上面的 map 覆盖不到它。
+    // 不同步的话价格会定格在打开那一刻——比不显示更糟,看着像实时其实是死数。
+    setPreviewStock(prev => {
+      if (!prev) return prev;
+      const symbol = String(prev.symbol || '').trim().toLowerCase();
+      return stocks.find(s => String(s.symbol || '').trim().toLowerCase() === symbol) || prev;
     });
   }, [selectedSymbol]);
 
@@ -472,6 +525,7 @@ const App: React.FC = () => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         setShowChartFullscreen(false);
+        setDrillAsOf(''); // 与右上角 X 一致:退出练习截断,别把限制留给下一次看图
       }
     };
     window.addEventListener('keydown', handleEscape);
@@ -532,7 +586,6 @@ const App: React.FC = () => {
       await WindowMaximize();
       await syncWindowMaximizedState();
     } catch {
-      // fallback to optimistic toggle when runtime query is unavailable
       setIsMaximized(prev => !prev);
     }
   }, [syncWindowMaximizedState]);
@@ -784,6 +837,12 @@ const App: React.FC = () => {
       if (isMinuteTrendPeriod(timePeriod)) {
         setTimePeriod('1d');
       }
+    } else if (template === 'bingGeT') {
+      // 兵哥做T是分时日内指标,自动切到分时
+      setShowF10(false);
+      if (timePeriod !== '1m') {
+        setTimePeriod('1m');
+      }
     }
   }, [timePeriod]);
 
@@ -791,6 +850,7 @@ const App: React.FC = () => {
     setShowF10(false);
     setChartFullscreenMode('normal');
     setShowChartFullscreen(true);
+    setDrillAsOf(''); // 正常看图不受练习截断影响(练习那次没关就切过来也不会残留)
   }, []);
 
   const handlePageRefresh = useCallback(() => {
@@ -810,35 +870,35 @@ const App: React.FC = () => {
   }, [scannerErrorsByMode, scannerResultsByMode]);
 
   const handleOpenLowBuyTailStrategy = useCallback(() => {
-    handleOpenLowBuyScanner('低吸尾盘策略2', '尾盘懒人V2（量比1-2.5 · 涨幅3-6% · 换手5-10% · 多头排列/新高/形态）', 'taillazy');
+    handleOpenLowBuyScanner('低吸尾盘策略', '尾盘懒人V2（量比1-2.5 · 涨幅3-6% · 换手5-10% · 多头排列/新高/形态）', 'taillazy');
   }, [handleOpenLowBuyScanner]);
 
   const handleOpenLimitPullbackStrategy = useCallback(() => {
-    handleOpenLowBuyScanner('涨停回调低吸4', '近期涨停强启动 · 缩量回踩 · 站稳5/10日线后低吸', 'limit-pullback');
+    handleOpenLowBuyScanner('涨停回调低吸', '近期涨停强启动 · 缩量回踩 · 站稳5/10日线后低吸', 'limit-pullback');
   }, [handleOpenLowBuyScanner]);
 
   const handleOpenTripleVolumeStrategy = useCallback(() => {
-    handleOpenLowBuyScanner('三倍量策略5', '未涨停阳线 · 成交量≥前一日3倍 · 一阳穿MA5/10/20/30', 'triple-volume');
+    handleOpenLowBuyScanner('三倍量策略', '未涨停阳线 · 成交量≥前一日3倍 · 一阳穿MA5/10/20/30', 'triple-volume');
   }, [handleOpenLowBuyScanner]);
 
   const handleOpenTailBuyStrategy = useCallback(() => {
-    handleOpenLowBuyScanner('尾盘买入策略6', '昨日资金强势触发 · 今日阴线回踩 · 尾盘确认承接', 'tail-buy');
+    handleOpenLowBuyScanner('尾盘买入策略', '昨日资金强势触发 · 今日阴线回踩 · 尾盘确认承接', 'tail-buy');
   }, [handleOpenLowBuyScanner]);
 
   const handleOpenHotMoneyStrategy = useCallback(() => {
-    handleOpenLowBuyScanner('游资突破策略7', '游资涨停结构 · 量能倍率1-5 · 流通股本分档', 'hot-money');
+    handleOpenLowBuyScanner('游资突破策略', '游资涨停结构 · 量能倍率1-5 · 流通股本分档', 'hot-money');
   }, [handleOpenLowBuyScanner]);
 
   const handleOpenDipEntryStrategy = useCallback(() => {
-    handleOpenLowBuyScanner('低吸入场策略8', 'RSI短线反转 · 快速RSI过线 · 动能底背离三选二', 'dip-entry');
+    handleOpenLowBuyScanner('低吸入场策略', 'RSI短线反转 · 快速RSI过线 · 动能底背离三选二', 'dip-entry');
   }, [handleOpenLowBuyScanner]);
 
   const handleOpenMonsterStrategy = useCallback(() => {
-    handleOpenLowBuyScanner('捉妖策略9', '原“捉妖选股”可落地复刻 · 妖股初启/突破/布林爆发/低点反抽', 'monster');
+    handleOpenLowBuyScanner('捉妖策略', '原“捉妖选股”可落地复刻 · 妖股初启/突破/布林爆发/低点反抽', 'monster');
   }, [handleOpenLowBuyScanner]);
 
-  const handleOpenMonsterV10Strategy = useCallback(() => {
-    handleOpenLowBuyScanner('捉妖策略10', '通达信公式严格复刻 · GGZY_ZS=FILTER(GGZY_IG=1,3)', 'monster-v10');
+  const handleOpenOversoldIgniteStrategy = useCallback(() => {
+    handleOpenLowBuyScanner('超跌起爆', '250日深回撤 · 地量沉寂后爆量大阳 · 波段鱼身引擎共振(米奥/格林样板)', 'oversold-ignite');
   }, [handleOpenLowBuyScanner]);
 
   const handleOpenLateDayStrengthStrategy = useCallback(() => {
@@ -869,6 +929,10 @@ const App: React.FC = () => {
           ? await runMonsterScannerV9(req)
         : mode === 'monster-v10'
           ? await runMonsterScannerV10(req)
+        : mode === 'oversold-ignite'
+          ? await runOversoldIgniteScanner(req)
+        : mode === 'limitup-retrace'
+          ? await runLimitupRetraceScanner(req)
         : mode === 'caoyuan-standard4a'
           ? await runCaoYuanStandardScanner4A(req)
           : mode === 'caoyuan-zhuang4b'
@@ -883,6 +947,7 @@ const App: React.FC = () => {
       }
       setScannerResult(result);
       setScannerResultsByMode(prev => ({ ...prev, [mode]: result }));
+      lowBuySharedAtRef.current[LOWBUY_SHARED_METHOD[mode] || ''] = new Date().toLocaleString('sv-SE'); // 自己刚扫的,共享轮询不用再回灌
     } catch (err) {
       if (requestId !== lowBuyScanRequestIdRef.current) return;
       const message = err instanceof Error ? err.message : '扫描失败，请稍后重试';
@@ -894,6 +959,23 @@ const App: React.FC = () => {
       }
     }
   }, [lowBuyStrategyMode]);
+
+  // 低吸系扫描跨账号共享:弹窗开着就10秒轮询当前策略的最新共享结果,任何账号重扫都自动换新显示
+  const lowBuySharedAtRef = useRef<Record<string, string>>({});
+  useEffect(() => {
+    if (!showLowBuyScanner || scannerLoading) return;
+    const mode = lowBuyStrategyMode;
+    const method = LOWBUY_SHARED_METHOD[mode];
+    if (!method) return;
+    return watchSharedResult<LowBuyScannerResult>(method, hit => {
+      if (!hit.result) return;
+      lowBuySharedAtRef.current[method] = hit.at;
+      setScannerResult(hit.result);
+      setScannerResultsByMode(prev => ({ ...prev, [mode]: hit.result! }));
+      setScannerError('');
+      setScannerErrorsByMode(prev => ({ ...prev, [mode]: '' }));
+    }, () => lowBuySharedAtRef.current[method] || '');
+  }, [showLowBuyScanner, scannerLoading, lowBuyStrategyMode]);
 
   const handleRunTailLazyReplay = useCallback(async (date: string) => {
     setScannerLoading(true);
@@ -965,6 +1047,37 @@ const App: React.FC = () => {
     }
   };
 
+  // 搜索结果点进来:**只看,不加自选**。
+  // 之前点搜索结果会直接 addToWatchlist,于是"随手查一只"就把自选撑大(用户实测从 52 涨到 67)。
+  // 加自选必须是明确动作——下拉行右侧的「+自选」或搜索框旁的「+ 添加」按钮,不能是浏览的副作用。
+  // 机制沿用既有的 previewStock(handleOpenStockFromStrategy 同款),不落库、刷新即消失。
+  const handlePreviewStock = useCallback(async (stock: Stock) => {
+    const normalizedSymbol = String(stock.symbol || '').trim().toLowerCase();
+    if (!normalizedSymbol) return;
+    const existing = watchlist.find(s => s.symbol.toLowerCase() === normalizedSymbol);
+    setDrillAsOf('');
+    setSelectedSymbol(normalizedSymbol);
+    setPriceQuoteUpdatedAt(new Date());
+    setCurrentSession(null);
+    setPreviewStock(existing ? null : { ...stock, symbol: normalizedSymbol });
+    subscribeOrderBook(normalizedSymbol);
+
+    const [session, orderBookData, realtime] = await Promise.all([
+      getOrCreateSession(normalizedSymbol, stock.name),
+      getOrderBook(normalizedSymbol),
+      existing ? Promise.resolve([] as Stock[]) : getStockRealTimeData([normalizedSymbol]).catch(() => [] as Stock[]),
+    ]);
+    const realtimeStock = Array.isArray(realtime)
+      ? realtime.find(s => String(s.symbol || '').trim().toLowerCase() === normalizedSymbol)
+      : null;
+    if (!existing && realtimeStock) {
+      setPreviewStock(realtimeStock);
+      setPriceQuoteUpdatedAt(new Date());
+    }
+    setCurrentSession(session);
+    setOrderBook(orderBookData);
+  }, [watchlist, subscribeOrderBook]);
+
   const handleAddFromLongHuBang = useCallback(async (newStock: Stock): Promise<boolean> => {
     const normalizedSymbol = String(newStock.symbol || '').trim().toLowerCase();
     if (!normalizedSymbol) return false;
@@ -980,9 +1093,11 @@ const App: React.FC = () => {
     return true;
   }, [watchlist]);
 
-  const handleOpenStockFromStrategy = useCallback(async (stock: Stock) => {
+  // asOf 非空 = 体感练习点进来的:图只画到该日为止(见 drillAsOf)。
+  const handleOpenStockFromStrategy = useCallback(async (stock: Stock, asOf?: string) => {
     const normalizedSymbol = String(stock.symbol || '').trim().toLowerCase();
     if (!normalizedSymbol) return;
+    setDrillAsOf(asOf || '');
     const existing = watchlist.find(s => s.symbol.toLowerCase() === normalizedSymbol);
     const targetStock: Stock = existing || { ...stock, symbol: normalizedSymbol };
 
@@ -1011,6 +1126,38 @@ const App: React.FC = () => {
       setPreviewStock(realtimeStock);
       setPriceQuoteUpdatedAt(new Date());
     }
+    setCurrentSession(session);
+    setOrderBook(orderBookData);
+  }, [watchlist, subscribeOrderBook]);
+
+  // 打开股票到全屏分时趋势图(normal 模式 + 分时周期 + 标准主图),供竞价榜点股名跳转
+  const handleOpenStockTrendFullscreen = useCallback(async (symbol: string, name: string, price = 0) => {
+    const normalizedSymbol = String(symbol || '').trim().toLowerCase();
+    if (!normalizedSymbol) return;
+    const existing = watchlist.find(s => s.symbol.toLowerCase() === normalizedSymbol);
+    setShowF10(false);
+    setMainChartTemplate('standard');
+    setTimePeriod('1m');
+    setChartFullscreenMode('normal');
+    setShowChartFullscreen(true);
+    setDrillAsOf('');
+    setSelectedSymbol(normalizedSymbol);
+    setPriceQuoteUpdatedAt(new Date());
+    setCurrentSession(null);
+    // 完整 Stock(全字段默认值),避免全屏图读缺失字段崩溃;实时数据到达后覆盖
+    setPreviewStock(existing ? null : ({
+      symbol: normalizedSymbol, name, price,
+      change: 0, changePercent: 0, volume: 0, amount: 0,
+      marketCap: '', sector: '', open: price, high: price, low: price, preClose: price,
+    }));
+    subscribeOrderBook(normalizedSymbol);
+    const [session, orderBookData, realtime] = await Promise.all([
+      getOrCreateSession(normalizedSymbol, name),
+      getOrderBook(normalizedSymbol),
+      getStockRealTimeData([normalizedSymbol]).catch(() => [] as Stock[]),
+    ]);
+    const realtimeStock = Array.isArray(realtime) ? realtime.find(s => s.symbol.toLowerCase() === normalizedSymbol) : null;
+    if (!existing && realtimeStock) { setPreviewStock(realtimeStock); setPriceQuoteUpdatedAt(new Date()); }
     setCurrentSession(session);
     setOrderBook(orderBookData);
   }, [watchlist, subscribeOrderBook]);
@@ -1261,7 +1408,7 @@ const App: React.FC = () => {
       {/* Top Navbar */}
       <header
         className="h-14 fin-panel border-b fin-divider flex items-center px-4 justify-between shrink-0 z-20"
-        style={{ '--wails-draggable': 'drag' } as React.CSSProperties}
+        style={{ '--wails-draggable': 'drag', paddingLeft: IS_MAC ? 82 : undefined } as React.CSSProperties}
         onDoubleClick={(e) => {
           // 排除 no-drag 区域的双击
           const target = e.target as HTMLElement;
@@ -1271,7 +1418,7 @@ const App: React.FC = () => {
       >
         <div className="flex items-center gap-2" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}>
           <img src={logo} alt="logo" className="h-8 w-8 rounded-lg" />
-          <span className={`font-bold text-lg tracking-tight ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>JOEY <span className="text-accent-2">AI</span></span>
+          <span className={`font-bold text-lg tracking-tight ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>观鲸测浪</span>
         </div>
         
         <div className="flex items-center gap-1.5 fin-panel-soft px-2.5 py-1.5 rounded-full border fin-divider relative w-[160px] lg:w-[200px] xl:w-[240px] max-w-[18vw] shrink-0" style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties} title={marketMessage}>
@@ -1342,22 +1489,15 @@ const App: React.FC = () => {
             <Wallet className="h-3.5 w-3.5" />
             <span>模拟持仓</span>
           </button>
-          <button
-            onClick={() => setShowIntel(true)}
-            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-cyan-400/40`}
-            title="交易情报库 · 第二大脑（信息入库 + 反证晨报）"
-          >
-            <Brain className="h-3.5 w-3.5" />
-            <span>情报库</span>
-          </button>
+          {/* 情报库入口已移入「全网热点」窗口头部(HotTrendDialog onOpenIntel) */}
           <div ref={lowBuyStrategyMenuRef} className="relative">
             <button
               onClick={() => setShowLowBuyStrategyMenu(prev => !prev)}
               className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg fin-panel border fin-divider transition-colors text-xs font-medium ${colors.isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'} hover:border-fuchsia-400/40`}
-              title="低吸策略：选择低吸/尾盘策略入口"
+              title="选股策略:全部策略入口(1-11+基本面+综合评分)"
             >
               <Search className="h-3.5 w-3.5" />
-              <span>低吸策略</span>
+              <span>选股策略</span>
               <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showLowBuyStrategyMenu ? 'rotate-180' : ''}`} />
             </button>
             {showLowBuyStrategyMenu && (
@@ -1375,66 +1515,67 @@ const App: React.FC = () => {
                   🏆 综合评分(质量+结构+催化)
                 </button>
                 <div className="my-1 border-t fin-divider-soft" />
-                <button
-                  onClick={() => handleOpenLowBuyScanner('低吸选股策略1', 'V1.2 高胜率短线规则（全A · 回踩偏好 · Top3）')}
-                  className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
-                >
-                  低吸选股策略1
-                </button>
+                {/* 低吸选股策略1 已停用隐藏(2026-07-26):扣费超额 −0.52%/笔 n=273,稳定跑输全市场中位。
+                    扫描器代码与历史留痕/学习样本全部保留,想复活把这个按钮和 tailScanSpecs 里那行放回来即可。 */}
                 <button
                   onClick={handleOpenLowBuyTailStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  低吸尾盘策略2
+                  低吸尾盘策略
                 </button>
                 <button
                   onClick={handleOpenLateDayStrengthStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  尾盘强势策略3
+                  尾盘强势策略
                 </button>
                 <button
                   onClick={handleOpenLimitPullbackStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  涨停回调低吸4
+                  涨停回调低吸
                 </button>
                 <button
                   onClick={handleOpenTripleVolumeStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  三倍量策略5
+                  三倍量策略
                 </button>
                 <button
                   onClick={handleOpenTailBuyStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  尾盘买入策略6
+                  尾盘买入策略
                 </button>
                 <button
                   onClick={handleOpenHotMoneyStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  游资突破策略7
+                  游资突破策略
                 </button>
                 <button
                   onClick={handleOpenDipEntryStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  低吸入场策略8
+                  低吸入场策略
                 </button>
                 <button
                   onClick={handleOpenMonsterStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  捉妖策略9
+                  捉妖策略
                 </button>
+                {/* 捉妖策略10 已停用隐藏(2026-07-26):扣费超额 −0.61%/笔 n=239,同上。
+                    复活:放回按钮 onClick={() => handleOpenLowBuyScanner('捉妖策略10','通达信公式严格复刻','monster-v10')} */}
                 <button
-                  onClick={handleOpenMonsterV10Strategy}
+                  onClick={handleOpenOversoldIgniteStrategy}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs transition-colors ${colors.isDark ? 'text-slate-200 hover:bg-slate-700/60' : 'text-slate-700 hover:bg-slate-100'}`}
                 >
-                  捉妖策略10
+                  超跌起爆
                 </button>
+                {/* 涨停回踩12 已回测证伪,不上线(2026-07-27):两年67个信号,扣费超额 −0.08%、
+                    按成文纪律 −0.59%(比死拿到收盘还差)、评分与结果相关系数 0.003(等于随机)、≥80分两年零笔。
+                    扫描器/回测器/漏斗代码全保留,详见 docs_策略规则手册.md 策略12。 */}
                 {/* 草元标准4A / 草元抓庄4B 已暂停隐藏（用户停用） */}
               </div>
             )}
@@ -1500,7 +1641,8 @@ const App: React.FC = () => {
             </div>
           </div>
           <MarketRegimeBadge />
-          {/* 窗口控制按钮 */}
+          {/* 窗口控制按钮:macOS 用系统自带的红黄绿三个灯,这里不再自绘(否则一窗两套) */}
+          {!IS_MAC && (
           <div className="flex items-center ml-2 border-l fin-divider pl-3">
             <button
               onClick={handleWindowMinimize}
@@ -1524,6 +1666,7 @@ const App: React.FC = () => {
               <X className="h-4 w-4" />
             </button>
           </div>
+          )}
         </div>
       </header>
 
@@ -1536,6 +1679,7 @@ const App: React.FC = () => {
             selectedSymbol={selectedSymbol}
             onSelect={handleSelectStock}
             onAddStock={handleAddStock}
+            onPreviewStock={handlePreviewStock}
             onRemoveStock={handleRemoveStock}
             marketIndices={marketIndices}
           />
@@ -1727,6 +1871,7 @@ const App: React.FC = () => {
                 >
                   <option value="standard">主图：标准</option>
                   <option value="openEatFish">主图：开仓吃鱼</option>
+                  <option value="bingGeT">分时：兵哥做T</option>
                   {TDX_MAIN_GROUPS.map(g => (
                     <optgroup key={g.category} label={`通达信·${g.category}`}>
                       {g.items.map(f => (
@@ -1742,7 +1887,8 @@ const App: React.FC = () => {
                 )}
                 <button
                   type="button"
-                  onClick={toggleAuctionOverlay}
+                  onClick={() => setAuctionChartTarget({ symbol: selectedStock?.symbol || '', name: selectedStock?.name || '', preClose: Number(selectedStock?.preClose) || 0 })}
+                  onContextMenu={(e) => { e.preventDefault(); toggleAuctionOverlay(); }}
                   className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-xs transition-colors ${
                     showAuctionOverlay
                       ? 'border-amber-400/70 text-amber-400 bg-amber-400/10'
@@ -1750,7 +1896,7 @@ const App: React.FC = () => {
                         ? 'border-slate-700 bg-slate-900/35 text-slate-400 hover:border-amber-400/50 hover:text-amber-300'
                         : 'border-slate-300 bg-white/60 text-slate-500 hover:border-amber-400/60 hover:text-amber-600'
                   }`}
-                  title="分时图前叠加当日集合竞价段(9:15-9:25);仅分时周期生效"
+                  title="点击:打开独立集合竞价视图(9:15-9:25 放大);右键:开关分时图上的竞价段叠加"
                 >
                   <Gavel className="h-3 w-3" />
                   竞价
@@ -1869,7 +2015,11 @@ const App: React.FC = () => {
 	          await handleTradeJournalChanged();
 	        }}
       />
-      <HotTrendDialog isOpen={showHotTrend} onClose={() => setShowHotTrend(false)} />
+      <HotTrendDialog
+        isOpen={showHotTrend}
+        onClose={() => setShowHotTrend(false)}
+        onOpenIntel={() => { setShowHotTrend(false); setShowIntel(true); }}
+      />
       <LongHuBangDialog
         isOpen={showLongHuBang}
         onClose={() => setShowLongHuBang(false)}
@@ -1881,6 +2031,14 @@ const App: React.FC = () => {
         onClose={() => setShowAuctionBoard(false)}
         watchlistSymbols={watchlist.map(stock => stock.symbol)}
         onAddToWatchlist={handleAddFromLongHuBang}
+        onOpenChart={(symbol, name, price) => { setShowAuctionBoard(false); void handleOpenStockTrendFullscreen(symbol, name, price); }}
+      />
+      <AuctionChartDialog
+        isOpen={!!auctionChartTarget}
+        onClose={() => setAuctionChartTarget(null)}
+        symbol={auctionChartTarget?.symbol || ''}
+        name={auctionChartTarget?.name || ''}
+        preClose={auctionChartTarget?.preClose || 0}
       />
       <MarketMovesDialog isOpen={showMarketMoves} onClose={() => setShowMarketMoves(false)} marketStatusCode={marketStatus?.status} />
       <LowBuyScannerDialog
@@ -1925,7 +2083,18 @@ const App: React.FC = () => {
       <SafeBoundary title="情报库页面出错" resetKey={showIntel ? 'open' : 'closed'} onReset={() => setShowIntel(false)}>
         <IntelDialog isOpen={showIntel} onClose={() => setShowIntel(false)} />
       </SafeBoundary>
-      <FundamentalScanDialog isOpen={showFundamental} onClose={() => setShowFundamental(false)} />
+      <FundamentalScanDialog
+        isOpen={showFundamental}
+        onClose={() => setShowFundamental(false)}
+        onOpenStock={(symbol, name, price) => {
+          setShowFundamental(false);
+          void handleOpenStockFromStrategy({
+            symbol, name, price,
+            change: 0, changePercent: 0, volume: 0, amount: 0,
+            marketCap: '', sector: '', open: price, high: price, low: price, preClose: price,
+          });
+        }}
+      />
       <CompositeScoreDialog
         isOpen={showComposite}
         onClose={() => setShowComposite(false)}
@@ -1947,7 +2116,8 @@ const App: React.FC = () => {
       />
       {showChartFullscreen && selectedStock && (
         <div
-          className="fixed inset-0 z-[70] flex flex-col bg-[#070b12]"
+          // 练习模式要盖住体感练习弹窗(z-96),否则点开图看不见;关掉后弹窗原样还在
+          className={`fixed inset-0 ${drillAsOf ? 'z-[110]' : 'z-[70]'} flex flex-col bg-[#070b12]`}
           style={{ '--wails-draggable': 'no-drag' } as React.CSSProperties}
         >
           <div className="shrink-0 border-b border-slate-800/90 bg-slate-950/96 px-3 py-2 shadow-lg">
@@ -1960,9 +2130,14 @@ const App: React.FC = () => {
                 <span className="shrink-0 rounded border border-accent/30 bg-accent/10 px-2 py-0.5 text-[11px] font-medium text-accent-2">
                   {chartFullscreenMode === 'strategy' ? '全屏四图K线' : '全屏趋势图'}
                 </span>
-                {chartFullscreenMode === 'strategy' && (
+                {chartFullscreenMode === 'strategy' && !drillAsOf && (
                   <span className="hidden sm:inline shrink-0 rounded border border-cyan-400/20 bg-cyan-400/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
                     日K · 近6个月 · 主图开仓吃鱼
+                  </span>
+                )}
+                {drillAsOf && (
+                  <span className="shrink-0 rounded border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-[11px] font-semibold text-amber-200">
+                    体感练习 · K线只到 {drillAsOf}(之后走势已屏蔽,分时不可用)
                   </span>
                 )}
               </div>
@@ -1997,6 +2172,7 @@ const App: React.FC = () => {
                   onClick={() => {
                     setShowBoardReport(false);
                     setShowChartFullscreen(false);
+                    setDrillAsOf(''); // 退出练习模式截断,别把限制带到下一次正常看图
                   }}
                   className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-700 text-slate-400 transition-colors hover:border-red-400/50 hover:bg-red-500/10 hover:text-red-200"
                   title="关闭全屏"
@@ -2009,12 +2185,13 @@ const App: React.FC = () => {
           <div className="min-h-0 flex-1 p-2">
             <SafeBoundary title="全屏图表渲染异常" resetKey={`fullscreen:${chartFullscreenMode}:${selectedSymbol}:${timePeriod}`}>
               <StockChartLW
-                data={safeKLineData}
+                data={drillKLineData}
                 updateMode={kLineUpdateMode}
                 period={timePeriod}
-                onPeriodChange={setTimePeriod}
+                // 练习模式锁死日K:周/月线那根"当期"柱子会把信号日之后的几天一起画进去,同样泄题
+                onPeriodChange={drillAsOf ? ((p) => { if (p === '1d') setTimePeriod(p); }) : setTimePeriod}
                 stock={selectedStock}
-                dayKData={multiCycleKLines.daily}
+                dayKData={drillDayKData}
                 mainChartTemplate={mainChartTemplate}
                 onMainChartTemplateChange={handleMainChartTemplateChange}
                 showAuction={showAuctionOverlay}
@@ -2031,7 +2208,7 @@ const App: React.FC = () => {
             isOpen={showBoardReport}
             onClose={() => setShowBoardReport(false)}
             stock={selectedStock}
-            data={safeKLineData}
+            data={drillKLineData}
             period={timePeriod}
             dayKLineData={multiCycleKLines.daily}
             weekKLineData={multiCycleKLines.weekly}

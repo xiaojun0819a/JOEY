@@ -97,7 +97,7 @@ export function showLoginOverlay(base: string) {
     'margin-top:10px;width:100%;box-sizing:border-box;padding:9px 12px;border-radius:8px;border:1px solid rgba(148,163,184,.3);background:#060d1a;color:#e2e8f0;font-size:14px;outline:none;'
   ov.innerHTML = `
     <div style="width:320px;padding:26px 26px 22px;border:1px solid rgba(148,163,184,.25);border-radius:14px;background:#0b1524;color:#e2e8f0;box-shadow:0 20px 60px rgba(0,0,0,.5);">
-      <div id="jcp-login-title" style="font-size:17px;font-weight:700;">JOEY · 登录</div>
+      <div id="jcp-login-title" style="font-size:17px;font-weight:700;">观鲸测浪 · 登录</div>
       <div style="margin-top:4px;font-size:12px;color:#94a3b8;">连接远程服务需要账号</div>
       <input id="jcp-login-user" placeholder="账号" autocomplete="username" style="margin-top:16px;${inputCss}">
       <input id="jcp-login-pass" placeholder="密码" type="password" autocomplete="current-password" style="${inputCss}">
@@ -122,7 +122,7 @@ export function showLoginOverlay(base: string) {
     }
     show('jcp-login-pass2', reg)
     show('jcp-login-invite', reg)
-    document.getElementById('jcp-login-title')!.textContent = reg ? 'JOEY · 注册' : 'JOEY · 登录'
+    document.getElementById('jcp-login-title')!.textContent = reg ? '观鲸测浪 · 注册' : '观鲸测浪 · 登录'
     ;(document.getElementById('jcp-login-btn') as HTMLButtonElement).textContent = reg ? '注 册' : '登 录'
     document.getElementById('jcp-login-toggle')!.textContent = reg ? '已有账号?去登录' : '没有账号?注册一个'
     document.getElementById('jcp-login-err')!.textContent = ''
@@ -188,7 +188,11 @@ export function installRemoteBridge(url: string, token?: string) {
 
   // 按方法名挑超时:真正耗时的 AI/扫描/回补给长超时,其余给普通超时。
   // 没有超时的 fetch 遇到公网隧道抖动会永远吊住,触发它的按钮就"点不动"。
-  const LONG_METHOD = /Scanner|Scan|Backfill|Enrich|Collect|Report|Meeting|GenerateStrategy|EnhancePrompt|Generate|Review|Diagnos/i
+  // ⚠️必须覆盖服务端 main_headless.go 的 heavyMethodRe(两边不同步过:服务端认 Replay 会算完并缓存结果,
+  //   客户端不认 → 只给 30s 就放弃、还跳过断线找回,复盘按钮必报"请求超时")。
+  //   除服务端那批外,再加本地判定为重的:Backtest/Repair/Learn(回测/断层修复/全策略学习都按分钟计)。
+  const LONG_METHOD =
+    /Scanner|Scan|Backfill|Enrich|Collect|Report|Meeting|GenerateStrategy|EnhancePrompt|Generate|Review|Diagnos|Replay|Rebuild|RunWave|Digest|Backtest|Repair|Learn/i
   const rpcTimeout = (method: string) => {
     if (LONG_METHOD.test(method)) return 16 * 60 * 1000 // 16min:圆桌/投研报告等
     return 30 * 1000 // 普通操作 30s
@@ -216,24 +220,63 @@ export function installRemoteBridge(url: string, token?: string) {
     }).catch(() => { /* 重探测失败保持现址,下次再试 */ })
   }
 
+  // fnv1a32:与服务端对同一 body 串算同一指纹(断线找回的缓存键)
+  const fnv1a32 = (s: string): string => {
+    const bytes = new TextEncoder().encode(s)
+    let h = 0x811c9dc5
+    for (let i = 0; i < bytes.length; i++) {
+      h ^= bytes[i]
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0
+    }
+    return h.toString(16)
+  }
+
+  // 断线找回:长扫描请求被隧道掐断/超时后,服务端其实照常算完并按(方法+参数指纹)缓存了结果。
+  // 每6秒查一次 __heavyStatus,最多等5分钟:在跑→继续等;有新结果→直接当作本次调用的返回。
+  const recoverHeavy = async (method: string, bodyStr: string): Promise<any> => {
+    const hash = fnv1a32(bodyStr)
+    const deadline = Date.now() + 5 * 60 * 1000
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 6000))
+      try {
+        const st = await rpc('__heavyStatus', [method, hash], 15000)
+        if (st && st.running) continue
+        if (st && st.result != null && st.ageSec >= 0 && st.ageSec < 600) {
+          console.info(`[remoteBridge] ${method} 连接曾被中断,已从服务端找回结果`)
+          return st.result
+        }
+        return undefined // 没在跑也没有新结果:找回失败
+      } catch {
+        /* 轮询失败继续试 */
+      }
+    }
+    return undefined
+  }
+
   // ---- 1) RPC 代理：接管 window.go.main.App ----
-  const rpc = async (method: string, args: any[], timeoutMs?: number) => {
+  const rpc = async (method: string, args: any[], timeoutMs?: number): Promise<any> => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (cred) headers['X-JCP-Token'] = cred
     const ac = new AbortController()
     const to = timeoutMs ?? rpcTimeout(method)
     const timer = setTimeout(() => ac.abort(), to)
+    const bodyStr = JSON.stringify(args ?? [])
     let resp: Response
     try {
       resp = await fetch(`${base}/rpc/${method}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(args ?? []),
+        body: bodyStr,
         signal: ac.signal,
       })
     } catch (e: any) {
       clearTimeout(timer)
       maybeReprobe()
+      // 重方法(扫描/回测/报告等)网络级失败→尝试从服务端缓存找回,而不是直接报错
+      if (LONG_METHOD.test(method) && method !== '__heavyStatus') {
+        const recovered = await recoverHeavy(method, bodyStr)
+        if (recovered !== undefined) return recovered
+      }
       if (e?.name === 'AbortError') throw new Error(`请求超时(${method})，请检查网络后重试`)
       throw new Error(`网络错误(${method}): ${e?.message || e}`)
     }
@@ -274,12 +317,13 @@ export function installRemoteBridge(url: string, token?: string) {
     'DoUpdate',
     'RestartApp',
     'GetCurrentVersion',
-    // 交易情报库(第二大脑)V1:笔记存本机 intel.db、AI 用本机 config key,先本地跑。
-    // (持仓由前端从 NAS 取好传进 GenerateIntelDigest。后续要多设备同步/分发再迁 NAS。)
-    'AddIntelNote',
-    'ListIntelNotes',
-    'DeleteIntelNote',
-    'GenerateIntelDigest',
+    // 多窗口:必须在本机起进程,转发到 NAS 就成了让服务器开窗口(它没有图形界面)
+    'OpenNewWindow',
+    'CountAppInstances',
+    // 交易情报库(第二大脑)2026-07-27 已迁 NAS:扫描与推送都在 NAS 上跑,
+    // 笔记留在本机的话 NAS 读不到,"策略命中情报库就标注"这条链路根本接不通。
+    // 迁移前确认本机与 NAS 两边都是 0 条,零风险。迁后与持仓/留痕一样以 NAS 为单一数据源,
+    // 换台电脑也能看到自己记的东西。(故这几个方法**不再**走本地。)
   ])
 
   // 公开行情(高频轮询类)改由客户端本地直连数据源(腾讯等),不经 NAS——
@@ -299,11 +343,30 @@ export function installRemoteBridge(url: string, token?: string) {
     if (method === 'GetKLineData' && (args?.[1] === '1m' || args?.[1] === '5d')) return true
     return false
   }
-  // 行情类先本地,本地取数失败(个别客户端连不上数据源)才回落 NAS;其余直接 NAS。
+  // 本地行情结果是否"空/坏"(需回落 NAS)。本地数据源连接失效时会返回空数组或全 0 价,
+  // 不抛异常——若不检测就会把 0.00 直接显示出来(收盘后 TDX 连接失效即此症状)。
+  const isEmptyMarketResult = (method: string, r: any): boolean => {
+    if (r == null) return true
+    if (Array.isArray(r)) {
+      if (r.length === 0) return true
+      // 实时报价:全部价格为 0/缺失 视为坏数据
+      if (method === 'GetStockRealTimeData') {
+        return r.every((x: any) => !x || !(Number(x.price) > 0))
+      }
+      return false
+    }
+    return false
+  }
+
+  // 行情类先本地,本地取数失败(抛错)或返回空/坏数据才回落 NAS;其余直接 NAS。
   const callMarketOrRpc = async (method: string, args: any[], timeoutMs?: number) => {
     if (routeLocalMarket(method, args)) {
       try {
-        return await localApp[method](...(args ?? []))
+        const local = await localApp[method](...(args ?? []))
+        if (!isEmptyMarketResult(method, local)) return local
+        // 本地空/坏 → 回落 NAS(NAS 行情源与本地独立,通常一方失效另一方仍好)
+        const remote = await rpc(method, args, timeoutMs)
+        return isEmptyMarketResult(method, remote) ? local : remote
       } catch {
         return await rpc(method, args, timeoutMs)
       }

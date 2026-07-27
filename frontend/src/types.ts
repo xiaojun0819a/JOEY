@@ -1,4 +1,5 @@
 export interface Stock {
+  watchAddedAt?: string; // 加入自选时刻(自选列表持久化字段)
   symbol: string;
   name: string;
   price: number;
@@ -30,6 +31,7 @@ export interface KLineData {
   volume: number;
   amount?: number;
   avg?: number; // For intraday average price line
+  turnoverRate?: number; // 换手率%(日K真实值,来自本地日线库/档案;行情源不带时为空)
   // 均线数据
   ma5?: number;
   ma10?: number;

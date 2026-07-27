@@ -27,3 +27,12 @@ func (a *App) RunBackupNow(weekly bool) services.BackupResult {
 func (a *App) GetBackupStatus() *services.BackupResult {
 	return a.backup().Status()
 }
+
+// RunQfqRebuild 全市场前复权重建(重活,手动触发):把 stock_daily 最近420根改写为行情源前复权口径,
+// 消除本地不复权+缺OHL的双口径问题。日常维护由每日采集的除权检测自动做,本接口用于一次性对齐/大修。
+func (a *App) RunQfqRebuild(concurrency int) services.RebuildQfqResult {
+	if a.historyService == nil {
+		return services.RebuildQfqResult{Message: "历史服务未初始化"}
+	}
+	return a.historyService.RebuildAllQfq(concurrency, 420)
+}
