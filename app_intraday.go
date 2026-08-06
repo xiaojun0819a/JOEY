@@ -137,8 +137,8 @@ func passesAuctionGatesC(r services.AuctionFinalRow) bool {
 	if strings.HasPrefix(num, "4") || strings.HasPrefix(num, "8") || strings.HasPrefix(num, "92") {
 		return false
 	}
-	gkf := r.Pct                       // 高开幅度% =(竞价价/昨收-1)*100
-	jje := r.Amount / 10000            // 竞价额(万元)
+	gkf := r.Pct                        // 高开幅度% =(竞价价/昨收-1)*100
+	jje := r.Amount / 10000             // 竞价额(万元)
 	jhs := r.Amount / r.FloatMcap * 100 // 竞价换手率% = 竞价额/流通市值*100
 	return gkf > 0.5 && gkf < 3.0 && jje > 500 && jhs > 0.15
 }
@@ -238,7 +238,7 @@ func matchAuctionFormulaG(row services.AuctionFinalRow, bars []models.KLineData)
 		return a
 	}
 	volShou := func(k int) float64 { return float64(bars[n-k].Volume) / 100 } // 股→手
-	maC := func(period, k int) float64 { // MA(C,period) 在 REF k 处
+	maC := func(period, k int) float64 {                                      // MA(C,period) 在 REF k 处
 		end := n - k
 		start := end - period + 1
 		if start < 0 {
@@ -273,9 +273,9 @@ func matchAuctionFormulaG(row services.AuctionFinalRow, bars []models.KLineData)
 		return false
 	}
 	竞价涨幅 := row.Pct
-	竞价量 := 竞价额 / 竞价价 / 100 // 手
-	prevVolShou := volShou(1)  // 昨日量(手)
-	prevAmt := amt(1)          // 昨日额(元)
+	竞价量 := 竞价额 / 竞价价 / 100    // 手
+	prevVolShou := volShou(1) // 昨日量(手)
+	prevAmt := amt(1)         // 昨日额(元)
 	if prevVolShou <= 0 || prevAmt <= 0 {
 		return false
 	}
@@ -369,9 +369,23 @@ func (a *App) intradayFocusPool() []string {
 		seen[sym] = true
 		out = append(out, sym)
 	}
-	for _, codes := range a.GetStockGroups() {
-		for _, c := range codes {
-			add(c)
+	// ⚠️2026-07-28 修:这里原来是
+	//     for _, codes := range a.GetStockGroups() { for _, c := range codes { add(c) } }
+	// 而 GetStockGroups 返回的是 **股票代码 → 所属分组ID列表**(map[symbol][]groupID),
+	// 遍历"值"拿到的是 g1784700493950713450 / trade-journal 这种**分组 ID**,被当成股票代码塞进了重点池。
+	// 两个后果:
+	//   ① 自选股**一条 3 秒线都没采到**(实测:只在分组里的 59 只票今日 focus_ticks 全为 0,
+	//      而模拟持仓的票有 4857 条)——重点池等于只覆盖了持仓,自选那半边一直是空的;
+	//   ② TDX 的 GetQuote 只要有一个代码不被 IsStock 认可就**整批报错**
+	//      ("DefaultCodes未初始化"),于是每 3 秒刷一条 WARN、每次都白跑一次主源再回落兜底源。
+	// 正解:取 **键**(股票代码)。另外直接用 configService,不走 a.GetStockGroups()——
+	// 后者每次调用都会跑一遍 syncTradeJournalWatchGroup,3 秒一次没必要。
+	if a.configService != nil {
+		for _, s := range a.configService.GetWatchlist() {
+			add(s.Symbol) // 自选(含未归组的)
+		}
+		for code := range a.configService.GetStockGroups() {
+			add(code) // 分组成员;键才是代码
 		}
 	}
 	if a.paperService != nil {

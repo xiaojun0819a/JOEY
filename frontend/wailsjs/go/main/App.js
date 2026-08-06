@@ -38,6 +38,10 @@ export function AddToWatchlist(arg1) {
   return window['go']['main']['App']['AddToWatchlist'](arg1);
 }
 
+export function AddXSignalsManual(arg1) {
+  return window['go']['main']['App']['AddXSignalsManual'](arg1);
+}
+
 export function ApplyPaperExitRules() {
   return window['go']['main']['App']['ApplyPaperExitRules']();
 }
@@ -70,12 +74,20 @@ export function BacktestLimitupRetrace(arg1, arg2) {
   return window['go']['main']['App']['BacktestLimitupRetrace'](arg1, arg2);
 }
 
+export function BacktestSecondWave(arg1, arg2) {
+  return window['go']['main']['App']['BacktestSecondWave'](arg1, arg2);
+}
+
 export function CancelInterruptedMeeting(arg1) {
   return window['go']['main']['App']['CancelInterruptedMeeting'](arg1);
 }
 
 export function CancelMeeting(arg1) {
   return window['go']['main']['App']['CancelMeeting'](arg1);
+}
+
+export function CheckDataFreshness() {
+  return window['go']['main']['App']['CheckDataFreshness']();
 }
 
 export function CheckForUpdate() {
@@ -514,6 +526,10 @@ export function ImportAIReport(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
   return window['go']['main']['App']['ImportAIReport'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
+export function IngestXPosts(arg1) {
+  return window['go']['main']['App']['IngestXPosts'](arg1);
+}
+
 export function IsTrustedRemoteUser(arg1) {
   return window['go']['main']['App']['IsTrustedRemoteUser'](arg1);
 }
@@ -558,6 +574,14 @@ export function PushSignal(arg1) {
   return window['go']['main']['App']['PushSignal'](arg1);
 }
 
+export function RealizedPnLOfStock(arg1) {
+  return window['go']['main']['App']['RealizedPnLOfStock'](arg1);
+}
+
+export function ReduceStockPosition(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['ReduceStockPosition'](arg1, arg2, arg3, arg4);
+}
+
 export function RefreshFundamentals() {
   return window['go']['main']['App']['RefreshFundamentals']();
 }
@@ -584,6 +608,10 @@ export function ReopenPaperPosition(arg1) {
 
 export function RepairQfqGaps(arg1) {
   return window['go']['main']['App']['RepairQfqGaps'](arg1);
+}
+
+export function ReportFrontendError(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ReportFrontendError'](arg1, arg2, arg3);
 }
 
 export function ReprobeBackend() {
@@ -742,6 +770,10 @@ export function RunWaveTimingBacktest(arg1, arg2) {
   return window['go']['main']['App']['RunWaveTimingBacktest'](arg1, arg2);
 }
 
+export function RunXOpenBuy() {
+  return window['go']['main']['App']['RunXOpenBuy']();
+}
+
 export function SaveTradeJournal(arg1) {
   return window['go']['main']['App']['SaveTradeJournal'](arg1);
 }
@@ -790,6 +822,10 @@ export function SetUserTrusted(arg1, arg2) {
   return window['go']['main']['App']['SetUserTrusted'](arg1, arg2);
 }
 
+export function SetXBloggerAutoBuy(arg1, arg2) {
+  return window['go']['main']['App']['SetXBloggerAutoBuy'](arg1, arg2);
+}
+
 export function StartBoardReport(arg1) {
   return window['go']['main']['App']['StartBoardReport'](arg1);
 }
@@ -804,6 +840,10 @@ export function StartHistoryMinuteBackfill(arg1, arg2, arg3) {
 
 export function StartResearchReport(arg1, arg2) {
   return window['go']['main']['App']['StartResearchReport'](arg1, arg2);
+}
+
+export function SweepSecondWaveParams(arg1, arg2) {
+  return window['go']['main']['App']['SweepSecondWaveParams'](arg1, arg2);
 }
 
 export function SyncTradeJournalWatchGroup() {
@@ -848,6 +888,14 @@ export function UpdateStockPosition(arg1, arg2, arg3, arg4) {
 
 export function UpdateStrategy(arg1) {
   return window['go']['main']['App']['UpdateStrategy'](arg1);
+}
+
+export function ValidateSecondWaveOOS(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ValidateSecondWaveOOS'](arg1, arg2, arg3);
+}
+
+export function VerifyXBloggers(arg1, arg2) {
+  return window['go']['main']['App']['VerifyXBloggers'](arg1, arg2);
 }
 
 export function WindowClose() {

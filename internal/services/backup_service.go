@@ -107,7 +107,7 @@ func (s *BackupService) RunBackup(withIntraday bool) BackupResult {
 
 	// 1) 可写库:WAL 检查点后拷贝主文件,再对副本做完整性校验。
 	// (不用 VACUUM INTO:modernc 驱动对大库会卡死且挂读事务阻塞 checkpoint,2026-07-09 实测)
-	for _, name := range []string{"history.db", "paper.db", "journal.db", "push.db", "audit.db"} {
+	for _, name := range []string{"history.db", "paper.db", "journal.db", "push.db", "audit.db", "xblog.db"} {
 		src := filepath.Join(s.dataDir, name)
 		if _, err := os.Stat(src); err != nil {
 			continue

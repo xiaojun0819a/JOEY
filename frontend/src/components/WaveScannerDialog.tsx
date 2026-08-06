@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Activity, BarChart3, Check, Loader2, RefreshCw, X, AlertTriangle, CheckCircle2, Flame, Fish, TrendingUp, ShieldAlert } from 'lucide-react';
+import { Activity, BarChart3, Loader2, RefreshCw, X, AlertTriangle, CheckCircle2, Flame, Fish, TrendingUp, ShieldAlert, Gauge } from 'lucide-react';
 import type { Stock } from '../types';
 import { AddToGroupButton } from './AddToGroupButton';
-import { BatchAddToGroupButton } from './BatchAddToGroupButton';
 import { StrategyReviewDialog } from './StrategyReviewDialog';
+import { FeelDrillDialog } from './FeelDrillDialog';
+import { getStrategyLearnReport } from '../services/scannerService';
 import { runWaveScannerWithGate, getWaveScanStatus, type WaveCandidate, type WaveScanResult } from '../services/waveService';
 import { watchSharedResult } from '../services/sharedScanService';
 import { listPaperPositions } from '../services/paperService';
@@ -12,7 +13,9 @@ interface WaveScannerDialogProps {
   isOpen: boolean;
   onClose: () => void;
   onAddToWatchlist?: (stock: Stock) => Promise<boolean> | void;
-  onOpenStock?: (stock: Stock) => void | Promise<void>;
+  // asOf:体感练习点股票时传信号日,全屏图只画到该日为止(防泄题)。
+  // App 传进来的 handleOpenStockFromStrategy 本来就支持这个参数,这里只是把类型补上。
+  onOpenStock?: (stock: Stock, asOf?: string) => void | Promise<void>;
   watchlistSymbols?: string[];
 }
 
@@ -67,16 +70,13 @@ const WaveCandidateRow: React.FC<{
   inPaper: boolean;
   onAddToWatchlist?: (stock: Stock) => Promise<boolean> | void;
   onOpenStock?: (stock: Stock) => void | Promise<void>;
-  batchSelectMode?: boolean;
-  batchSelected?: boolean;
-  onToggleBatch?: () => void;
-}> = ({ item, inWatch, inPaper, onAddToWatchlist, onOpenStock, batchSelectMode, batchSelected, onToggleBatch }) => {
+}> = ({ item, inWatch, inPaper, onAddToWatchlist, onOpenStock }) => {
   const stock = emptyStock(item.code, item.name, item.price);
   const reasons = item.reasons ?? [];
   const risks = item.risks ?? [];
   return (
     <div className={`rounded-xl border px-3 py-2.5 hover:bg-white/[0.04] ${item.keyLayout ? 'border-red-500/50 bg-red-500/[0.06] ring-1 ring-red-500/25' : 'fin-divider bg-slate-950/20'}`}>
-      <div className={`grid ${batchSelectMode ? 'grid-cols-[112px_1fr_92px_84px_26px]' : 'grid-cols-[112px_1fr_92px_84px]'} gap-3 items-start`}>
+      <div className="grid grid-cols-[112px_1fr_92px_84px] gap-3 items-start">
         <div className="min-w-0">
           <button
             type="button"
@@ -139,27 +139,11 @@ const WaveCandidateRow: React.FC<{
             {item.level || '观察'}
           </span>
           <span className="text-[15px] font-bold text-amber-200">{Number(item.score || 0).toFixed(1)}</span>
-          {onAddToWatchlist && !batchSelectMode && (
+          {onAddToWatchlist && (
             <AddToGroupButton stock={stock} source="wave-v1" inWatch={inWatch} inPaper={inPaper} onAddToWatchlist={onAddToWatchlist} />
           )}
         </div>
 
-        {batchSelectMode && (
-          <div className="flex justify-end pt-1">
-            <button
-              type="button"
-              onClick={onToggleBatch}
-              className={`inline-flex h-4 w-4 items-center justify-center rounded-[3px] border transition-colors ${
-                batchSelected
-                  ? 'border-amber-300 bg-amber-400 text-slate-950'
-                  : 'border-slate-500/80 bg-slate-950/20 hover:border-amber-300'
-              }`}
-              title={batchSelected ? '取消勾选' : '勾选批量添加'}
-            >
-              {batchSelected && <Check className="h-3 w-3" />}
-            </button>
-          </div>
-        )}
       </div>
     </div>
   );
@@ -177,8 +161,12 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<(WaveScanResult & { scannedAt?: string }) | null>(null);
   const [showNextDayReview, setShowNextDayReview] = useState(false);
-  const [batchSelectMode, setBatchSelectMode] = useState(false);
-  const [batchSelectedCodes, setBatchSelectedCodes] = useState<string[]>([]);
+  // 体感练习 + 学习日报(2026-07-29 用户提:低吸那套波段也要)。
+  // 后端本来就按 strategyId 取数、波段一直在写 strategy_scan_picks 留痕,所以零后端改动:
+  // 实测波段可练习日 27 个(比低吸入场的 19 个还多)、学习日报 283 笔样本。
+  const [showDrill, setShowDrill] = useState(false);
+  const [learnReport, setLearnReport] = useState<string | null>(null);
+  const [learnLoading, setLearnLoading] = useState(false);
   const scanRequestIdRef = useRef(0);
 
   // 「在模拟持仓」与「在自选」是两回事:这里单独拉一次未平仓列表,让按钮如实显示"持仓中"
@@ -223,8 +211,6 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
     setLoading(true);
     setError(null);
     setResult(null);
-    setBatchSelectMode(false);
-    setBatchSelectedCodes([]);
     try {
       const res = await runWaveScannerWithGate(useGate);
       if (requestId !== scanRequestIdRef.current) return;
@@ -253,12 +239,6 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
     }
   };
 
-  useEffect(() => {
-    if (!isOpen) return;
-    setBatchSelectMode(false);
-    setBatchSelectedCodes([]);
-  }, [isOpen]);
-
   // 跨账号共享:打开即显示任意账号最新一次扫描(不重扫),期间10秒轮询——谁点了重新扫描,这里自动换新
   const sharedAtRef = useRef('');
   useEffect(() => {
@@ -280,19 +260,6 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
   // 撞上"已有一次扫描进行中"时,后端返回的是空占位(gatePassed 等字段都是零值),
   // 直接照渲染会显示成"闸门未过(空仓)·命中0只"——看着像扫完没选出票,其实压根没扫。
   const isBusyPlaceholder = !!result && !result.universeCount && /正在进行/.test(result.message || '');
-  const batchSelectedSet = new Set(batchSelectedCodes);
-  const batchStocks = items
-    .filter(item => batchSelectedSet.has(item.code))
-    .map(item => emptyStock(item.code, item.name, item.price));
-  const toggleBatchStock = (code: string) => {
-    setBatchSelectedCodes(prev => (
-      prev.includes(code) ? prev.filter(item => item !== code) : [...prev, code]
-    ));
-  };
-  const exitBatchMode = () => {
-    setBatchSelectMode(false);
-    setBatchSelectedCodes([]);
-  };
 
   return (
     <>
@@ -338,37 +305,8 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
             )}
           </div>
           <div className="flex items-center gap-2">
-            {onAddToWatchlist && (
-              batchSelectMode ? (
-                <>
-                  <BatchAddToGroupButton
-                    stocks={batchStocks}
-                    source="wave-v1"
-                    onAddToWatchlist={onAddToWatchlist}
-                    onDone={exitBatchMode}
-                  />
-                  <button
-                    type="button"
-                    onClick={exitBatchMode}
-                    className="flex items-center gap-1.5 rounded-lg border border-slate-600/70 px-3 py-1.5 text-xs font-medium text-slate-400 hover:bg-white/5"
-                  >
-                    取消
-                  </button>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBatchSelectedCodes([]);
-                    setBatchSelectMode(true);
-                  }}
-                  disabled={items.length === 0}
-                  className="flex items-center gap-1.5 rounded-lg border border-amber-400/45 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-500/15 disabled:opacity-50"
-                >
-                  批量操作
-                </button>
-              )
-            )}
+            {/* 批量操作已于 2026-07-29 按用户要求移除(勾选模式 + BatchAddToGroupButton 整套)。
+                单只卡片上的「加自选/加分组」按钮不受影响,仍可逐只操作。 */}
             <button
               type="button"
               onClick={() => setShowNextDayReview(true)}
@@ -377,6 +315,29 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
             >
               <BarChart3 className="h-3.5 w-3.5" />
               <span>次日复盘</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowDrill(true)}
+              className="flex items-center gap-1.5 rounded-lg border border-sky-400/45 bg-sky-500/8 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/15"
+              title="盲选练习:只看某日扫描选出的证据挑一只,再用次日真实分时回放、由你自己按卖出,练选股与离场手感"
+            >
+              <Gauge className="h-3.5 w-3.5" />
+              <span>体感练习</span>
+            </button>
+            <button
+              type="button"
+              onClick={async () => {
+                if (learnReport !== null) { setLearnReport(null); return; }
+                setLearnLoading(true);
+                try { setLearnReport(await getStrategyLearnReport('wave-v1')); } catch (e) { setLearnReport(String(e)); }
+                setLearnLoading(false);
+              }}
+              className="flex items-center gap-1.5 rounded-lg border border-violet-400/45 bg-violet-500/8 px-3 py-1.5 text-xs font-medium text-violet-200 hover:bg-violet-500/15"
+              title="每日自动学习:历史入选×次日结果按特征分桶统计,提炼上涨/下跌共同点;硬门槛不自动改,达标发现只作用于评分权重"
+            >
+              <BarChart3 className="h-3.5 w-3.5" />
+              <span>{learnLoading ? '加载中...' : learnReport !== null ? '收起日报' : '学习日报'}</span>
             </button>
             <button
               onClick={() => handleScan(true)}
@@ -388,6 +349,12 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
             </button>
           </div>
         </div>
+
+        {learnReport !== null && (
+          <div className="mx-5 mb-3 max-h-72 overflow-y-auto rounded-lg border border-violet-400/30 bg-violet-500/5 p-3">
+            <pre className="whitespace-pre-wrap text-[11px] leading-relaxed fin-text-secondary">{learnReport}</pre>
+          </div>
+        )}
 
         {/* body */}
         <div className="flex-1 overflow-auto px-5 py-3">
@@ -454,9 +421,6 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
                   inPaper={paperSet.has(it.code.toLowerCase())}
                   onAddToWatchlist={onAddToWatchlist}
                   onOpenStock={onOpenStock}
-                  batchSelectMode={batchSelectMode}
-                  batchSelected={batchSelectedSet.has(it.code)}
-                  onToggleBatch={() => toggleBatchStock(it.code)}
                 />
               ))}
             </div>
@@ -480,6 +444,17 @@ export const WaveScannerDialog: React.FC<WaveScannerDialogProps> = ({
         setShowNextDayReview(false);
         onClose();
         void onOpenStock(emptyStock(symbol, name, price));
+      } : undefined}
+    />
+    <FeelDrillDialog
+      isOpen={showDrill}
+      onClose={() => setShowDrill(false)}
+      strategyId="wave-v1"
+      strategyName="波段策略 1.0"
+      onOpenStock={onOpenStock ? (symbol, name, price, asOf) => {
+        // 与低吸那套一致:**不关练习弹窗**——全屏图在练习模式下层级更高(z-110),
+        // 关掉图还能接着挑下一只。asOf 必须透传,否则图会画出信号日之后的走势 = 泄题。
+        void onOpenStock(emptyStock(symbol, name, price), asOf);
       } : undefined}
     />
     </>

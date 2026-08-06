@@ -595,21 +595,41 @@ export function calculateIntradayTradingSignals(data: KLineData[], preClose = 0,
     const { support, resistance } = bingGeTLevels(data, preClose);
     let cumPV = 0;
     let cumV = 0;
+    let cumC = 0;
     const ratio: number[] = new Array(n);
-    let dh = -Infinity;
-    let dl = Infinity;
+    const vwapArr: number[] = new Array(n);
     const midAxis: number[] = new Array(n);
     for (let i = 0; i < n; i++) {
       cumPV += close[i] * (volume[i] || 0);
       cumV += volume[i] || 0;
+      cumC += close[i];
       const vwap = cumV > 0 ? cumPV / cumV : close[i];
-      // 通达信原式对 VWAP 偏离>5% 回退均线,这里 VWAP 由累计量价直接算,天然在价带内
-      ratio[i] = vwap > 0 ? close[i] / vwap : 1;
-      dh = Math.max(dh, close[i]);
-      dl = Math.min(dl, close[i]);
-      const axisMid = (dh + dl) / 2;
-      midAxis[i] = axisMid - (dh - dl) * 15 / 130; // (50-HL3)*轴差/HL4+中价轴,HL3=65,HL4=130
+      vwapArr[i] = vwap;
+      // 原式 VBNH 有个 ±5% 的价带回退:C/VWAP 落在 [0.95,1.05] 之外时改用 MA(C,全程)。
+      // 之前注释说"VWAP 天然在价带内"所以省了 —— 那只在振幅小的日子成立。
+      // 大涨大跌日(截图里有研新材 +9.76%)C/VWAP 会冲出价带,省掉这段会让
+      // 比价线整体偏移,起涨/加仓的位置跟通达信对不上。
+      const inBand = vwap > 0 && close[i] / vwap >= 0.95 && close[i] / vwap <= 1.05;
+      const vbnh = inBand ? vwap : cumC / (i + 1);
+      ratio[i] = vbnh > 0 ? close[i] / vbnh : 1;
     }
+    // 中间价轴:与通达信**逐字对齐**(2026-08-05 用户明确要求)。
+    //
+    // 原式 LIJINA9:=CONST(HHV(C,250)) —— CONST 取全序列最后一个值,
+    // 等于把**当日收盘后才知道的最高/最低**当常数套回每一根K线。
+    // ⚠️这就是通达信自己在图上标「用到未来数据」的来源:
+    //    上午十点画出来的信号,用到了下午三点的数据。
+    // 盘后复盘与通达信完全一致,但**盘中实时会随新高新低跳位置** —— 这是用户选的口径。
+    let dayHi = -Infinity;
+    let dayLo = Infinity;
+    for (let i = 0; i < n; i++) {
+      dayHi = Math.max(dayHi, close[i]);
+      dayLo = Math.min(dayLo, close[i]);
+    }
+    const axisSpan = dayHi - dayLo;              // 轴差
+    const axisCenter = (dayHi + dayLo) / 2;      // 中价轴
+    const midConst = axisCenter - axisSpan * 15 / 130; // (50-HL3)*轴差/HL4+中价轴,HL3=65,HL4=130
+    for (let i = 0; i < n; i++) midAxis[i] = midConst;
     const emaR30 = ema(ratio, 30);
     const emaR60 = ema(ratio, 60);
     const emaR120 = ema(ratio, 120);
@@ -651,7 +671,10 @@ export function calculateIntradayTradingSignals(data: KLineData[], preClose = 0,
       // 加仓:限制散户线在均价线上方且价格上穿它
       const retailLine = emaR120[i] * midAxis[i];
       const retailLinePrev = emaR120[i - 1] * midAxis[i - 1];
-      const avgV = avgLine[i];
+      // ⚠️必须用当日累计 VWAP,不能用外面那个 avgLine ——
+      // avgLine 在缺 d.avg 时会退化成 5 根均线,跟原式的 SUM(C*V)/SUM(V) 差得远,
+      // 「加仓」会打在完全不相干的位置。
+      const avgV = vwapArr[i];
       if (Number.isFinite(retailLine) && retailLine > avgV
         && close[i] > retailLine && close[i - 1] <= retailLinePrev && i - lastAdd >= 30) {
         signals.push({
@@ -667,26 +690,201 @@ export function calculateIntradayTradingSignals(data: KLineData[], preClose = 0,
   return signals;
 }
 
-// bingGeTLevels 兵哥做T的日内支撑/阻力序列(随行情演进的运行值;跨日自动重置)。
+// bingGeTLevels 兵哥做T的日内支撑/阻力(**当日定格值**,与通达信一致;跨日各自定格)。
 // 阻力=L1+P1*7/8(绿),支撑=L1+P1*0.5/8(紫),H1/L1 含昨收。
+//
+// ⚠️2026-08-05 从"运行值"改为定格值,用户明确选了与通达信逐位一致:
+// 原式 H1/L1 用 DYNAINFO(5)/(6)(当日最高/最低),盘后回看是收盘后的定值,
+// 每根K线都按同一条水平线判 LONGCROSS —— 运行值会让早盘信号打在完全不同的位置。
+// 代价同 CONST():**盘中实时时这两条线会随当日新高新低移动**,历史信号位置跟着变。
 export function bingGeTLevels(data: KLineData[], preClose = 0): { support: number[]; resistance: number[] } {
-  const support: number[] = [];
-  const resistance: number[] = [];
-  let hi = -Infinity;
-  let lo = Infinity;
-  let day = '';
+  const support: number[] = new Array(data.length);
+  const resistance: number[] = new Array(data.length);
+  // 先按日分组算出各日最终高低,再整日回填同一个定值
+  const dayRange = new Map<string, { hi: number; lo: number }>();
   for (const d of data) {
     const dp = String(d.time).slice(0, 10);
-    if (dp !== day) { day = dp; hi = -Infinity; lo = Infinity; }
-    hi = Math.max(hi, d.high || d.close);
-    lo = Math.min(lo, d.low || d.close);
-    const h1 = preClose > 0 ? Math.max(preClose, hi) : hi;
-    const l1 = preClose > 0 ? Math.min(preClose, lo) : lo;
-    const p1 = h1 - l1;
-    resistance.push(l1 + p1 * 7 / 8);
-    support.push(l1 + p1 * 0.5 / 8);
+    const r = dayRange.get(dp) || { hi: -Infinity, lo: Infinity };
+    r.hi = Math.max(r.hi, d.high || d.close);
+    r.lo = Math.min(r.lo, d.low || d.close);
+    dayRange.set(dp, r);
   }
+  data.forEach((d, i) => {
+    const r = dayRange.get(String(d.time).slice(0, 10))!;
+    const h1 = preClose > 0 ? Math.max(preClose, r.hi) : r.hi;
+    const l1 = preClose > 0 ? Math.min(preClose, r.lo) : r.lo;
+    const p1 = h1 - l1;
+    resistance[i] = l1 + p1 * 7 / 8;
+    support[i] = l1 + p1 * 0.5 / 8;
+  });
   return { support, resistance };
+}
+
+// ===== 兵哥做T · 主图全套视觉元素(与通达信公式逐段对应,2026-08-05)=====
+//
+// 通达信那份公式除了买卖点,还画了一堆东西:两组趋势线、底部的 ∠开始/黄棒/起涨 柱标、
+// 上涨/加仓 文字、左下角机构买卖比、右侧资金流条。lightweight-charts 的 markers
+// 画不了这些,全部算好坐标交给 overlay canvas 自绘。
+// 口径与原式的对应关系逐条写在各段注释里;凡取不到的字段(流通股本 FINANCE(7))
+// 因只影响比例不影响过零/交叉判断,按 1 处理,判断结果不变。
+
+export interface BingGeTTrendSeg { i1: number; p1: number; i2: number; p2: number }
+export interface BingGeTStick { i: number; yFrom: number; yTo: number; color: string; text?: string; textColor?: string }
+export interface BingGeTText { i: number; y: number; text: string; color: string }
+export interface BingGeTOverlay {
+  trendDown: BingGeTTrendSeg[];  // 下降压力线(黄)
+  trendUp: BingGeTTrendSeg[];    // 上涨支撑线(红)
+  sticks: BingGeTStick[];        // ∠开始(紫)/黄棒/起涨(青) 底部柱标
+  texts: BingGeTText[];          // 上涨/加仓 文字
+  zhuli: number[];               // 主力线 = EXPMA(C/VBNH,60)×中间价轴(紫点线)
+  vwap: number[];                // 当日累计均价线(红绿分色的分界)
+  instBuyPct: number;            // 机构买%(大单口径:该分钟成交额>160万)
+  instSellPct: number;
+  flowBuyWan: number;            // 资金条:全量上涨分钟成交额合计(万)
+  flowSellWan: number;
+}
+
+export function computeBingGeTOverlay(data: KLineData[]): BingGeTOverlay | null {
+  const n = data.length;
+  if (n < 30) return null;
+  const close = data.map(d => d.close);
+  const high = data.map(d => d.high || d.close);
+  const low = data.map(d => d.low || d.close);
+  const volume = data.map(d => d.volume || 0);
+
+  // —— VBNH 比价基线(同信号计算:VWAP 带 ±5% 回退全程均线)——
+  let cumPV = 0; let cumV = 0; let cumC = 0;
+  const ratio: number[] = new Array(n);
+  const vwap: number[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    cumPV += close[i] * volume[i];
+    cumV += volume[i];
+    cumC += close[i];
+    const vw = cumV > 0 ? cumPV / cumV : close[i];
+    vwap[i] = vw;
+    const inBand = vw > 0 && close[i] / vw >= 0.95 && close[i] / vw <= 1.05;
+    const vbnh = inBand ? vw : cumC / (i + 1);
+    ratio[i] = vbnh > 0 ? close[i] / vbnh : 1;
+  }
+  const e20 = ema(ratio, 20);   // 起动线
+  const e30 = ema(ratio, 30);
+  const e60 = ema(ratio, 60);   // 主力线基
+  const e120 = ema(ratio, 120); // 散户线基
+
+  // —— 中间价轴 / 轴差:CONST(HHV/LLV(C,250)) → 当日收盘定格(用户选的通达信口径)——
+  let dayHiC = -Infinity; let dayLoC = Infinity;
+  for (const c of close) { dayHiC = Math.max(dayHiC, c); dayLoC = Math.min(dayLoC, c); }
+  const span = dayHiC - dayLoC;                       // 轴差
+  const midConst = (dayHiC + dayLoC) / 2 - span * 15 / 130; // 中间价轴
+  const zhuli = e60.map(v => v * midConst);
+  const retail = e120.map(v => v * midConst);          // 限制散户线
+
+  // —— LIJINA 资金链(FINANCE(7) 流通股本取不到 → 按 1;只影响幅度不影响过零判断)——
+  // LIJINA=加权换手×累计均价;LIJINA1=∑(涨分钟 LIJINA×V) − ∑(跌分钟 LIJINA×V)
+  const lijina1: number[] = new Array(n);
+  const lijin3: number[] = new Array(n);
+  let accA = 0; let accB = 0; let upV = 0; let dnV = 0;
+  for (let i = 0; i < n; i++) {
+    const h0 = volume[i];
+    const h1 = i >= 1 ? volume[i - 1] : 0;
+    const h2 = i >= 2 ? volume[i - 2] : 0;
+    const w = (h0 * 0.5 + h1 * 0.33 + h2 * 0.17) * (cumSum(close, i) / (i + 1));
+    if (i >= 1 && close[i] > close[i - 1]) { accA += w * volume[i]; upV += volume[i]; }
+    else if (i >= 1 && close[i] < close[i - 1]) { accB -= w * volume[i]; dnV += volume[i]; }
+    lijina1[i] = accA + accB;
+    lijin3[i] = upV - dnV;
+  }
+
+  // FILTER(X,N):首个信号后 N 根内屏蔽重复
+  const filter = (cond: (i: number) => boolean, gap: number): number[] => {
+    const out: number[] = [];
+    let last = -Infinity;
+    for (let i = 3; i < n; i++) {
+      if (i - last < gap) continue;
+      if (cond(i)) { out.push(i); last = i; }
+    }
+    return out;
+  };
+  const crossZero = (i: number) => lijina1[i] > 0 && lijina1[i - 1] <= 0;
+  const llv3 = (i: number) => Math.min(volume[i], volume[i - 1] ?? Infinity, volume[i - 2] ?? Infinity);
+
+  const sticks: BingGeTStick[] = [];
+  const texts: BingGeTText[] = [];
+  // ∠开始:CROSS(LIJINA1,0)&&C>REF(C,2)&&V>LLV(V,3)*3,FILTER 15,紫柱到 45% 轴差
+  for (const i of filter(i => crossZero(i) && close[i] > close[i - 2] && volume[i] > llv3(i) * 3, 15)) {
+    sticks.push({ i, yFrom: dayLoC, yTo: dayLoC + span * 0.45, color: '#e879f9', text: '∠开始', textColor: '#e879f9' });
+  }
+  // 黄棒:CROSS(LIJINA1,0)&&(C>REF(C,2)||(LIJIN3>0&&LIJIN3>LIJINA1)),FILTER 30,到 30%
+  for (const i of filter(i => crossZero(i) && (close[i] > close[i - 2] || (lijin3[i] > 0 && lijin3[i] > lijina1[i])), 30)) {
+    sticks.push({ i, yFrom: dayLoC, yTo: dayLoC + span * 0.30, color: '#facc15' });
+  }
+  // 起涨:CROSS(EXPMA30,EXPMA60),青柱到 15% + 黄字(原式 STICKLINE 无 FILTER,逐次都画)
+  for (let i = 3; i < n; i++) {
+    if (crossedUp(e30, e60, i)) {
+      sticks.push({ i, yFrom: dayLoC, yTo: dayLoC + span * 0.15, color: '#22d3ee', text: '起涨', textColor: '#facc15' });
+    }
+  }
+  // 上涨:FILTER(CROSS(起动线,1.01),30) 紫字贴底
+  for (const i of filter(i => e20[i] > 1.01 && e20[i - 1] <= 1.01, 30)) {
+    texts.push({ i, y: dayLoC, text: '上涨', color: '#e879f9' });
+  }
+  // 加仓:FILTER(散户线>均价线 && CROSS(C,散户线),30),黄字在均价线与散户线中间
+  for (const i of filter(i => retail[i] > vwap[i] && close[i] > retail[i] && close[i - 1] <= retail[i - 1], 30)) {
+    texts.push({ i, y: vwap[i] + (retail[i] - vwap[i]) / 2, text: '加仓', color: '#facc15' });
+  }
+
+  // —— 趋势线:DRAWLINE(cond1,p1,cond2,p2,1) → 最近 cond1 点连到下一个 cond2 点并右延 ——
+  const hhv = (arr: number[], i: number, nWin: number) => { let m = -Infinity; for (let k = Math.max(0, i - nWin + 1); k <= i; k++) m = Math.max(m, arr[k]); return m; };
+  const llv = (arr: number[], i: number, nWin: number) => { let m = Infinity; for (let k = Math.max(0, i - nWin + 1); k <= i; k++) m = Math.min(m, arr[k]); return m; };
+  const pairSegs = (
+    c1: (i: number) => boolean, p1f: (i: number) => number,
+    c2: (i: number) => boolean, p2f: (i: number) => number,
+  ): BingGeTTrendSeg[] => {
+    const segs: BingGeTTrendSeg[] = [];
+    let lastC1 = -1;
+    for (let i = 5; i < n; i++) {
+      if (lastC1 >= 0 && i > lastC1 && c2(i)) {
+        segs.push({ i1: lastC1, p1: p1f(lastC1), i2: i, p2: p2f(i) });
+        lastC1 = -1;
+      }
+      if (c1(i)) lastC1 = i;
+    }
+    return segs;
+  };
+  // 下降压力线(黄):HIGH>=HHV(H,30) 的高点 → LOW<=LLV(L,20) 处的 HHV(H,20)
+  const trendDown = pairSegs(
+    i => high[i] >= hhv(high, i, 30), i => high[i],
+    i => low[i] <= llv(low, i, 20), i => hhv(high, i, 20),
+  );
+  // 上涨支撑线(红):LOW<=LLV(L,20) 的低点 → HIGH>=HHV(H,10) 处的 LLV(L,10)
+  const trendUp = pairSegs(
+    i => low[i] <= llv(low, i, 20), i => low[i],
+    i => high[i] >= hhv(high, i, 10), i => llv(low, i, 10),
+  );
+
+  // —— 机构买卖比(大单:分钟成交额/8>20 即 >160万)与资金条(全量)——
+  let instBuy = 0; let instSell = 0; let flowBuy = 0; let flowSell = 0;
+  for (let i = 1; i < n; i++) {
+    const amtWan = volume[i] * close[i] / 100; // V(手)×C/100 ≈ 万元,与原式同口径
+    if (close[i] > close[i - 1]) flowBuy += amtWan;
+    else if (close[i] < close[i - 1]) flowSell += amtWan;
+    if (amtWan / 8 <= 20) continue;
+    if (close[i] > close[i - 1]) instBuy += amtWan;
+    else if (close[i] < close[i - 1]) instSell += amtWan;
+  }
+  const instTotal = instBuy + instSell;
+  return {
+    trendDown, trendUp, sticks, texts, zhuli, vwap,
+    instBuyPct: instTotal > 0 ? Math.round(instBuy / instTotal * 100) : 0,
+    instSellPct: instTotal > 0 ? Math.round(instSell / instTotal * 100) : 0,
+    flowBuyWan: flowBuy, flowSellWan: flowSell,
+  };
+}
+
+function cumSum(arr: number[], upto: number): number {
+  let s = 0;
+  for (let k = 0; k <= upto; k++) s += arr[k];
+  return s;
 }
 
 export function getLatestTradingSignal(signals: TradingSignal[]): TradingSignal | null {

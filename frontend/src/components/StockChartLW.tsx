@@ -46,8 +46,9 @@ import {
   calculateCCI,
   calculateWR,
 } from '../utils/indicators';
-import { bingGeTLevels, calculateIntradayTradingSignals, calculateTradingSignals, getLatestTradingSignal, TradingSignal } from '../utils/tradingSignals';
+import { bingGeTLevels, calculateIntradayTradingSignals, calculateTradingSignals, computeBingGeTOverlay, getLatestTradingSignal, TradingSignal } from '../utils/tradingSignals';
 import { listPaperPositions, type PaperPosition } from '../services/paperService';
+import { getTradeJournal, type TradeEntry } from '../services/journalService';
 
 const VOLUME_MIN = 18;
 const VOLUME_MAX = 420;
@@ -1825,6 +1826,8 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const vipAxisPaneRefs = useRef<Array<ISeriesApi<SeriesType, Time> | null>>([null, null, null]);
   const maSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]);
   const tLevelSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]); // 兵哥做T:分时阻力/支撑点线
+  const bingGeExtraSeriesRefs = useRef<ISeriesApi<SeriesType, Time>[]>([]); // 兵哥做T:[价红段,价绿段,主力线]
+  const bingGeOverlayCanvasRef = useRef<HTMLCanvasElement>(null); // 兵哥做T:趋势线/柱标/资金条自绘层
   const pctAxisSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null); // 分时左轴:涨跌幅%(相对昨收)
   const auctionLineSeriesRef = useRef<ISeriesApi<SeriesType, Time> | null>(null); // 集合竞价白色价线(真序列,由图表按索引定位,不用 timeToCoordinate 避免压缩)
   // 分时价格轴以昨收为中心上下对称(A股标准),autoscaleInfoProvider 从此读取
@@ -1921,6 +1924,13 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const displayData = hoverData || lastData;
   const displayTime = displayData?.time ? parseTime(displayData.time) : null;
   const bingGeTActive = mainChartTemplate === 'bingGeT' && period === '1m';
+
+  // 兵哥做T全套视觉元素:趋势线/柱标/文字/机构比/资金条/主力线/均价分界,
+  // 一次算好(computeBingGeTOverlay 与通达信公式逐段对应),canvas 与附加线共用。
+  const bingGeOverlay = useMemo(
+    () => (bingGeTActive ? computeBingGeTOverlay(safeData) : null),
+    [bingGeTActive, safeData],
+  );
   const tradingSignals = useMemo(
     () => (isTrendLinePeriod
       ? calculateIntradayTradingSignals(safeData, preClose, dayKData, bingGeTActive)
@@ -2278,6 +2288,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     }
     clearSeriesArray(chart, maSeriesRefs);
     clearSeriesArray(chart, tLevelSeriesRefs);
+    clearSeriesArray(chart, bingGeExtraSeriesRefs);
     if (pctAxisSeriesRef.current) {
       try { chart.removeSeries(pctAxisSeriesRef.current); } catch { /* already removed */ }
       pctAxisSeriesRef.current = null;
@@ -3497,9 +3508,27 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     return () => { alive = false; };
   }, [stock?.symbol]);
 
+  // ===== 真实持仓买卖点:交易台账的建/加/减/平流水,与模拟盘标记同一套样式 =====
+  // 标签用「(持)」跟模拟盘的「(模)」区分开 —— 同一根K线上两种仓位都可能有标记,
+  // 不区分的话根本看不出哪个是真金白银哪个是纸上模拟。
+  const [journalEntries, setJournalEntries] = useState<TradeEntry[]>([]);
+  useEffect(() => {
+    const sym = (stock?.symbol || '').toLowerCase();
+    if (!sym) { setJournalEntries([]); return; }
+    let alive = true;
+    getTradeJournal()
+      .then(list => { if (alive) setJournalEntries((list || []).filter(e => (e.stockCode || '').toLowerCase() === sym)); })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, [stock?.symbol]);
+
   // 买卖点解析:对齐到K线柱(分时按分钟/日K按日期),锚定柱高低价供 overlay 画带框标签
   const paperMarks = useMemo<{ time: Time; side: 'buy' | 'sell'; text: string; anchorLow: number; anchorHigh: number }[]>(() => {
-    if (!paperTrades.length || !safeData.length) return [];
+    // ⚠️两个来源各自判空:模拟盘为空不代表真实持仓也为空。
+    // 原来写的是 `!paperTrades.length || !safeData.length` —— 没有模拟仓时直接返回,
+    // 真实持仓的标记永远画不出来(三孚股份就是这样,查了一轮才发现卡在这一行)。
+    if (!safeData.length) return [];
+    if (!paperTrades.length && !journalEntries.length) return [];
     if (!isTrendLinePeriod && period !== '1d') return []; // 周/月K桶对不上具体日期,不标
     const byMinute = new Map<string, KLineData>();
     const byDate = new Map<string, KLineData>();
@@ -3527,8 +3556,43 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         }
       }
     }
-    return out;
-  }, [paperTrades, safeData, isTrendLinePeriod, period]);
+
+    // 真实持仓流水:建仓=买(持)、加仓=加(持)、减仓=减(持)、平仓=卖(持)
+    const ACT: Record<string, { txt: string; side: 'buy' | 'sell' }> = {
+      build:  { txt: '买(持)', side: 'buy' },
+      add:    { txt: '加(持)', side: 'buy' },
+      reduce: { txt: '减(持)', side: 'sell' },
+      close:  { txt: '卖(持)', side: 'sell' },
+    };
+    for (const e of journalEntries) {
+      for (const a of (e.actions || [])) {
+        const m = ACT[a.action];
+        if (!m || !a.tradeDate) continue;
+        const bar = locate(a.tradeDate, a.createdAt);
+        if (!bar) continue;
+        out.push({
+          time: parseTime(bar.time), side: m.side,
+          text: `${m.txt}${(a.price || 0).toFixed(2)}`,
+          anchorLow: bar.low, anchorHigh: bar.high,
+        });
+      }
+    }
+    // 去重:同一根K线 + 同方向 + 同价格 只留一个标记。两种重复都真实存在过——
+    //   ① 台账里同一天记了两条建仓(手滑点了两次保存)→ 两个一模一样的 买(持)
+    //   ② 减仓拆单会同时产生 close 和 reduce 两条流水,但用户只做了一个动作
+    // 标签冲突时取更具体的那个(减>卖、加>买),别把"减仓"显示成"清仓"。
+    const rank: Record<string, number> = { '减(持)': 2, '加(持)': 2, '卖(持)': 1, '买(持)': 1 };
+    const pick = new Map<string, typeof out[number]>();
+    for (const m of out) {
+      const price = m.text.replace(/^[^\d]*/, '');
+      const key = `${String(m.time)}|${m.side}|${price}`;
+      const prev = pick.get(key);
+      if (!prev) { pick.set(key, m); continue; }
+      const tag = (t: string) => t.replace(/[\d.]+$/, '');
+      if ((rank[tag(m.text)] || 0) > (rank[tag(prev.text)] || 0)) pick.set(key, m);
+    }
+    return [...pick.values()];
+  }, [paperTrades, journalEntries, safeData, isTrendLinePeriod, period]);
 
   // 箭头走 markers(自动叠放);文字标签由 overlay 自绘(黄框+深底,避开其他信号文字)
   const paperMarkerData = useMemo<SeriesMarker<Time>[]>(() => (
@@ -3632,6 +3696,171 @@ export const StockChartLW: React.FC<StockChartProps> = ({
     };
   }, [paperMarks, safeData, isTrendLinePeriod, chartViewport.width, chartViewport.height]);
 
+  // 兵哥做T自绘层:趋势线 / ∠开始·黄棒·起涨柱标 / 上涨·加仓文字 / 机构比 / 资金流条。
+  // 这些是通达信 DRAWLINE/STICKLINE/DRAWTEXT/DRAWRECTREL 的对应物,markers 画不了,
+  // 全部走 canvas(坐标随缩放平移重算,模式与上面的模拟盘标签层一致)。
+  useEffect(() => {
+    const canvas = bingGeOverlayCanvasRef.current;
+    const container = chartContainerRef.current;
+    const chart = chartRef.current;
+    const series = mainSeriesRef.current;
+    if (!canvas || !container || !chart || !series || !bingGeOverlay || !bingGeTActive) {
+      if (canvas) { const ctx = canvas.getContext('2d'); ctx?.clearRect(0, 0, canvas.width, canvas.height); }
+      return;
+    }
+    const ov = bingGeOverlay;
+    const timeScale = chart.timeScale();
+    let frame = 0;
+    const draw = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width <= 0 || height <= 0) return;
+      const dpr = window.devicePixelRatio || 1;
+      if (canvas.width !== Math.floor(width * dpr) || canvas.height !== Math.floor(height * dpr)) {
+        canvas.width = Math.floor(width * dpr);
+        canvas.height = Math.floor(height * dpr);
+      }
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const clipRight = Math.max(0, width - PRICE_SCALE_MIN_WIDTH);
+      // ⚠️裁剪必须从**左轴之后**开始,不能从 0。
+      // 分时图左右都有价格轴,从 0 起裁会让早盘那几根柱标(∠开始/黄棒)和左下角文字
+      // 直接压在左侧价格刻度上 —— 截图里"用到44.00据"那串糊字就是这么来的。
+      const leftPad = (() => {
+        try { return chart.priceScale('left').width(); } catch { return 0; }
+      })();
+      const clipLeft = Math.max(0, leftPad);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(clipLeft, 0, Math.max(0, clipRight - clipLeft), height);
+      ctx.clip();
+      const xAt = (i: number): number => {
+        const v = timeScale.timeToCoordinate(parseTime(safeData[i].time));
+        return typeof v === 'number' ? Number(v) : NaN;
+      };
+      const yAt = (price: number): number => {
+        const v = series.priceToCoordinate(price);
+        return typeof v === 'number' ? Number(v) : NaN;
+      };
+      // ① 趋势线(带右延,对应 DRAWLINE 的 EXPAND=1)
+      const drawTrend = (segs: typeof ov.trendDown, color: string) => {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        for (const seg of segs) {
+          const x1 = xAt(seg.i1); const y1 = yAt(seg.p1);
+          const x2 = xAt(seg.i2); const y2 = yAt(seg.p2);
+          if (![x1, y1, x2, y2].every(Number.isFinite) || x2 <= x1) continue;
+          const yEdge = y1 + (y2 - y1) * (clipRight - x1) / (x2 - x1);
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(clipRight, yEdge);
+          ctx.stroke();
+        }
+      };
+      drawTrend(ov.trendDown, '#eab308');
+      drawTrend(ov.trendUp, '#ef4444');
+      // ② 底部柱标 + 随柱文字
+      ctx.font = 'bold 11px "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.textBaseline = 'bottom';
+      for (const st of ov.sticks) {
+        const x = xAt(st.i);
+        const y0 = yAt(st.yFrom);
+        const y1 = yAt(st.yTo);
+        if (![x, y0, y1].every(Number.isFinite)) continue;
+        ctx.strokeStyle = st.color;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(x, y0);
+        ctx.lineTo(x, y1);
+        ctx.stroke();
+        if (st.text) {
+          ctx.fillStyle = st.textColor || st.color;
+          // 早盘的柱贴着绘图区左沿,文字直接写 x+3 会被裁掉一半 —— 夹进可视区再画
+          const tw = ctx.measureText(st.text).width;
+          ctx.fillText(st.text, Math.min(Math.max(x + 3, clipLeft + 2), clipRight - tw - 2), y1 - 2);
+        }
+      }
+      // ③ 上涨/加仓 文字
+      for (const t of ov.texts) {
+        const x = xAt(t.i);
+        const y = yAt(t.y);
+        if (![x, y].every(Number.isFinite)) continue;
+        ctx.fillStyle = t.color;
+        const tw2 = ctx.measureText(t.text).width;
+        ctx.fillText(t.text, Math.min(Math.max(x + 3, clipLeft + 2), clipRight - tw2 - 2), y - 2);
+      }
+      // ④ 左下:机构买卖比 + 未来数据提示(与通达信同位同色;提示照抄——中间价轴用了收盘定格值)
+      ctx.font = '11px Menlo, Consolas, monospace';
+      ctx.textBaseline = 'alphabetic';
+      const tx = clipLeft + 10; // 贴绘图区左沿,避开价格刻度
+      const ty = height - 120;
+      ctx.fillStyle = '#22d3ee';
+      ctx.fillText(`机构买=${ov.instBuyPct}%`, tx, ty);
+      ctx.fillStyle = '#34d399';
+      ctx.fillText(`机构卖=${ov.instSellPct}%`, tx, ty + 16);
+      ctx.fillStyle = '#64748b';
+      ctx.fillText('用到未来数据', tx, ty + 32);
+      // ⑤ 资金流条(对应 DRAWRECTREL 那组:左绿=卖、右红=买,上方金额,两侧占比,中带金流)
+      const total = ov.flowBuyWan + ov.flowSellWan;
+      if (total > 0) {
+        const bx0 = clipRight * 0.52;
+        const bx1 = clipRight * 0.86;
+        const by = height - 92;
+        const bh = 16;
+        const center = (bx0 + bx1) / 2;
+        const halfW = (bx1 - bx0) / 2;
+        const sellW = Math.min(halfW, ov.flowSellWan / total * halfW * 1.4);
+        const buyW = Math.min(halfW, ov.flowBuyWan / total * halfW * 1.4);
+        ctx.fillStyle = 'rgba(190,190,190,0.25)';
+        ctx.fillRect(bx0, by, bx1 - bx0, bh);
+        ctx.fillStyle = '#16a34a';
+        ctx.fillRect(center - sellW, by, sellW, bh);
+        ctx.fillStyle = '#dc2626';
+        ctx.fillRect(center, by, buyW, bh);
+        ctx.strokeStyle = 'rgba(220,220,220,0.8)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(bx0, by, bx1 - bx0, bh);
+        ctx.beginPath();
+        ctx.moveTo(center, by);
+        ctx.lineTo(center, by + bh);
+        ctx.stroke();
+        const wan = (v: number) => `${v.toFixed(2)}万`;
+        ctx.fillStyle = '#34d399';
+        ctx.fillText(wan(ov.flowSellWan), bx0 + 4, by - 5);
+        ctx.fillStyle = '#f87171';
+        ctx.textAlign = 'right';
+        ctx.fillText(wan(ov.flowBuyWan), bx1 - 4, by - 5);
+        ctx.fillText(`${(ov.flowBuyWan / total * 100).toFixed(2)}%`, bx0 - 6, by + bh - 3);
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#34d399';
+        ctx.fillText(`${(ov.flowSellWan / total * 100).toFixed(2)}%`, bx1 + 6, by + bh - 3);
+        const diff = ov.flowBuyWan - ov.flowSellWan;
+        ctx.fillStyle = diff >= 0 ? '#22d3ee' : '#34d399';
+        ctx.fillText(`${diff >= 0 ? '金流入' : '金流出'}${wan(Math.abs(diff))}`, center + 6, by + bh + 14);
+      }
+      ctx.restore();
+    };
+    const scheduleDraw = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(draw);
+    };
+    scheduleDraw();
+    const timeout = window.setTimeout(scheduleDraw, 120);
+    chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleDraw);
+    const resizeObserver = new ResizeObserver(scheduleDraw);
+    resizeObserver.observe(container);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(scheduleDraw);
+      resizeObserver.disconnect();
+    };
+  }, [bingGeOverlay, bingGeTActive, safeData, chartViewport.width, chartViewport.height]);
+
   // 5日图·日分界虚线:5个交易日连成一条分时线,日与日之间画深色竖直虚线便于分辨(2026-07-23 用户要)。
   useEffect(() => {
     const canvas = daySepCanvasRef.current;
@@ -3699,7 +3928,9 @@ export const StockChartLW: React.FC<StockChartProps> = ({
   const signalMarkerData = useMemo<SeriesMarker<Time>[]>(() => {
     // 默认主图交易标记全局关闭(SHOW_MAIN_TRADING_MARKERS=false);但"兵哥做T"模板下,
     // 它自己的 T买/T卖/涨/加 信号必须显示——这才是选这个模板的目的。
-    const isBingGeTSignal = (s: TradingSignal) => s.title.startsWith('兵哥T') || s.title === '起涨' || s.title === '加仓';
+    // 起涨/加仓 已由 overlay canvas 按通达信原样画(底部柱标/黄字),markers 只留 T买/T卖,
+    // 否则同一个信号会出现两遍(方块一遍、柱标一遍)。
+    const isBingGeTSignal = (s: TradingSignal) => s.title.startsWith('兵哥T');
     const source = SHOW_MAIN_TRADING_MARKERS
       ? compactMarkerSignals
       : (bingGeTActive ? compactMarkerSignals.filter(isBingGeTSignal) : []);
@@ -4140,6 +4371,19 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         });
         tLevelSeriesRefs.current = [resistanceSeries, supportSeries];
 
+        // 兵哥做T:价格线红绿分色段(C>=均价红、C<均价绿,同原式 IF(...)DRAWNULL)+ 主力线(紫点)。
+        // lightweight-charts 单条线不能分段变色,用两条线互相留白({time} 空洞)拼出来。
+        const bingGeRed = chart.addSeries(LineSeries, {
+          priceScaleId: 'left', color: '#f87171', lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+        });
+        const bingGeGreen = chart.addSeries(LineSeries, {
+          priceScaleId: 'left', color: '#34d399', lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+        });
+        const bingGeZhuli = chart.addSeries(LineSeries, {
+          priceScaleId: 'left', color: '#e879f9', lineWidth: 1, lineStyle: LineStyle.Dotted, priceLineVisible: false, lastValueVisible: false,
+        });
+        bingGeExtraSeriesRefs.current = [bingGeRed, bingGeGreen, bingGeZhuli];
+
         // 成交量
         volumeSeriesRef.current = volumeChart.addSeries(HistogramSeries, {
           priceFormat: { type: 'volume' },
@@ -4207,7 +4451,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         maSeriesRefs.current[0].setData(avgData);
       }
 
-      // 兵哥做T阻力/支撑:仅"兵哥做T"模板选中且分时1m 才画(默认分时不画)
+      // 兵哥做T阻力/支撑:仅"兵哥做T"模板选中且分时1m 才画(定格值 → 两条水平线,与通达信一致)
       if (tLevelSeriesRefs.current.length === 2) {
         if (mainChartTemplate === 'bingGeT' && period === '1m' && safeData.length >= 30) {
           const { support, resistance } = bingGeTLevels(safeData, preClose);
@@ -4216,6 +4460,31 @@ export const StockChartLW: React.FC<StockChartProps> = ({
         } else {
           tLevelSeriesRefs.current[0].setData([]);
           tLevelSeriesRefs.current[1].setData([]);
+        }
+      }
+      // 兵哥做T:价格红绿分段 + 主力线。红段=C>=当日累计均价,绿段=C<均价;
+      // 相邻段之间**多补一根衔接点**,否则每段开头会断一格。
+      if (bingGeExtraSeriesRefs.current.length === 3) {
+        if (bingGeOverlay) {
+          const red: (LineData | { time: Time })[] = [];
+          const green: (LineData | { time: Time })[] = [];
+          safeData.forEach((d, i) => {
+            const t = parseTime(d.time);
+            const above = d.close >= bingGeOverlay.vwap[i];
+            const prevAbove = i > 0 ? safeData[i - 1].close >= bingGeOverlay.vwap[i - 1] : above;
+            if (above) {
+              red.push({ time: t, value: d.close });
+              green.push(prevAbove ? { time: t } : { time: t, value: d.close });
+            } else {
+              green.push({ time: t, value: d.close });
+              red.push(!prevAbove ? { time: t } : { time: t, value: d.close });
+            }
+          });
+          bingGeExtraSeriesRefs.current[0].setData(red as LineData[]);
+          bingGeExtraSeriesRefs.current[1].setData(green as LineData[]);
+          bingGeExtraSeriesRefs.current[2].setData(safeData.map((d, i) => ({ time: parseTime(d.time), value: bingGeOverlay.zhuli[i] })) as LineData[]);
+        } else {
+          bingGeExtraSeriesRefs.current.forEach(sr => sr.setData([]));
         }
       }
     }
@@ -4435,7 +4704,7 @@ export const StockChartLW: React.FC<StockChartProps> = ({
       }
       hasFittedRef.current = true;
     }
-  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, allMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, sampledAuction, showAuction]);
+  }, [safeData, updateMode, preClose, isTrendLinePeriod, chartColors, clearAllSeries, clearSubChart, renderSubChart, indicatorConfig, allMarkerData, mainChartTemplate, openEatFishMainSeries, visibleRangeBars, stock?.symbol, stock?.name, floatSharesTick, period, sampledAuction, showAuction, bingGeOverlay]);
 
   // 副图指标独立于主图叠加开关，用户可自由切换 VOL/MACD/KDJ/RSI/CCI/WR（不再随设置回退）
 
@@ -5098,6 +5367,10 @@ export const StockChartLW: React.FC<StockChartProps> = ({
           className={`absolute inset-0 z-[5] pointer-events-none ${period === '5d' ? 'block' : 'hidden'}`}
         />
         {/* 模拟盘买(模)/卖(模)标签:黄框深底自绘,偏移避开信号文字 */}
+        <canvas
+          ref={bingGeOverlayCanvasRef}
+          className={`absolute inset-0 z-10 pointer-events-none ${bingGeTActive ? 'block' : 'hidden'}`}
+        />
         <canvas
           ref={paperOverlayCanvasRef}
           className={`absolute inset-0 z-10 pointer-events-none ${paperMarks.length > 0 ? 'block' : 'hidden'}`}

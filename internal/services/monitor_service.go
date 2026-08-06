@@ -34,10 +34,12 @@ type MonitorService struct {
 	pushService    *PushService
 	configService  *ConfigService
 
-	buyScan     func() // 尾盘买点扫描回调（由 App 注入，低吸，14:00）
-	waveScan    func() // 盘后波段扫描回调（由 App 注入，全A锯齿，17:30）
-	paperExit   func() // 模拟持仓风控巡检（由 App 注入，盘中每5分钟+尾盘窗口）
-	boardReseal func() // 游资炸板回封状态机（由 App 注入，盘中每分钟,名单空时是空转)
+	buyScan     func(part string) // 买点信号推送回调(由 App 注入)。part: light=三倍量+超跌起爆 / wave=波段
+	waveScan    func()            // 盘后波段扫描回调（由 App 注入，全A锯齿，17:30）
+	paperExit   func()            // 模拟持仓风控巡检（由 App 注入，盘中每5分钟+尾盘窗口）
+	boardReseal func()            // 游资炸板回封状态机（由 App 注入，盘中每分钟,名单空时是空转)
+	dataHealth  func()            // 日K数据新鲜度自检(由 App 注入,每交易日 09:10 与 17:20)
+	xOpenBuy    func()            // X 荐股博主推荐的次日开盘建仓(由 App 注入,每交易日 09:30)
 
 	mu            sync.Mutex
 	cancel        context.CancelFunc
@@ -61,7 +63,7 @@ func NewMonitorService(sessionService *SessionService, marketService *MarketServ
 }
 
 // SetBuyScanFunc 注入尾盘买点扫描回调。
-func (m *MonitorService) SetBuyScanFunc(fn func()) {
+func (m *MonitorService) SetBuyScanFunc(fn func(part string)) {
 	if m == nil {
 		return
 	}
@@ -82,6 +84,22 @@ func (m *MonitorService) SetPaperExitFunc(fn func()) {
 		return
 	}
 	m.paperExit = fn
+}
+
+// SetDataHealthFunc 注入日K数据新鲜度自检(见 app_data_health.go)。
+func (m *MonitorService) SetDataHealthFunc(fn func()) {
+	if m == nil {
+		return
+	}
+	m.dataHealth = fn
+}
+
+// SetXOpenBuyFunc 注入 X 荐股博主的开盘建仓(见 app_xblogger_buy.go)。
+func (m *MonitorService) SetXOpenBuyFunc(fn func()) {
+	if m == nil {
+		return
+	}
+	m.xOpenBuy = fn
 }
 
 // SetBoardResealFunc 注入游资炸板回封状态机(封死→炸板→回封买入,成文规则v1)。
@@ -222,11 +240,39 @@ func (m *MonitorService) tick() {
 	}
 
 	// 固定时点任务（贴收盘 / 盘后），各自每交易日仅一次
-	m.fireDailyWindow("buyscan", today, nowMin, 14*60, func() {
-		if m.buyScan != nil {
-			m.buyScan()
-		}
-	})
+	// 买点信号扫描(2026-07-30 用户定;全部 detached,不占 monitor 单槽)。
+	//
+	// 硬要求:**14:58 前必须推完**,否则手机收到时已收盘、票买不进,推了等于噪声。
+	// 盘中实测耗时(收盘后测的数据严重低估,别再用):
+	//   三倍量 + 超跌起爆 ≈ 15 秒(轻)
+	//   波段(全A锯齿)   ≈ 3分43秒(重)
+	//
+	// **每交易日只此一轮(14:40,用户 2026-07-30 定)**:波段先跑(最慢),
+	// 跑完立刻接着跑轻的两个 → 约 14:45 全部推完。
+	// 串成一轮而不是各排各的时点,是因为波段耗时波动大(降级态可到 8 分钟),
+	// 固定时点排在它后面要么撞车、要么留太多空档;跑完即接最省时也最紧凑。
+	// 即使波段拖到 8 分钟,14:48 也还在截止线内;真超了 App 侧会放弃推送。
+	// (曾另排过 14:30 的轻量预警轮,用户觉得多余,已摘。)
+	//
+	// **只推送不建仓**:建仓统一在 14:50 那轮,否则同票会在多个时点各建一次,仓位翻倍。
+	if m.buyScan != nil {
+		m.fireDailyWindowDetached("signalscan1440", today, nowMin, 14*60+40, func() { m.buyScan("full") })
+	}
+	// 日K数据新鲜度自检:两个时点各一次(2026-07-31 加)。
+	//   09:10 开盘前 —— 此刻应有"上一交易日"数据,让你在下单前就知道地基是不是旧的
+	//   17:20 采集窗口(16:00-17:00)之后 —— 此刻应有"今天"的数据,当天就抓到采集失败
+	// 起因:采集开关被关掉后 stock_daily 连断 4 个交易日无人察觉(体感练习/复盘/学习日报/
+	// 扣费超额基准全部静默停在那天,界面不报错),最后靠用户提问才发现。静默失效必须主动探。
+	if m.dataHealth != nil {
+		m.fireDailyWindow("datahealth0910", today, nowMin, 9*60+10, m.dataHealth)
+		m.fireDailyWindow("datahealth1720", today, nowMin, 17*60+20, m.dataHealth)
+	}
+	// X 荐股博主的推荐在 09:30 开盘建仓。用**执行时刻的实时价**记账,不是当日开盘价——
+	// 若因重启拖到 09:50 才跑,那就按 09:50 的价买,记录里的 day_open 会把这个差异显出来。
+	// 拿已经走完的开盘价回头入账才是前视偏差。
+	if m.xOpenBuy != nil {
+		m.fireDailyWindowDetached("xopenbuy0930", today, nowMin, 9*60+30, m.xOpenBuy)
+	}
 	m.fireDailyWindow("tail1430", today, nowMin, 14*60+30, func() { m.MonitorPositionsIntraday() })
 	m.fireDailyWindow("tail1455", today, nowMin, 14*60+55, func() { m.MonitorPositionsIntraday() })
 	if cfg.AfterMarketCheck {
@@ -257,6 +303,32 @@ func (m *MonitorService) fireDailyWindow(taskKey, today string, nowMin, targetMi
 	}
 }
 
+// fireDailyWindowDetached 与 fireDailyWindow 同样的"每交易日仅一次"窗口语义,但**不占用 monitor
+// 的单槽执行位**(runGuarded),而是起独立 goroutine 跑。给「自带并发控制且耗时长」的任务用。
+//
+// ⚠️2026-07-30 血的教训:买点信号扫描原来走 runGuarded,而盘中它要跑 8 分半(波段一家 3分43秒,
+// 我此前测的 55s 是收盘后测的,严重低估)。后果两头堵:
+//
+//	① 它占着那把锁的 14:50-14:59,炸板回封(每分钟)和模拟持仓风控巡检(每5分钟)全被卡死;
+//	② 它自己也被别的任务挡着——当天 14:30 的窗口一路被挡到 14:50:27 才开始,
+//	   导致推送落到 15:00 收盘后才到手机,票根本来不及买。
+//
+// 所以:长任务必须脱离这把全局锁,靠自己的 mutex 防重入。
+func (m *MonitorService) fireDailyWindowDetached(taskKey, today string, nowMin, targetMin int, fn func()) {
+	if nowMin < targetMin || nowMin >= targetMin+30 {
+		return
+	}
+	m.mu.Lock()
+	done := m.dailyDone[taskKey] == today
+	if !done {
+		m.dailyDone[taskKey] = today // 不看 m.running:本任务不排这个队
+	}
+	m.mu.Unlock()
+	if !done {
+		go fn()
+	}
+}
+
 func (m *MonitorService) runGuarded(fn func()) {
 	m.mu.Lock()
 	if m.running {
@@ -284,6 +356,7 @@ func (m *MonitorService) MonitorPositionsIntraday() int {
 		return 0
 	}
 	snap := m.snapshotMap()
+	today := m.cstNow().Format("2006-01-02")
 	fired := 0
 	for _, held := range positions {
 		row, ok := snap[held.StockCode]
@@ -296,26 +369,42 @@ func (m *MonitorService) MonitorPositionsIntraday() int {
 		cost := held.Position.CostPrice
 		pnl := (price - cost) / cost * 100
 
+		// ⚠️A股 T+1:当日买入当日不可卖。下面 1/2/3 类告警都是"现在就走"的指令,
+		// 对当日新仓根本执行不了——2026-07-27 实例:14:10 推荐买入、14:44 就推"换手>12% 建议先走",
+		// 而那批仓位买入日正是当天。
+		// 这里**不静默丢弃**:跌到 -5% 你仍然该知道,只是不能假装你现在能卖。
+		// 所以照推、但把 T+1 事实钉在文案里,并降一档紧急度(不必立刻掏手机)。
+		// 注:第 4 类「跌破10日线」文案本来就写"明日不收回则离场",指向次日,不受影响。
+		// (模拟持仓引擎 app.go ApplyPaperExitRules 早在 2026-07-21 就加了同款守卫,
+		//  推送这条路一直漏着,同一个坑只补了一半。)
+		newToday := strings.TrimSpace(held.Position.BuyDate) == today
+		t1Note := ""
+		level := "timeSensitive"
+		if newToday {
+			t1Note = "｜⚠️当日买入,T+1 次日才可卖,今日无法执行"
+			level = "active"
+		}
+
 		// 1) 止损 -5%（无条件，最高优先级）
 		if pnl <= stopLossPct {
-			m.push(held, models.PushTypeStopLoss, "timeSensitive",
-				fmt.Sprintf("现价 %.2f，成本 %.2f，浮亏 %.1f%%，触发 -5%% 止损线，无条件离场", price, cost, pnl))
+			m.push(held, models.PushTypeStopLoss, level,
+				fmt.Sprintf("现价 %.2f，成本 %.2f，浮亏 %.1f%%，触发 -5%% 止损线，无条件离场%s", price, cost, pnl, t1Note))
 			fired++
 			continue
 		}
 
 		// 2) 止盈 +15%（短线累计涨幅，减半）
 		if pnl >= takeProfitPct {
-			m.push(held, models.PushTypeTakeProfit, "timeSensitive",
-				fmt.Sprintf("现价 %.2f，累计涨 %.1f%%，达 +15%% 止盈线，建议减半仓锁利", price, pnl))
+			m.push(held, models.PushTypeTakeProfit, level,
+				fmt.Sprintf("现价 %.2f，累计涨 %.1f%%，达 +15%% 止盈线，建议减半仓锁利%s", price, pnl, t1Note))
 			fired++
 			continue
 		}
 
 		// 3) 换手 >12%（疑似主力出货）
 		if turnover > turnoverExitPct {
-			m.push(held, models.PushTypeTakeProfit, "timeSensitive",
-				fmt.Sprintf("换手率 %.1f%%（>12%%），主力疑似出货，浮盈 %.1f%%，建议先走", turnover, pnl))
+			m.push(held, models.PushTypeTakeProfit, level,
+				fmt.Sprintf("换手率 %.1f%%（>12%%），主力疑似出货，浮盈 %.1f%%，建议先走%s", turnover, pnl, t1Note))
 			fired++
 			continue
 		}

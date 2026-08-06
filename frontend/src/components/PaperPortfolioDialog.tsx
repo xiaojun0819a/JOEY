@@ -598,7 +598,9 @@ export const PaperPortfolioDialog: React.FC<Props> = ({ isOpen, onClose, onOpenS
             {tipResult && (
               <div className="mt-2 space-y-1">
                 <div className="fin-text-tertiary">{tipResult.at} · 记入 <b className="text-sky-300">{tipResult.added}</b> 只，跳过 {tipResult.skipped} 只</div>
-                {tipResult.rows.map(r => (
+                {/* Go 的 nil slice 序列化成 JSON null,直接 .map 会崩 —— 远程模式下这类空值
+                    在本项目已经崩过好几次,统一用 (x || []) 兜底 */}
+                {(tipResult.rows || []).map(r => (
                   <div key={r.symbol} className={`rounded border px-2 py-1 text-[11px] ${r.skipped ? 'border-red-500/25 bg-red-500/5 fin-text-tertiary' : 'border-emerald-500/25 bg-emerald-500/5'}`}>
                     <b>{r.name || r.symbol}</b> <span className="font-mono fin-text-tertiary">{r.symbol}</span>
                     {r.skipped

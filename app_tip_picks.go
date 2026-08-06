@@ -25,7 +25,10 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/run-bigpig/jcp/internal/models"
 )
 
 // tipPickSource 来源 ID。ID 是数据唯一键不可改;界面名在前端 STRATEGY_SOURCE_LABELS 里。
@@ -173,4 +176,121 @@ func (a *App) AddTipPicks(raw string, amountPerStock float64, note string) (*Tip
 	}
 	log.Info("荐股建仓[%s] 记入%d 跳过%d @%s", res.Note, res.Added, res.Skipped, res.At)
 	return res, nil
+}
+
+// ===== 买点信号推送扫描(2026-07-28 用户定:波段/三倍量/超跌起爆,14:30 与 14:45 各一次) =====
+//
+// 背景:此前**只有波段(手动跑)和低吸选股1(已下架)会推买点**,14:50 那轮全量扫描只建仓不推送,
+// 所以摘掉低吸选项1 之后自动买点推送归零。用户要这三个策略在尾盘两个时点推给他。
+//
+// 纪律:
+//   ① 只推送不建仓——建仓统一在 14:50 那轮,否则同票会在三个时点各建一次,仓位翻三倍。
+//   ② 单飞锁:两个时点若因重启等原因叠到一起,后一轮直接跳过,不叠跑(NAS 是 J4125,
+//      全量扫描叠跑过 OOM,见 tailScanAllMu 的注释)。
+//   ③ 推送带【策略名】,几条并排能看出是谁选的。
+//   ④ 涨停封死买不进的票不推(isPriceAtLimitUp,在 pushScannerSignals 里已拦)。
+
+var signalPushScanMu sync.Mutex
+
+// signalPushDeadlineMin 推送硬截止(14:57)。过了这个点还没算完就**放弃推送**:
+// 手机收到时已接近/越过收盘,票根本买不进,推出去只是噪声,还会污染"我看到信号了"的判断。
+// 2026-07-30 实录:波段那轮拖到 14:58:59 才出结果、推送 15:00 才到手机,用户明确要求 14:58 前推完。
+const signalPushDeadlineMin = 14*60 + 57
+
+// tooLateToPush 现在推还来得及吗(非交易日/收盘后一律来不及)。
+func (a *App) tooLateToPush() bool {
+	now := time.Now().In(time.FixedZone("CST", 8*60*60))
+	return now.Hour()*60+now.Minute() >= signalPushDeadlineMin
+}
+
+// runSignalPushScan 买点信号推送扫描。part: "light"=三倍量+超跌起爆(约15秒) / "wave"=波段(约4分钟)。
+// 拆开跑是因为两者耗时差一个数量级,混在一起会被波段拖到收盘后(见 monitor 侧时间表注释)。
+func (a *App) runSignalPushScan(part string) {
+	if a == nil || a.pushService == nil {
+		return
+	}
+	if !signalPushScanMu.TryLock() {
+		log.Info("买点信号扫描[%s]:上一轮还没跑完,本轮跳过(不叠跑)", part)
+		return
+	}
+	defer signalPushScanMu.Unlock()
+
+	// 让路:14:52 那次会紧跟在 14:50 自动建仓那轮(RunTailForwardScanAll)之后。
+	// 这里**只探测不占用** tailScanAllMu——一旦真把锁拿在手里,建仓那轮的 TryLock 会失败、整轮被跳过,
+	// 那比叠跑还糟。最多等 2 分钟:等太久会撞上推送截止,不如放弃这一轮。
+	for i := 0; i < 24; i++ {
+		if tailScanAllMu.TryLock() {
+			tailScanAllMu.Unlock()
+			break
+		}
+		if i == 0 {
+			log.Info("买点信号扫描[%s]:全量扫描进行中,等它跑完再开始(避免叠跑打爆内存)", part)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	if a.tooLateToPush() {
+		log.Info("买点信号扫描[%s]:已过 14:57 推送截止,放弃本轮(推了也买不进)", part)
+		return
+	}
+
+	// part=="full":波段先跑(最慢),**跑完立刻接着跑轻的两个**,不再等下一个定时窗口。
+	// 用户 2026-07-30 定的顺序。好处是三个策略在同一轮里连着推完(约 14:40→14:45),
+	// 不会出现"波段推了、另两个还要再等十几分钟"的割裂,也不用为轻任务单开一个时点。
+	if part == "full" || part == "wave" {
+		// ⚠️RunWaveScanner 内部**已经调用 pushWaveSignals**,这里绝不能再推一次(会重复轰炸);
+		// 它也自带 waveScanMu 单飞锁,与手动扫描叠跑时会自己让路。
+		// 用带闸门的口径(大盘环境不通过就不出票),与手动跑一致——推送不该比手动更宽松。
+		res := a.RunWaveScanner()
+		log.Info("买点信号扫描[波段]:选出 %d 只(闸门%v)", len(res.Items), res.GatePassed)
+		// 放进跨账号共享池,署名「系统自动扫描」。不做这一步的话,用户打开波段弹窗
+		// 看到的仍是上一次**手动**扫描的旧结果——后台刚扫过一轮界面上完全看不出来。
+		publishSharedScan("RunWaveScanner", res, sharedScanAutoUser)
+		if part == "wave" {
+			return
+		}
+		if a.tooLateToPush() { // 波段若异常慢(降级态可到 8 分钟),后面的就别推了
+			log.Info("买点信号扫描:波段跑完已过 14:57 截止,后续策略不再推送")
+			return
+		}
+	}
+
+	for _, s := range []struct {
+		label  string
+		method string // 共享池按 RPC 方法名索引,要和前端取数用的名字一致
+		run    func(models.LowBuyScannerRequest) models.LowBuyScannerResult
+	}{
+		{"三倍量", "RunTripleVolumeScannerV5", a.RunTripleVolumeScannerV5},
+		{"超跌起爆", "RunOversoldIgniteScanner", a.RunOversoldIgniteScanner},
+	} {
+		res := s.run(models.LowBuyScannerRequest{Limit: 10})
+		// 先发布再判截止:结果本身值得看(界面上能看到后台扫过什么),
+		// 只有"推送到手机"才受 14:57 截止约束——推了买不进才是噪声,看一眼不是。
+		publishSharedScan(s.method, res, sharedScanAutoUser)
+		if a.tooLateToPush() { // 每只算完再看一次表:降级态下单个扫描也可能拖很久
+			log.Info("买点信号扫描[%s]:算完已过截止,不再推送", s.label)
+			return
+		}
+		log.Info("买点信号扫描[%s]:选出 %d 只", s.label, len(res.Items))
+		a.pushScannerSignals(res.Items, s.label)
+	}
+}
+
+// ReportFrontendError 前端渲染崩溃上报(2026-07-30 建)。
+//
+// 起因:模拟持仓弹窗被 SafeBoundary 接住报"页面出错",但 SafeBoundary 只 console.error,
+// 而 Wails 产品版打不开 devtools —— 错误信息完全取不到,只能靠猜。这类崩溃项目里已发生多次
+// (体感练习白屏、模拟持仓 toFixed 崩),每次都要重新摸。
+//
+// 装上这个后,前端崩溃会落进 server.log,ssh 上去 grep「前端渲染崩溃」即可看到组件栈。
+// 刻意不返回错误、不抛异常:上报失败绝不能再引发一次崩溃。
+func (a *App) ReportFrontendError(where, message, stack string) string {
+	trim := func(s string, n int) string {
+		s = strings.TrimSpace(s)
+		if r := []rune(s); len(r) > n {
+			return string(r[:n]) + "…"
+		}
+		return s
+	}
+	log.Warn("前端渲染崩溃 [%s] %s\n组件栈:%s", trim(where, 80), trim(message, 500), trim(stack, 1500))
+	return "ok"
 }

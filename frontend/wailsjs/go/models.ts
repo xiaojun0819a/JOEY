@@ -669,6 +669,165 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class XIngestPost {
+	    id: string;
+	    postedAt: string;
+	    text: string;
+	    url: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new XIngestPost(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.postedAt = source["postedAt"];
+	        this.text = source["text"];
+	        this.url = source["url"];
+	    }
+	}
+	export class XIngestRequest {
+	    handle: string;
+	    posts: XIngestPost[];
+	    dryRun: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new XIngestRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.handle = source["handle"];
+	        this.posts = this.convertValues(source["posts"], XIngestPost);
+	        this.dryRun = source["dryRun"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class XIngestResult {
+	    blogger: string;
+	    display: string;
+	    received: number;
+	    new: number;
+	    repeat: number;
+	    updated: number;
+	    parsed: xblogger.Parsed[];
+	    errors?: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new XIngestResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.blogger = source["blogger"];
+	        this.display = source["display"];
+	        this.received = source["received"];
+	        this.new = source["new"];
+	        this.repeat = source["repeat"];
+	        this.updated = source["updated"];
+	        this.parsed = this.convertValues(source["parsed"], xblogger.Parsed);
+	        this.errors = source["errors"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class XManualRow {
+	    line: string;
+	    blogger: string;
+	    display: string;
+	    posted: string;
+	    target: string;
+	    symbols: string[];
+	    names: string[];
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new XManualRow(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.line = source["line"];
+	        this.blogger = source["blogger"];
+	        this.display = source["display"];
+	        this.posted = source["posted"];
+	        this.target = source["target"];
+	        this.symbols = source["symbols"];
+	        this.names = source["names"];
+	        this.error = source["error"];
+	    }
+	}
+	export class XManualResult {
+	    rows: XManualRow[];
+	    added: number;
+	    signals: number;
+	    failed: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new XManualResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.rows = this.convertValues(source["rows"], XManualRow);
+	        this.added = source["added"];
+	        this.signals = source["signals"];
+	        this.failed = source["failed"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
 	export class boardResealWatch {
 	    symbol: string;
 	    name: string;
@@ -5695,6 +5854,131 @@ export namespace tools {
 	        this.description = source["description"];
 	    }
 	}
+
+}
+
+export namespace xblogger {
+	
+	export class Plan {
+	    symbol: string;
+	    name: string;
+	    entryLow: number;
+	    entryHigh: number;
+	    tp1: number;
+	    tp2: number;
+	    stop: number;
+	    raw: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Plan(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.symbol = source["symbol"];
+	        this.name = source["name"];
+	        this.entryLow = source["entryLow"];
+	        this.entryHigh = source["entryHigh"];
+	        this.tp1 = source["tp1"];
+	        this.tp2 = source["tp2"];
+	        this.stop = source["stop"];
+	        this.raw = source["raw"];
+	    }
+	}
+	export class Pick {
+	    symbol: string;
+	    name: string;
+	    kind: string;
+	    source: string;
+	    rawLine: string;
+	    warnings?: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Pick(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.symbol = source["symbol"];
+	        this.name = source["name"];
+	        this.kind = source["kind"];
+	        this.source = source["source"];
+	        this.rawLine = source["rawLine"];
+	        this.warnings = source["warnings"];
+	    }
+	}
+	export class TargetDate {
+	    date: string;
+	    basis: string;
+	    sameDay: boolean;
+	    guessed: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new TargetDate(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.date = source["date"];
+	        this.basis = source["basis"];
+	        this.sameDay = source["sameDay"];
+	        this.guessed = source["guessed"];
+	    }
+	}
+	export class Parsed {
+	    blogger: string;
+	    handle: string;
+	    display: string;
+	    postedAt: string;
+	    target: TargetDate;
+	    buys: Pick[];
+	    holds: Pick[];
+	    exits: Pick[];
+	    warnings?: string[];
+	    needsReview: boolean;
+	    segments: number;
+	    plans?: Plan[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Parsed(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.blogger = source["blogger"];
+	        this.handle = source["handle"];
+	        this.display = source["display"];
+	        this.postedAt = source["postedAt"];
+	        this.target = this.convertValues(source["target"], TargetDate);
+	        this.buys = this.convertValues(source["buys"], Pick);
+	        this.holds = this.convertValues(source["holds"], Pick);
+	        this.exits = this.convertValues(source["exits"], Pick);
+	        this.warnings = source["warnings"];
+	        this.needsReview = source["needsReview"];
+	        this.segments = source["segments"];
+	        this.plans = this.convertValues(source["plans"], Plan);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
+	
 
 }
 

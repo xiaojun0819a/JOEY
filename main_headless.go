@@ -16,6 +16,7 @@ import (
 	"io"
 	stdlog "log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/run-bigpig/jcp/internal/pkg/paths"
 	"github.com/run-bigpig/jcp/internal/rt"
+	"github.com/run-bigpig/jcp/internal/xblogger"
 )
 
 func main() {
@@ -48,6 +50,9 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 让后台定时扫描的结果也能进跨账号共享池(必须在 startup 之前接好,调度器一起就可能用到)
+	wireSharedScanPublisher()
 
 	// 复用桌面版同样的启动流程(调度器、MCP、服务初始化)
 	app.startup(ctx)
@@ -113,6 +118,18 @@ func main() {
 				return
 			}
 			dir = g.reportsDir()
+		}
+		// 报告是 .doc(Word 兼容的 HTML)。不加下面这两个头,浏览器会**把它当网页渲染**——
+		// 用户点「下载 Word」看到的是网页版,拿不到能给 Word 打开的文件(2026-08-05 反馈)。
+		// Content-Disposition: attachment 才会触发下载;文件名同时给 ASCII 和 UTF-8 两版,
+		// 因为报告名是中文,只给 filename= 的话浏览器会存成乱码。
+		if name := strings.TrimPrefix(r.URL.Path, "/reports/"); strings.HasSuffix(strings.ToLower(name), ".doc") {
+			if decoded, err := url.PathUnescape(name); err == nil {
+				name = decoded
+			}
+			w.Header().Set("Content-Type", "application/msword")
+			w.Header().Set("Content-Disposition",
+				fmt.Sprintf("attachment; filename=\"report.doc\"; filename*=UTF-8''%s", url.PathEscape(name)))
 		}
 		http.StripPrefix("/reports/", http.FileServer(http.Dir(dir))).ServeHTTP(w, r)
 	})))
@@ -203,6 +220,72 @@ func main() {
 		_, _ = w.Write([]byte(b.String()))
 	})))
 
+	// /x/ingest 给那台常开的 Windows 笔记本用:它挂着 VPN 能打开 x.com,NAS 打不开。
+	// 抓取端只负责搬运原始文本,解析全在这边 —— 规则以后天天要改,改服务端不用去动那台机器。
+	// 收 JSON({handle, posts:[{id, postedAt, text, url}]}),tweet id 做幂等键,重复推不会重复建仓。
+	mux.Handle("/x/ingest", auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "private, no-store")
+		if role, _ := r.Context().Value(ctxKeyRole{}).(string); token != "" && role != "admin" {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "仅管理员可用"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "请用 POST"})
+			return
+		}
+		var req XIngestRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败:" + err.Error()})
+			return
+		}
+		res, err := app.IngestXPosts(req)
+		if err != nil {
+			// 200 + error 字段:抓取端是个无人值守的脚本,非 2xx 会被它当网络故障重试,
+			// 而"未登记的博主"这类错误重试一万次也不会好,必须让它把原因记进日志。
+			writeJSON(w, http.StatusOK, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})))
+
+	// /x/manual 手动补录历史推荐:请求体就是纯文本,一行一条「博主 发帖日 股票...」。
+	// 存在的理由是自动回溯被 X 限流卡死(六个博主连跑,五个只翻到两周)——
+	// 用户翻手机看一眼就能补,比等机器爬快得多。响应回人话纯文本,手机上直接看。
+	mux.Handle("/x/manual", auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "private, no-store")
+		if role, _ := r.Context().Value(ctxKeyRole{}).(string); token != "" && role != "admin" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("仅管理员可用"))
+			return
+		}
+		if r.Method != http.MethodPost {
+			_, _ = w.Write([]byte("POST 纯文本,一行一条:\n  老枪 07-30 神州信息 武商集团\n  云舒 2026-07-15 创新医疗、顺钠股份\n\n可用博主简称:" + xblogger.AliasHint()))
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 512<<10))
+		if err != nil {
+			_, _ = w.Write([]byte("读取失败:" + err.Error()))
+			return
+		}
+		res, err := app.AddXSignalsManual(string(body))
+		if err != nil {
+			_, _ = w.Write([]byte("❌ " + err.Error()))
+			return
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "✅ 入库 %d 行 / %d 只,失败 %d 行\n\n", res.Added, res.Signals, res.Failed)
+		for _, row := range res.Rows {
+			if row.Error != "" {
+				fmt.Fprintf(&b, "✗ %s\n   %s\n", row.Line, row.Error)
+				continue
+			}
+			fmt.Fprintf(&b, "· [%s] 发帖%s → 买入日%s  %s\n",
+				row.Display, row.Posted, row.Target, strings.Join(row.Names, "、"))
+		}
+		_, _ = w.Write([]byte(b.String()))
+	})))
+
 	srv := &http.Server{Addr: addr, Handler: withCORS(mux)}
 
 	// 优雅退出
@@ -272,6 +355,17 @@ var guestBlockedMethods = map[string]bool{
 	"TestPush":   true,
 	// 账号分级
 	"SetUserTrusted": true,
+
+	// 往主人模拟盘里塞仓位的入口 —— 一律禁访客(2026-07-31 补)。
+	//
+	// 这几个方法的数据都落在**主人数据目录**,不做访客隔离(它们本来就是主人专属功能)。
+	// 而访客名单是黑名单制:没列进来就等于放行。漏一个的后果不是"看到不该看的",而是
+	// 访客能往主人的持仓里建仓、能把自动建仓开关打开、能拿伪造的推文触发推送到主人手机。
+	// ⚠️以后再加"写主人持仓/改主人开关"的方法,必须同时加进这里。
+	"AddTipPicks":        true, // 荐股跟单建仓(此前只挡了 /tip/submit 这个 HTTP 口,RPC 同名方法一直漏着)
+	"IngestXPosts":       true, // X 博主推文入库 → 会推送、会建仓
+	"SetXBloggerAutoBuy": true, // 自动建仓总闸
+	"RunXOpenBuy":        true, // 直接触发开盘建仓
 }
 
 // guestResourceMethods 资源类防线:普通访客 403,信任账号(RemoteUser.Trusted)放行。
@@ -631,6 +725,20 @@ func sharedScanLatest(name string) map[string]any {
 		"user":   best.user,
 		"result": json.RawMessage(best.body),
 	}
+}
+
+// wireSharedScanPublisher 让「不走 HTTP 的内部扫描」也能把结果放进共享池。
+// 后台定时扫描(14:40 买点信号轮)是 Go 直接调扫描函数的,不经过 RPC 处理器,
+// 以前结果进不了共享池 → 用户打开弹窗只看得到上一次手动扫描的旧结果。见 app_shared_publish.go。
+func wireSharedScanPublisher() {
+	SetSharedScanPublisher(func(method string, result any, user string) {
+		b, err := json.Marshal(result)
+		if err != nil {
+			return
+		}
+		// reqBody 用固定标记:内部调用没有真实请求体,同方法的自动扫描互相覆盖即可
+		sharedScanPut(method, []byte("__auto__"), b, user)
+	})
 }
 
 func sharedScanPut(name string, reqBody, resp []byte, user string) {

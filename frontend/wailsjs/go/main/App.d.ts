@@ -25,6 +25,8 @@ export function AddTipPicks(arg1:string,arg2:number,arg3:string):Promise<main.Ti
 
 export function AddToWatchlist(arg1:models.Stock):Promise<string>;
 
+export function AddXSignalsManual(arg1:string):Promise<main.XManualResult>;
+
 export function ApplyPaperExitRules():Promise<number>;
 
 export function AskBoardReport(arg1:main.AskBoardReportRequest):Promise<main.AskBoardReportResponse>;
@@ -41,9 +43,13 @@ export function BackfillWatchlistHistory(arg1:number):Promise<models.HistoryBack
 
 export function BacktestLimitupRetrace(arg1:string,arg2:string):Promise<string>;
 
+export function BacktestSecondWave(arg1:string,arg2:string):Promise<string>;
+
 export function CancelInterruptedMeeting(arg1:string):Promise<boolean>;
 
 export function CancelMeeting(arg1:string):Promise<boolean>;
+
+export function CheckDataFreshness():Promise<string>;
 
 export function CheckForUpdate():Promise<services.UpdateInfo>;
 
@@ -263,6 +269,8 @@ export function Greet(arg1:string):Promise<string>;
 
 export function ImportAIReport(arg1:string,arg2:string,arg3:string,arg4:number,arg5:number,arg6:string,arg7:string):Promise<string>;
 
+export function IngestXPosts(arg1:main.XIngestRequest):Promise<main.XIngestResult>;
+
 export function IsTrustedRemoteUser(arg1:string):Promise<boolean>;
 
 export function LearnAllStrategiesNow():Promise<string>;
@@ -285,6 +293,10 @@ export function OpenURL(arg1:string):Promise<void>;
 
 export function PushSignal(arg1:models.PushSignal):Promise<models.PushResult>;
 
+export function RealizedPnLOfStock(arg1:string):Promise<number>;
+
+export function ReduceStockPosition(arg1:string,arg2:number,arg3:number,arg4:string):Promise<string>;
+
 export function RefreshFundamentals():Promise<string>;
 
 export function RefreshFundamentalsHistory():Promise<string>;
@@ -298,6 +310,8 @@ export function RenameStockGroupDef(arg1:string,arg2:string):Promise<string>;
 export function ReopenPaperPosition(arg1:number):Promise<string>;
 
 export function RepairQfqGaps(arg1:string):Promise<string>;
+
+export function ReportFrontendError(arg1:string,arg2:string,arg3:string):Promise<string>;
 
 export function ReprobeBackend():Promise<main.BackendMode>;
 
@@ -377,6 +391,8 @@ export function RunWaveScannerWithGate(arg1:boolean):Promise<models.WaveScanResu
 
 export function RunWaveTimingBacktest(arg1:number,arg2:number):Promise<services.WaveTimingBacktestResult>;
 
+export function RunXOpenBuy():Promise<string>;
+
 export function SaveTradeJournal(arg1:models.TradeJournalRequest):Promise<string>;
 
 export function SearchStocks(arg1:string):Promise<Array<services.StockSearchResult>>;
@@ -401,6 +417,8 @@ export function SetTailForwardConfig(arg1:boolean,arg2:boolean):Promise<string>;
 
 export function SetUserTrusted(arg1:string,arg2:boolean):Promise<string>;
 
+export function SetXBloggerAutoBuy(arg1:string,arg2:boolean):Promise<string>;
+
 export function StartBoardReport(arg1:main.GenerateBoardReportRequest):Promise<main.BoardReportStatus>;
 
 export function StartDrillTapeBackfill(arg1:string,arg2:string):Promise<string>;
@@ -408,6 +426,8 @@ export function StartDrillTapeBackfill(arg1:string,arg2:string):Promise<string>;
 export function StartHistoryMinuteBackfill(arg1:string,arg2:string,arg3:number):Promise<string>;
 
 export function StartResearchReport(arg1:string,arg2:string):Promise<main.ResearchReportStatus>;
+
+export function SweepSecondWaveParams(arg1:string,arg2:string):Promise<string>;
 
 export function SyncTradeJournalWatchGroup():Promise<string>;
 
@@ -430,6 +450,10 @@ export function UpdatePaperPosition(arg1:number,arg2:number,arg3:number):Promise
 export function UpdateStockPosition(arg1:string,arg2:number,arg3:number,arg4:string):Promise<string>;
 
 export function UpdateStrategy(arg1:models.Strategy):Promise<string>;
+
+export function ValidateSecondWaveOOS(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function VerifyXBloggers(arg1:string,arg2:string):Promise<string>;
 
 export function WindowClose():Promise<void>;
 
