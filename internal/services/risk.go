@@ -42,7 +42,15 @@ var riskDipBuy = RiskProfile{Name: "低吸系(V1.2)", HardStopPct: -5, Breakeven
 // 尾盘买入6 写的一直是"买入价-5%止损",引擎却按 -3% 执行,现在两边对上了。
 // 代价要认:止盈封顶仍是 +6%,盈亏比从 1:2 降到约 1:1.2,同样胜率下单笔期望更薄;
 // 且 -3% 时代平掉的历史样本与此后的不同口径,计分卡跨这条线比较要留意。
-var riskOvernight = RiskProfile{Name: "尾盘隔日", HardStopPct: -5, BreakevenAtPct: 3, TrailArmPct: 4, TrailDropPct: 3, TPPct: 6, TimeStopDays: 1, TimeStopGain: 1, PrevLowStop: true}
+//
+// ⚠️2026-07-31 用户定(方案A,保守放宽):保本武装 3%→4%,移动武装 4%→5%、回落 3%→4%。
+// 起因是 07-30 三笔尾盘仓次日开盘被保本/移动止损全扫,原线太贴身:峰值 5% 时旧线落在
+// +1.85%,正常回抽就破。新线在峰值 5% 时落在 +0.8%,仍锁小利但不至于被日内波动扫掉。
+// **止盈封顶维持 +6% 不动**——武装线必须低于封顶才有意义:若把武装线也提到 6%,
+// 价格到 6% 会先被止盈平掉,移动止损永远轮不到触发,等于把它废了。
+// 注:保本/移动止损这两条**并不在尾盘6的成文条款里**(成文只有 -5%/+6%/1日<1%清/破昨强阳低点),
+// 属于标定兜底参数,可调;真要严格对齐铁律应当整条删掉,用户选择保留并放宽。
+var riskOvernight = RiskProfile{Name: "尾盘隔日", HardStopPct: -5, BreakevenAtPct: 4, TrailArmPct: 5, TrailDropPct: 4, TPPct: 6, TimeStopDays: 1, TimeStopGain: 1, PrevLowStop: true}
 
 // 涨停回调:接力企稳,失败快走,成了吃一段
 // 成文(涨停回调):跌破5日线先走(涨停阳线低点在建仓日之前拿不到精确价,以-6%硬线近似兜底)

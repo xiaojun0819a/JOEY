@@ -25,6 +25,15 @@ export const STRATEGY_SOURCE_LABELS: Record<string, string> = {
   // 按固定金额跟单进模拟盘,攒不被卖方挑选的真实前向样本。风控引擎对它一律不接管
   // (要测的是用户自己"冲高就卖"的手,引擎替他卖了就测不出来了)。详见 app_tip_picks.go
   'tip-tianding': '天鼎早盘推荐',
+  // X 荐股博主跟单(2026-07-31):同样**不是自研策略**。六个博主各占一个 source,
+  // 这样「按策略分组」天然就是「按博主分组」,每人的扣费超额可以单独算、互不污染。
+  // 与天鼎那条不同的是:这里由风控引擎按统一 profile 出场——要比的是选股,不是出场规则。
+  'x-dianfeng': '走上大A巅峰',
+  'x-qushi': 'A股趋势捕手',
+  'x-laolin': '老林A股',
+  'x-shanye': '山野寻龙',
+  'x-laoqiang': 'A股老枪',
+  'x-yunshu': '云舒交易日记',
   lowbuy: '低吸旧口径',
   taillazy: '低吸尾盘旧口径',
   latechase: '尾盘强势旧口径',

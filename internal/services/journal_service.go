@@ -161,6 +161,12 @@ func (s *JournalService) insertAction(tx *sql.Tx, tradeID int64, code, name, act
 	if tx == nil || strings.TrimSpace(code) == "" || strings.TrimSpace(action) == "" {
 		return
 	}
+	// 存之前先归一化。前端只认 build/add/reduce/close 四个值,
+	// 写进别名(实测:减仓那次写的是 "trim")会让流水显示成「手动」,
+	// 而且**不会报任何错**——只是标签悄悄变了,很难发现。
+	if n := normalizeAction(action); n != "" {
+		action = n
+	}
 	amount := round2(price * float64(shares))
 	_, _ = tx.Exec(`INSERT INTO trade_actions
 		(trade_id, stock_code, stock_name, action, trade_date, price, shares, amount, after_shares, after_cost, note, created_at)
@@ -699,4 +705,79 @@ func finalizePeriods(m map[string]*models.TradePeriodStat) []models.TradePeriodS
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Period > out[j].Period }) // 新→旧
 	return out
+}
+
+// OnPartialSell 减仓:把未平仓那笔**拆成两笔** —— 卖掉的部分结算成 closed,剩下的继续 open。
+//
+// 为什么必须拆而不是改数量(2026-08-02 用户实测发现):
+// 持仓设置里把 1000 股改成 500 走的是"更正记录"那条路,只把数量改小,
+// 于是**减仓那 500 股赚的钱凭空消失**——台账没记、总盈亏也不认。
+//
+// ⚠️剩余那笔的 buy_price **原样保留,绝不摊薄**。
+// 用户提过"把已实现利润从剩余成本里扣掉"的算法(有些券商这么显示),这里不能用:
+// 本项目的止损/止盈/保本线全部按成本价算,成本价一降,
+// **止损线会在减仓那一刻悄悄挪走一大截,而界面上完全看不出来**。
+// 已实现的钱靠新拆出来的 closed 那笔留痕,不去动成本价。
+func (s *JournalService) OnPartialSell(code, sellDate string, sellPrice float64, sellShares int64) {
+	if s == nil || s.db == nil || code == "" || sellShares <= 0 {
+		return
+	}
+	if strings.TrimSpace(sellDate) == "" {
+		sellDate = time.Now().Format("2006-01-02")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	var id, shares int64
+	var buyPrice float64
+	var name, buyDate, source, note sql.NullString
+	row := tx.QueryRow(`SELECT id, stock_name, buy_date, buy_price, shares, source, note
+		FROM trades WHERE stock_code=? AND status='open' ORDER BY id DESC LIMIT 1`, code)
+	if err := row.Scan(&id, &name, &buyDate, &buyPrice, &shares, &source, &note); err != nil {
+		return // 没有未平仓记录
+	}
+	if sellShares >= shares { // 卖光了就是普通平仓,交给 OnSell 那条路
+		return
+	}
+
+	// ① 卖出的部分:新建一笔 closed
+	e := models.TradeJournalEntry{
+		StockCode: code, StockName: name.String, BuyDate: buyDate.String, BuyPrice: buyPrice,
+		Shares: sellShares, SellDate: sellDate, SellPrice: sellPrice, Status: "closed",
+		Source: source.String, Note: strings.TrimSpace(note.String + " 减仓"),
+	}
+	computePnL(&e)
+	now := nowStr()
+	res, err := tx.Exec(`INSERT INTO trades
+		(stock_code, stock_name, buy_date, buy_price, shares, sell_date, sell_price, status, pnl, pnl_pct, hold_days, source, note, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,'closed',?,?,?,?,?,?,?)`,
+		code, e.StockName, e.BuyDate, e.BuyPrice, e.Shares, e.SellDate, e.SellPrice,
+		e.PnL, e.PnLPct, e.HoldDays, e.Source, e.Note, now, now)
+	if err != nil {
+		journalLog.Warn("减仓拆单失败: %v", err)
+		return
+	}
+	newID, _ := res.LastInsertId()
+	s.insertAction(tx, newID, code, e.StockName, "close", sellDate, sellPrice, sellShares, 0, buyPrice, "减仓")
+
+	// ② 剩下的部分:只减数量,**成本价不动**
+	left := shares - sellShares
+	tx.Exec(`UPDATE trades SET shares=?, updated_at=? WHERE id=?`, left, now, id)
+	s.insertAction(tx, id, code, e.StockName, "reduce", sellDate, sellPrice, sellShares, left, buyPrice, "减仓")
+	_ = tx.Commit()
+}
+
+// RealizedPnLOf 某只票**已实现**盈亏合计(所有已平仓的笔)。
+// 减仓之后界面要能同时显示"浮动 / 已实现 / 合计",少了这个数,
+// 用户看到的浮盈会比他真赚的少一大截(减仓卖掉那部分的利润不在浮盈里)。
+func (s *JournalService) RealizedPnLOf(code string) float64 {
+	if s == nil || s.db == nil || code == "" {
+		return 0
+	}
+	var v sql.NullFloat64
+	_ = s.db.QueryRow(`SELECT SUM(pnl) FROM trades WHERE stock_code=? AND status='closed'`, code).Scan(&v)
+	return v.Float64
 }

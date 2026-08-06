@@ -21,6 +21,19 @@ export class SafeBoundary extends React.Component<SafeBoundaryProps, SafeBoundar
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     // Keep the app alive on render crashes while still surfacing details for debugging.
     console.error('[SafeBoundary] render failed:', error, info);
+    // 同时上报到后端日志(2026-07-30 加)。Wails 产品版打不开 devtools,只 console.error 等于
+    // 错误信息取不到——这类崩溃项目里已发生多次,每次都只能靠猜。上报后 ssh 上去
+    // grep「前端渲染崩溃」就能看到具体报错和组件栈。
+    // 整段包在 try 里、只 catch 不 rethrow:上报本身绝不能再引发一次崩溃。
+    try {
+      const app = (window as unknown as { go?: { main?: { App?: Record<string, unknown> } } })?.go?.main?.App;
+      const fn = app?.ReportFrontendError as undefined | ((w: string, m: string, s: string) => Promise<unknown>);
+      void fn?.(
+        this.props.title || 'unknown',
+        `${error?.name || 'Error'}: ${error?.message || String(error)}`,
+        info?.componentStack || '',
+      );
+    } catch { /* 上报失败就算了,绝不能影响兜底 UI */ }
   }
 
   componentDidUpdate(prevProps: SafeBoundaryProps) {

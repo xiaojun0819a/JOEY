@@ -7,6 +7,8 @@ import { F10Panel } from './components/F10Panel';
 import { AgentRoom } from './components/AgentRoom';
 import { SettingsDialog } from './components/SettingsDialog';
 import { PositionDialog } from './components/PositionDialog';
+import { reduceStockPosition, realizedPnLOfStock } from './services/journalService';
+import { reportToBackend } from './utils/reportToBackend';
 import { TradeJournalDialog } from './components/TradeJournalDialog';
 import { HotTrendDialog } from './components/HotTrendDialog';
 import { LongHuBangDialog } from './components/LongHuBangDialog';
@@ -252,6 +254,9 @@ const App: React.FC = () => {
   const [settingsInitialTab, setSettingsInitialTab] = useState<'update' | undefined>(undefined);
   const [updateAvailable, setUpdateAvailable] = useState<string>('');
   const [showPosition, setShowPosition] = useState(false);
+  // 该股已实现盈亏(历次卖出/减仓累计)。减仓后浮盈只剩剩余仓位那部分,
+  // 不把已实现摆出来,用户会以为钱少了一半(2026-08-02 实测反馈)。
+  const [positionRealizedPnL, setPositionRealizedPnL] = useState(0);
   const [showHotTrend, setShowHotTrend] = useState(false);
   const [showLongHuBang, setShowLongHuBang] = useState(false);
   const [showAuctionBoard, setShowAuctionBoard] = useState(false);
@@ -353,6 +358,11 @@ const App: React.FC = () => {
     if (preview) codes.push(preview);
     return Array.from(new Set(codes)).join(',');
   }, [watchlist, previewStock]);
+  useEffect(() => {
+    if (!showPosition || !selectedStock?.symbol) { setPositionRealizedPnL(0); return; }
+    void realizedPnLOfStock(selectedStock.symbol).then(setPositionRealizedPnL).catch(() => setPositionRealizedPnL(0));
+  }, [showPosition, selectedStock?.symbol]);
+
 
   // 体感练习「看图但不许看未来」:非空时全屏图只画到这一天为止。
   // 练习是盲选,右侧四图要是把信号日之后的走势也画出来,题就废了。
@@ -2014,6 +2024,21 @@ const App: React.FC = () => {
 	          await sellStockPosition(selectedStock.symbol, sellPrice, today);
 	          await handleTradeJournalChanged();
 	        }}
+	        onReduce={async (sellShares, sellPrice) => {
+	          const today = new Date().toISOString().slice(0, 10);
+	          // ⚠️这些 RPC 用返回字符串报错,不抛异常。不看返回值 = 失败时界面毫无反应,
+	          // 用户只能看到"点了没用",而真正的原因("没有持仓""超过持仓")被吞掉。
+	          const res = await reduceStockPosition(selectedStock.symbol, sellShares, sellPrice, today);
+	          if (res !== 'success') {
+	            // window.alert 在 Wails 的 WKWebView 里是空操作(宿主没实现 JS 对话框代理),
+	            // 报错只能走后端日志这条验证过的通道。
+	            reportToBackend('减仓', `失败:${res}`);
+	            return;
+	          }
+	          await handleTradeJournalChanged();
+	          setPositionRealizedPnL(await realizedPnLOfStock(selectedStock.symbol));
+	        }}
+	        realizedPnL={positionRealizedPnL}
       />
       <HotTrendDialog
         isOpen={showHotTrend}

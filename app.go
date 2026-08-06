@@ -447,16 +447,27 @@ func (a *App) startup(ctx context.Context) {
 	if a.monitorService != nil {
 		// 注入游资炸板回封状态机(封死→炸板→回封买入,成文规则v1,盘中每分钟)
 		a.monitorService.SetBoardResealFunc(a.checkBoardReseal)
+		// 日K数据新鲜度自检(09:10 / 17:20),见 app_data_health.go
+		a.monitorService.SetDataHealthFunc(func() { a.checkDataFreshness() })
+		// X 荐股博主推荐的开盘建仓(09:30),见 app_xblogger_buy.go。
+		// 灰度期各博主的 auto_buy 默认关着,这条回调会照跑但只把信号标成 off —— 不建仓也要留痕,
+		// 否则等开关打开时,前面那段"他推了什么"的样本就断了。
+		a.monitorService.SetXOpenBuyFunc(func() { a.RunXOpenBuy() })
 		// 注入模拟持仓风控巡检(盘中每5分钟:止损/止盈实时触线;尾盘14:45后收盘口径条款当天执行)
 		a.monitorService.SetPaperExitFunc(func() {
 			if n := a.ApplyPaperExitRules(); n > 0 {
 				log.Info("盘中风控巡检自动平仓 %d 笔", n)
 			}
 		})
-		// 注入尾盘买点扫描回调（14:00 触发，扫描内部已按 Top3 推送）
-		a.monitorService.SetBuyScanFunc(func() {
-			a.RunLowBuyScannerV1(models.LowBuyScannerRequest{Limit: 5})
-		})
+		// 买点信号推送(14:30 / 14:45 各一次,2026-07-28 用户定)。
+		//
+		// 原来这里注入的是 RunLowBuyScannerV1(低吸选股1)、14:00 触发,但该策略 2026-07-27 已因
+		// 扣费超额 −0.52%/笔(n=273)证伪下架,菜单/筛选/14:50 全量扫描都摘干净了,唯独这条漏着,
+		// 于是每天照旧把一个自己判定不赚钱的策略推到企微,还和在用策略长得一模一样。已换成下面三个。
+		//
+		// ⚠️只推送、不建仓:自动建仓统一由 14:50 的 RunTailForwardScanAll 负责。
+		// 若这里也建仓,同一只票会在 14:30/14:45/14:50 各进一次,仓位翻三倍、胜率统计也废了。
+		a.monitorService.SetBuyScanFunc(a.runSignalPushScan)
 		// 波段扫描已改纯手动(2026-07-20 用户定):不再注入 17:30 自动扫描回调。
 		// monitor 的 wavescan 定时窗仍在,但 waveScan==nil 时是空转。
 		// 注意:复盘留痕依赖"当天扫过一次"——手动模式下哪天没扫,当天就没有波段留痕/复盘数据。
@@ -2188,7 +2199,9 @@ func (a *App) RunLowBuyScannerV1(req models.LowBuyScannerRequest) models.LowBuyS
 
 	a.saveLowBuyStrategyPicks("lowbuy-v1", "低吸选股策略", result)
 	// 扫描入选标的异步推送为买点信号（复用 24h 防重，推送未开启时内部直接跳过）
-	a.pushScannerSignals(result.Items)
+	// 注:本策略 2026-07-27 已证伪下架,自动触发已摘(见 startup);这里保留推送是为了手动跑时仍有反馈,
+	// 标签明确标「已停用」,免得在企微里和在用策略混为一谈。
+	a.pushScannerSignals(result.Items, "低吸选股·已停用")
 
 	return result
 }
@@ -4836,7 +4849,10 @@ func (a *App) RunLateDayChaseScanner(req models.LateDayChaseScannerRequest) mode
 
 // pushScannerSignals 把扫描入选标的作为买点信号推送。
 // 后台异步执行、逐条节流，避免阻塞扫描返回与触发 Telegram 限流；防重由推送服务按股票去重。
-func (a *App) pushScannerSignals(items []models.LowBuyScannerItem) {
+//
+// label = 策略名(2026-07-28 用户要求)。以前推送不带策略名,几条并排看不出是谁选的,
+// 尤其现在多个策略同时推,不标出来根本没法归因。名字用界面同款(已去编号)。
+func (a *App) pushScannerSignals(items []models.LowBuyScannerItem, label string) {
 	if a == nil || a.pushService == nil || len(items) == 0 {
 		return
 	}
@@ -4858,7 +4874,7 @@ func (a *App) pushScannerSignals(items []models.LowBuyScannerItem) {
 				StockCode: item.Symbol,
 				StockName: item.Name,
 				Type:      models.PushTypeBuyPoint,
-				Message:   buildScannerPushMessage(item),
+				Message:   buildScannerPushMessage(item, label),
 				Level:     "active",
 			})
 			if i < len(batch)-1 {
@@ -4869,8 +4885,11 @@ func (a *App) pushScannerSignals(items []models.LowBuyScannerItem) {
 }
 
 // buildScannerPushMessage 组装扫描信号的推送正文。
-func buildScannerPushMessage(item models.LowBuyScannerItem) string {
+func buildScannerPushMessage(item models.LowBuyScannerItem, label string) string {
 	var b strings.Builder
+	if s := strings.TrimSpace(label); s != "" {
+		fmt.Fprintf(&b, "【%s】", s)
+	}
 	fmt.Fprintf(&b, "现价 %.2f (%+.2f%%)", item.Price, item.ChangePercent)
 	if strings.TrimSpace(item.Industry) != "" {
 		fmt.Fprintf(&b, " · %s", item.Industry)
@@ -9422,6 +9441,76 @@ func (a *App) SellStockPosition(stockCode string, sellPrice float64, sellDate st
 	return "success"
 }
 
+// ReduceStockPosition 减仓:卖掉一部分,**成本价保持不变**。
+//
+// 补的是一个真缺口(2026-08-02 用户实测):此前界面上只有"改数量"和"卖出清仓"两条路,
+// 想减半仓只能把持仓数量从 1000 改成 500 —— 那走的是更正记录,
+// **减仓那 500 股赚的钱不进台账、总盈亏里也找不回来**。
+//
+// ⚠️成本价不摊薄。止损/止盈/保本线全按成本价算,减仓时把成本降下去
+// 等于让止损线在那一刻悄悄挪走一大截,而界面完全看不出来。
+// 已实现的部分由台账里拆出来的那笔 closed 承载,查得到、算得清。
+func (a *App) ReduceStockPosition(stockCode string, sellShares int64, sellPrice float64, sellDate string) string {
+	// 每一条失败路径都记日志。第一版全部静默返回字符串,而前端又不看返回值,
+	// 结果用户点了没反应、日志里也一片空白,只能靠猜(猜错两次)。
+	fail := func(why string) string {
+		log.Warn("减仓被拒 %s %d股: %s", stockCode, sellShares, why)
+		return why
+	}
+	log.Info("减仓请求 %s %d股 @%.2f %s", stockCode, sellShares, sellPrice, sellDate)
+	if a.sessionService == nil {
+		return fail("service not ready")
+	}
+	if sellShares <= 0 {
+		return fail("减仓数量要大于 0")
+	}
+	sess := a.sessionService.GetSession(stockCode)
+	if sess == nil {
+		return fail("找不到该股票的会话记录")
+	}
+	if sess.Position == nil || sess.Position.Shares <= 0 {
+		return fail("该股票没有持仓")
+	}
+	held, cost, buyDate := sess.Position.Shares, sess.Position.CostPrice, sess.Position.BuyDate
+	if sellShares > held {
+		return fail(fmt.Sprintf("减仓 %d 股超过持仓 %d 股", sellShares, held))
+	}
+	if sellPrice <= 0 && a.marketService != nil {
+		if stocks, err := a.marketService.GetStockRealTimeData(stockCode); err == nil && len(stocks) > 0 && stocks[0].Price > 0 {
+			sellPrice = stocks[0].Price
+		}
+	}
+	if sellPrice <= 0 {
+		return fail("取不到卖出价")
+	}
+	if strings.TrimSpace(sellDate) == "" {
+		sellDate = time.Now().Format("2006-01-02")
+	}
+	// 减到 0 就是清仓,直接走原来那条路,免得台账里留一笔 0 股的 open
+	if sellShares == held {
+		return a.SellStockPosition(stockCode, sellPrice, sellDate)
+	}
+	if a.journalService != nil {
+		a.journalService.OnPartialSell(stockCode, sellDate, sellPrice, sellShares)
+		if err := a.syncTradeJournalWatchGroup(); err != nil {
+			log.Warn("同步交易台账组失败: %v", err)
+		}
+	}
+	if err := a.sessionService.UpdatePosition(stockCode, held-sellShares, cost, buyDate); err != nil {
+		return fail("写持仓失败:" + err.Error())
+	}
+	log.Info("减仓 %s %d股 @%.2f,剩 %d股 成本价仍为 %.2f(不摊薄)", stockCode, sellShares, sellPrice, held-sellShares, cost)
+	return "success"
+}
+
+// RealizedPnLOfStock 某只票已实现盈亏合计,供持仓面板显示「浮动/已实现/合计」。
+func (a *App) RealizedPnLOfStock(stockCode string) float64 {
+	if a.journalService == nil {
+		return 0
+	}
+	return a.journalService.RealizedPnLOf(stockCode)
+}
+
 // ========== 交易台账 API ==========
 
 // ========== 模拟持仓 ==========
@@ -9739,11 +9828,25 @@ func (a *App) ApplyPaperExitRules() int {
 		}
 		st, hasRT := rtMap[strings.ToLower(strings.TrimSpace(p.Symbol))]
 		// 入场以来最高价(已确认K,盘中并入今日实时最高——移动止损当天冲高也能武装)
+		// 入场以来最高价。**从建仓次日起算,入场当日那根K整根跳过。**
+		//
+		// ⚠️2026-07-31 修:原来把建仓日整根日K的 High 也算进峰值,而那个高点很可能出现在
+		// 你买入之前——尤其尾盘系策略,成文入场时点就是 14:30-15:00,当日高点几乎必然在入场前。
+		// 后果是拿"你根本没赚到的涨幅"去武装保本线/移动止损,次日一低开就被扫出去。
+		// 实录(2026-07-30 尾盘买入三笔,14:52:23 建仓,次日 09:30:27 全部被平):
+		//   赤天化   成本3.26,当日最高3.56(+9.2%,发生在入场前)→ 移动止损线架到3.45 → 次日开3.13 被平
+		//   天润乳业 成本8.65,当日最高9.18(+6.1%,同样在入场前)→ 线8.90 → 次日开8.36 被平
+		//   金煤科技 成本3.34,当日最高3.46(+3.6%)→ 保本线架到成本 → 次日开3.16 被平
+		// 三笔全中,是系统性偏差不是偶发。
+		// 收盘判定引擎(risk.go EvaluateRiskExit)的 hold 从 1 起,本来就是次日起算——这里跟它对齐。
+		// 代价:真在建仓日盘中冲高的仓位,那段涨幅不计入峰值,武装会晚一点。方向偏保守,
+		// 宁可晚锁利,也不能拿没发生过的浮盈把人止损掉。
 		peak := p.CostPrice
 		started := false
 		for _, k := range confirmed {
 			if k.Time == p.OpenDate {
 				started = true
+				continue // 建仓日整根跳过:高点可能在建仓之前
 			}
 			if started && k.High > peak {
 				peak = k.High

@@ -62,6 +62,9 @@ func NewHistoryService(dataDir string, marketService *MarketService, configServi
 		db.Close()
 		return nil, err
 	}
+	// 把"最新交易日的现用名"接给全市场名录:嵌入表 stock_basic.json 停在 2025-05-29,
+	// 单靠它按名字认股票会漏掉改名股和新股(详见 AllStockNameSymbols 注释)。
+	SetLiveNameProvider(svc.latestNameMap)
 	return svc, nil
 }
 
